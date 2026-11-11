@@ -1,0 +1,360 @@
+{
+  "data": {
+    "case": {
+      "diameter_mm": 42.0,
+      "lug_to_lug_mm": 50.0,
+      "thickness_mm": 13.0,
+      "lug_width_mm": 20.0,
+      "material": "316L stainless steel",
+      "finish": "brushed",
+      "water_resistance_m": 300,
+      "crystal": "sapphire",
+      "crystal_type": "domed",
+      "crystal_thickness_mm": 1.2,
+      "caseback": "screw-down",
+      "crown": "screw-down",
+      "bezel": "dive",
+      "crown_diameter_mm": 5.5,
+      "lug_count": 4
+    },
+    "dial": {
+      "diameter_mm": 37.8,
+      "thickness_mm": 0.4,
+      "color": "black",
+      "index_style": "applied batons",
+      "lume": true,
+      "date_window": true,
+      "small_seconds": false,
+      "logo_text": "",
+      "finish": "matte",
+      "index_material": "polished steel"
+    },
+    "hands": {
+      "style": "baton",
+      "hour_length_mm": 11.0,
+      "minute_length_mm": 16.6,
+      "second_length_mm": 17.4,
+      "thickness_mm": 0.25,
+      "material": "polished steel",
+      "stack_height_mm": 0.9
+    },
+    "movement": {
+      "kind": "mechanical",
+      "base_calibre": "",
+      "width_mm": 28.0,
+      "height_mm": 4.6,
+      "beat_rate_bph": 28800,
+      "power_reserve_h": 42.0,
+      "jewels": 21,
+      "winding": "automatic",
+      "escape_wheel_teeth": 15,
+      "usable_barrel_turns": 6.5,
+      "hand_height_mm": 1.2,
+      "complications": {
+        "date": {}
+      }
+    },
+    "quartz": {
+      "battery_mAh": 32.0,
+      "current_uA": 1.2,
+      "step_hz": 1.0,
+      "module": "generic 3-hand"
+    },
+    "derived": {
+      "train": {
+        "module_mm": 0.12,
+        "beat_rate_bph": 28800.0,
+        "escape_wheel_teeth": 15,
+        "stages": [
+          {
+            "driver": "barrel",
+            "driven": "centre",
+            "wheel_teeth": 84,
+            "pinion_teeth": 13,
+            "module_mm": 0.12,
+            "centre_mm": 5.82,
+            "ratio": 6.461538,
+            "note": ""
+          },
+          {
+            "driver": "centre",
+            "driven": "third",
+            "wheel_teeth": 60,
+            "pinion_teeth": 11,
+            "module_mm": 0.12,
+            "centre_mm": 4.26,
+            "ratio": 5.454545,
+            "note": ""
+          },
+          {
+            "driver": "third",
+            "driven": "fourth",
+            "wheel_teeth": 66,
+            "pinion_teeth": 6,
+            "module_mm": 0.12,
+            "centre_mm": 4.32,
+            "ratio": 11.0,
+            "note": ""
+          },
+          {
+            "driver": "fourth",
+            "driven": "escape",
+            "wheel_teeth": 96,
+            "pinion_teeth": 6,
+            "module_mm": 0.12,
+            "centre_mm": 6.12,
+            "ratio": 16.0,
+            "note": "escape pinion driven by fourth wheel"
+          }
+        ],
+        "motion_works": [
+          {
+            "driver": "cannon pinion",
+            "driven": "minute wheel",
+            "wheel_teeth": 24,
+            "pinion_teeth": 10,
+            "module_mm": 0.108,
+            "centre_mm": 1.836,
+            "ratio": 2.4,
+            "note": ""
+          },
+          {
+            "driver": "minute pinion",
+            "driven": "hour wheel",
+            "wheel_teeth": 40,
+            "pinion_teeth": 8,
+            "module_mm": 0.108,
+            "centre_mm": 2.592,
+            "ratio": 5.0,
+            "note": ""
+          }
+        ],
+        "barrel_to_centre": 6.461538,
+        "centre_to_fourth": 60.0,
+        "fourth_to_escape": 16.0,
+        "total_barrel_to_escape": 6203.08,
+        "hour_hand_ratio": 12.0,
+        "effective_power_reserve_h": 42.0,
+        "layout": [
+          {
+            "name": "centre",
+            "x": 0.0,
+            "y": 0.0,
+            "plane": 1,
+            "radius": 3.72
+          },
+          {
+            "name": "barrel",
+            "x": -5.82,
+            "y": 0.0,
+            "plane": 0,
+            "radius": 5.16
+          },
+          {
+            "name": "third",
+            "x": 3.263,
+            "y": -2.738,
+            "plane": 2,
+            "radius": 4.08
+          },
+          {
+            "name": "fourth",
+            "x": 0.486,
+            "y": 0.571,
+            "plane": 3,
+            "radius": 5.88
+          },
+          {
+            "name": "escape",
+            "x": 1.549,
+            "y": 6.598,
+            "plane": 3,
+            "radius": 1.02
+          }
+        ],
+        "seconds_per_hour": 3600.0
+      },
+      "barrel": {
+        "inner_diameter_mm": 9.52,
+        "arbor_diameter_mm": 3.17,
+        "height_mm": 1.2,
+        "spring_thickness_mm": 0.122,
+        "spring_length_mm": 518.8,
+        "usable_turns": 6.5,
+        "torque_full_nmm": 5.146,
+        "energy_j": 0.1051,
+        "formula": "M=E*s^3*h/(12L)*theta*preload; L=pi(D^2-d^2)/(4s)"
+      },
+      "stack": {
+        "caseback_mm": 1.2,
+        "movement_mm": 4.6,
+        "complications_mm": 0.45,
+        "dial_mm": 0.4,
+        "hands_mm": 0.9,
+        "crystal_mm": 1.2,
+        "clearances_mm": 0.55,
+        "required_case_thickness_mm": 9.3,
+        "available_case_thickness_mm": 13.0,
+        "margin_mm": 3.7,
+        "radial_margin_mm": 3.7,
+        "z_caseback_top": 1.2,
+        "z_plate_top": 2.4,
+        "z_movement_top": 5.8,
+        "z_complications_top": 9.9,
+        "z_dial_bottom": 9.95,
+        "z_dial_top": 10.35,
+        "z_hands_bottom": 10.65,
+        "z_hands_top": 11.55,
+        "z_crystal_bottom": 11.8,
+        "z_case_top": 13.0,
+        "movement_to_dial_gap_mm": 3.7
+      },
+      "torque": {
+        "barrel_torque_nmm": 5.146,
+        "escape_torque_nmm": 0.000621,
+        "unlock_threshold_nmm": 0.0003,
+        "escape_margin": 2.07,
+        "available_power_uw": 1.39,
+        "required_power_uw": 1.03,
+        "power_margin": 1.35,
+        "efficiency_per_mesh": 0.93,
+        "note": "energy and torque are estimates calibrated to typical movements"
+      },
+      "mass_g": 56.97,
+      "quartz_train": {},
+      "battery_life_years": 0.0,
+      "checksum": "6c99dd2e481f4d57"
+    },
+    "meta": {
+      "name": "Abyss 42",
+      "version": 33,
+      "created_at": "",
+      "notes": "",
+      "mode": "prompt-to-cad",
+      "source_url": ""
+    }
+  },
+  "provenance": {
+    "case.thickness_mm": {
+      "tag": "user",
+      "note": "diver preset"
+    },
+    "case.bezel": {
+      "tag": "user",
+      "note": "diver preset"
+    },
+    "case.crown": {
+      "tag": "user",
+      "note": "diver preset"
+    },
+    "movement.kind": {
+      "tag": "user",
+      "note": "diver preset"
+    },
+    "movement.winding": {
+      "tag": "user",
+      "note": "diver preset"
+    },
+    "meta.name": {
+      "tag": "user",
+      "note": "provided name"
+    },
+    "case.water_resistance_m": {
+      "tag": "user",
+      "note": "water resistance from prompt"
+    },
+    "case.diameter_mm": {
+      "tag": "user",
+      "note": "first bare size is the case diameter"
+    },
+    "case.material": {
+      "tag": "user",
+      "note": "case material from prompt"
+    },
+    "case.crystal": {
+      "tag": "user",
+      "note": "crystal from prompt"
+    },
+    "case.caseback": {
+      "tag": "user",
+      "note": "caseback from prompt"
+    },
+    "dial.finish": {
+      "tag": "user",
+      "note": "dial finish from prompt"
+    },
+    "dial.color": {
+      "tag": "user",
+      "note": "dial colour from prompt"
+    },
+    "dial.lume": {
+      "tag": "user",
+      "note": "lume from prompt"
+    },
+    "dial.index_style": {
+      "tag": "user",
+      "note": "index style from prompt"
+    },
+    "hands.style": {
+      "tag": "user",
+      "note": "hand style from prompt"
+    },
+    "dial.date_window": {
+      "tag": "user",
+      "note": "date module needs a window"
+    },
+    "movement.complications": {
+      "tag": "user",
+      "note": "complication set from prompt"
+    },
+    "movement.width_mm": {
+      "tag": "derived",
+      "note": "case bore minus wall and clearance"
+    },
+    "dial.diameter_mm": {
+      "tag": "derived",
+      "note": "case bore minus rehaut clearance"
+    },
+    "case.lug_to_lug_mm": {
+      "tag": "derived",
+      "note": "case diameter + 8 mm lug extension (rule of thumb)"
+    },
+    "case.lug_width_mm": {
+      "tag": "derived",
+      "note": "kept (industry default for this case size)"
+    },
+    "derived.barrel": {
+      "tag": "derived"
+    },
+    "derived.train": {
+      "tag": "derived"
+    },
+    "derived.torque": {
+      "tag": "derived"
+    },
+    "derived.stack": {
+      "tag": "derived"
+    },
+    "hands.hour_length_mm": {
+      "tag": "derived",
+      "note": "58% of dial radius"
+    },
+    "hands.minute_length_mm": {
+      "tag": "derived",
+      "note": "88% of dial radius"
+    },
+    "hands.second_length_mm": {
+      "tag": "derived",
+      "note": "92% of dial radius"
+    },
+    "derived.mass_g": {
+      "tag": "derived",
+      "note": "sum of part volumes x material density"
+    },
+    "derived.checksum": {
+      "tag": "derived"
+    }
+  },
+  "locks": [],
+  "schema_version": 1
+}

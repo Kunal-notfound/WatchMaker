@@ -1,0 +1,239 @@
+{
+  "data": {
+    "case": {
+      "diameter_mm": 36.0,
+      "lug_to_lug_mm": 44.0,
+      "thickness_mm": 8.0,
+      "lug_width_mm": 20.0,
+      "material": "titanium",
+      "finish": "brushed",
+      "water_resistance_m": 100,
+      "crystal": "sapphire",
+      "crystal_type": "domed",
+      "crystal_thickness_mm": 1.2,
+      "caseback": "screw-down",
+      "crown": "push",
+      "bezel": "plain",
+      "crown_diameter_mm": 5.5,
+      "lug_count": 4
+    },
+    "dial": {
+      "diameter_mm": 31.8,
+      "thickness_mm": 0.4,
+      "color": "white",
+      "index_style": "printed",
+      "lume": true,
+      "date_window": false,
+      "small_seconds": false,
+      "logo_text": "",
+      "finish": "sunburst",
+      "index_material": "polished steel"
+    },
+    "hands": {
+      "style": "baton",
+      "hour_length_mm": 9.2,
+      "minute_length_mm": 14.0,
+      "second_length_mm": 14.6,
+      "thickness_mm": 0.25,
+      "material": "polished steel",
+      "stack_height_mm": 0.9
+    },
+    "movement": {
+      "kind": "quartz",
+      "base_calibre": "",
+      "width_mm": 26.0,
+      "height_mm": 2.6,
+      "beat_rate_bph": 28800,
+      "power_reserve_h": 42.0,
+      "jewels": 0,
+      "winding": "automatic",
+      "escape_wheel_teeth": 15,
+      "usable_barrel_turns": 6.5,
+      "hand_height_mm": 1.2,
+      "complications": {}
+    },
+    "quartz": {
+      "battery_mAh": 32.0,
+      "current_uA": 1.2,
+      "step_hz": 1.0,
+      "module": "generic 3-hand"
+    },
+    "derived": {
+      "train": {},
+      "barrel": {},
+      "stack": {
+        "caseback_mm": 1.2,
+        "movement_mm": 2.6,
+        "complications_mm": 0,
+        "dial_mm": 0.4,
+        "hands_mm": 0.9,
+        "crystal_mm": 1.2,
+        "clearances_mm": 0.55,
+        "required_case_thickness_mm": 6.85,
+        "available_case_thickness_mm": 8.0,
+        "margin_mm": 1.15,
+        "radial_margin_mm": 1.15,
+        "z_caseback_top": 1.2,
+        "z_plate_top": 2.4,
+        "z_movement_top": 3.8,
+        "z_complications_top": 4.9,
+        "z_dial_bottom": 4.95,
+        "z_dial_top": 5.35,
+        "z_hands_bottom": 5.65,
+        "z_hands_top": 6.55,
+        "z_crystal_bottom": 6.8,
+        "z_case_top": 8.0,
+        "movement_to_dial_gap_mm": 1.15
+      },
+      "torque": {
+        "available_power_uw": 0.0,
+        "required_power_uw": 0.0,
+        "power_margin": 0.0,
+        "note": "not applicable to quartz"
+      },
+      "mass_g": 23.39,
+      "quartz_train": {
+        "pulses_per_minute": 60.0,
+        "rotor_revs_per_minute": 30.0,
+        "seconds_reduction": 30.0,
+        "stages": [
+          {
+            "driver": "rotor",
+            "driven": "intermediate",
+            "wheel_teeth": 40,
+            "pinion_teeth": 8,
+            "module_mm": 0.1,
+            "centre_mm": 2.4,
+            "ratio": 5.0,
+            "note": ""
+          },
+          {
+            "driver": "intermediate",
+            "driven": "seconds",
+            "wheel_teeth": 48,
+            "pinion_teeth": 8,
+            "module_mm": 0.1,
+            "centre_mm": 2.8,
+            "ratio": 6.0,
+            "note": ""
+          }
+        ],
+        "note": "30:1 typical for a 1 Hz Lavet stepper"
+      },
+      "battery_life_years": 2.59,
+      "checksum": "55776f364504cdf1"
+    },
+    "meta": {
+      "name": "Current 36",
+      "version": 30,
+      "created_at": "",
+      "notes": "",
+      "mode": "prompt-to-cad",
+      "source_url": ""
+    }
+  },
+  "provenance": {
+    "case.thickness_mm": {
+      "tag": "user",
+      "note": "quartz preset"
+    },
+    "dial.lume": {
+      "tag": "user",
+      "note": "quartz preset"
+    },
+    "meta.name": {
+      "tag": "user",
+      "note": "provided name"
+    },
+    "case.water_resistance_m": {
+      "tag": "user",
+      "note": "water resistance from prompt"
+    },
+    "case.diameter_mm": {
+      "tag": "user",
+      "note": "first bare size is the case diameter"
+    },
+    "case.material": {
+      "tag": "user",
+      "note": "case material from prompt"
+    },
+    "case.crystal": {
+      "tag": "user",
+      "note": "crystal from prompt"
+    },
+    "dial.color": {
+      "tag": "user",
+      "note": "dial colour from prompt"
+    },
+    "dial.index_style": {
+      "tag": "user",
+      "note": "index style from prompt"
+    },
+    "movement.kind": {
+      "tag": "user",
+      "note": "quartz movement"
+    },
+    "movement.complications": {
+      "tag": "derived",
+      "note": "quartz build: 3-hand only"
+    },
+    "movement.width_mm": {
+      "tag": "derived",
+      "note": "quartz module footprint"
+    },
+    "dial.diameter_mm": {
+      "tag": "derived",
+      "note": "case bore minus rehaut clearance"
+    },
+    "case.lug_to_lug_mm": {
+      "tag": "derived",
+      "note": "case diameter + 8 mm lug extension (rule of thumb)"
+    },
+    "case.lug_width_mm": {
+      "tag": "derived",
+      "note": "kept (industry default for this case size)"
+    },
+    "movement.height_mm": {
+      "tag": "derived",
+      "note": "quartz module height"
+    },
+    "movement.jewels": {
+      "tag": "derived",
+      "note": "quartz modules use no jewels"
+    },
+    "derived.quartz_train": {
+      "tag": "derived"
+    },
+    "derived.battery_life_years": {
+      "tag": "derived",
+      "note": "capacity / draw x 0.85 derating"
+    },
+    "derived.torque": {
+      "tag": "derived"
+    },
+    "derived.stack": {
+      "tag": "derived"
+    },
+    "hands.hour_length_mm": {
+      "tag": "derived",
+      "note": "58% of dial radius"
+    },
+    "hands.minute_length_mm": {
+      "tag": "derived",
+      "note": "88% of dial radius"
+    },
+    "hands.second_length_mm": {
+      "tag": "derived",
+      "note": "92% of dial radius"
+    },
+    "derived.mass_g": {
+      "tag": "derived",
+      "note": "sum of part volumes x material density"
+    },
+    "derived.checksum": {
+      "tag": "derived"
+    }
+  },
+  "locks": [],
+  "schema_version": 1
+}

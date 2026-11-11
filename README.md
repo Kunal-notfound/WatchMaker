@@ -1,0 +1,379 @@
+# watchcad
+
+Turn a sentence into a complete, parametric watch design — then inspect the
+spec, the geometry, the checks and the production package.
+
+```text
+"A 42 mm steel dive watch, 300 m water resistance, black matte dial,
+ applied lume indices, baton hands, sapphire crystal, screw-down crown, date."
+        │
+        ▼
+  spec (JSON)  ──►  deterministic solver  ──►  mesh / drawings / BOM / reports
+  single source      no LLM writes geometry         one build directory
+```
+
+`watchcad` implements the project brief in `Watch_CAD_Project_Spec.docx` as a
+local-first studio: a Python standard-library engine with no third-party
+packages, plus a browser UI served from the same process. An LLM is optional
+and can only propose spec patches; every dimension, tooth count, stack height
+and mesh vertex comes from deterministic code.
+
+---
+
+## Quick start
+
+Requirements: Python 3.11+ and a browser. Nothing to install.
+
+```bash
+cd watch_proj
+
+# 1. Studio: copilot chat, number fields, exploded 3D views, layered checks
+python3 -m watchcad serve --open          # http://127.0.0.1:8765
+
+# 2. Or stay on the command line
+python3 -m watchcad prompt "38 mm dress watch, manual wind, no date" -o dress.json
+python3 -m watchcad show dress.json
+python3 -m watchcad verify dress.json
+python3 -m watchcad build dress.json -o out/dress
+python3 -m watchcad export dress.json --format pdf -o out/dress.pdf
+```
+
+Run the test suite:
+
+```bash
+python3 -m unittest discover -s tests -v     # 33 tests, ~4 s
+
+# browser smoke test (Node 18+, no npm packages)
+python3 -m watchcad serve --port 8766 &
+node tests/ui_smoke.js                        # boot, copilot, undo, steppers, views, sidebars
+```
+
+Optional editable install:
+
+```bash
+python3 -m pip install -e .                  # exposes the `watchcad` command
+```
+
+Both entry points are equivalent: `python3 -m watchcad …` and `watchcad …`.
+
+### Built-in design briefs
+
+`python3 -m watchcad presets` prints the prompts behind the seven shipped
+examples. They all solve with **0 failures**:
+
+| id | example | notable checks |
+|---|---|---|
+| `diver` | Abyss 42 | dive bezel, 300 m, screw-down crown, date |
+| `dress` | Meridian 38 | manual wind, 48 h reserve, no date |
+| `field` | Surveyor 38 | bead-blasted case, matte dial, lume |
+| `pilot` | Navigator 43 | large crown, high legibility |
+| `chronograph` | Circuit 40 | two pushers, chrono counters, panda dial |
+| `moonphase` | Luna 40 | moon aperture, annual calendar |
+| `quartz` | Current 36 | battery path, no gear train |
+
+The generated specs are in [`examples/`](examples/).
+
+### The studio
+
+- **Design copilot.** The right panel is a conversation, not a one-shot prompt.
+  Press Enter to send. Each reply says what changed, shows the applied paths as
+  chips, asks for missing details, and offers one-level **Undo** (it restores
+  the previous spec through `/api/spec`). The rule parser always runs; the
+  optional LLM patch only adds or corrects spec fields. The engine chip shows
+  which path answered.
+- **Collapsible sidebars.** The specs tree sits on the left and the copilot on
+  the right. Each has a close button; the 3D viewport expands into the freed
+  space and a slim rail stays at the edge to reopen it. The open/closed choice
+  is remembered in `localStorage`.
+- **Number fields.** Numeric values use a plain number input plus black
+  up/down steppers. There are no range sliders in the spec editor. Keyboard
+  entry, lock buttons, provenance tags and validation all still apply.
+- **Exploded viewer.** Drag to orbit, wheel to zoom deep toward the cursor,
+  shift-drag to pan. **Explode** moves every part along the vertical axis in
+  rigid z-bands over an extended 0–250% range, so the case, dial, hands,
+  bridges and gear train separate without stretching any mesh. Every part is
+  opaque and individually clickable: click a part to highlight it and see its
+  name, group and bounding size; click empty space, the × in the part chip, or
+  press Escape to clear it. **Gears** isolates the movement and complications
+  and opens the gear layers; **Layers** shows a side view of the fully exploded
+  assembly. The overlay reports visible layers and parts. Deep links: `#gears`,
+  `#layers`, `#dial`, `#crown`, `#three`.
+
+---
+
+## How a design is produced
+
+1. **Prompt → patches (optional AI, always rules first).** The rule parser maps
+   phrases to dotted spec paths. If `WATCHCAD_LLM_URL` is set, an
+   OpenAI-compatible endpoint may add or correct patches; it cannot write
+   geometry and the rules result is kept when the model fails. The same
+   `parse()` path is used by the copilot chat and by the CLI.
+2. **Spec.** The document is a nested dict with a field registry, defaults,
+   ranges, enums and provenance. Every write is tagged; user locks stop both
+   prompts and the solver from overwriting a value.
+3. **Solver.** Derivations run in dependency order: bore, dial, case, train,
+   barrel, torque, stack z-levels, hand lengths, quartz current, mass and a
+   checksum. Gear ratios are found with exact `Fraction` arithmetic; only the
+   final presentation profiles are approximated.
+4. **Parts.** Pure functions turn the solved spec into meshes with a small
+   dependency-free kernel (revolve, extrude, tube, dome, torus, sweep).
+5. **Verification.** Checks are labelled `calculated` / `estimated` /
+   `needs_test`, and failures carry one-click fixes.
+6. **Build.** Everything is written to one directory with a sha256 manifest.
+   Rebuilding an unchanged spec is a cache hit.
+
+The same pipeline serves the copilot, numeric controls, API and CLI — there is
+no UI-only shortcut and no server-side "magic" beyond this code.
+
+---
+
+## The spec: provenance, locks, patches
+
+A spec is plain JSON; `spec.json` in every package is the authoritative input.
+
+```python
+from watchcad.nlp import parse
+from watchcad.solver import solve
+
+result = parse("A 42 mm steel dive watch, date.")
+spec = result.spec
+
+spec.set("case.diameter_mm", 41.0, tag="user", note="typed in the form")
+spec.lock("case.diameter_mm")                # solver and prompts now skip it
+spec.get("derived.train.total_barrel_to_escape")
+solved, report = solve(spec)
+print(solved.summary())
+```
+
+Provenance tags:
+
+| tag | meaning |
+|---|---|
+| `user` | typed or stated by the user |
+| `derived` | computed by the solver, reproducible from other fields |
+| `sourced` | copied from an external source; URL and timestamp are kept |
+| `not_found` | looked for and not published; kept as `null` rather than invented |
+
+Operations: `get`, `set`, `patch` (JSON-patch style), `diff`, `validate`,
+`copy`, `to_json` / `from_json`, `from_dict`. `set()` increments
+`meta.version` and refuses a locked path unless `force=True`.
+
+Locks survive prompts: parsing "make it 44 mm" against a spec with
+`case.diameter_mm` locked keeps the old value and reports `locked, kept:
+case.diameter_mm` in the result.
+
+---
+
+## Verification without a single badge
+
+There is deliberately no overall "PASS". Each check answers a different kind of
+question:
+
+- **`calculated`** — closed-form arithmetic or geometry predicates. The number
+  or boolean is trustworthy inside the stated model.
+- **`estimated`** — a model with documented assumptions (torque, mass, spring
+  proportions). Trust the order of magnitude, not the last digit.
+- **`needs_test`** — physics that only a bench can settle (rate, amplitude,
+  water resistance, shock, magnetism, thermal behaviour).
+- **fail** — an actual contradiction in the spec or geometry, with a `fix`
+  object the UI can apply.
+
+A typical 42 mm mechanical watch reports about 25 calculated, 6 estimated and
+8 needs-test checks, 0 failures. A thin 40 mm × 5 mm case correctly fails
+geometry, stack and tolerance checks instead of pretending to be buildable.
+
+Layers: `spec`, `geometry`, `kinematics`, `energy`, `tolerance`,
+`manufacturability`, `physical`.
+
+---
+
+## Production package
+
+`watchcad build` writes ~65 files (about 7 MB for a mechanical design):
+
+```text
+spec.json / spec.md          source of truth + readable summary
+model.stl .obj .gltf         assembly meshes
+parts/<part>.stl             one mesh per component (~114 parts by default)
+drawings/front.svg           front view
+drawings/section.svg         case section
+drawings/train.svg           gear train layout
+drawings/notes.svg           notes and title block
+drawings/watch_sheet.dxf     ASCII DXF R12 sheet
+drawings/watch_drawings.pdf  4-page drawing set
+bom.csv / bom.md             bill of materials and rolled-up totals
+assembly.md                  assembly sequence and notes
+test_plan.md                 bench tests mapped to the checks
+dfm.md                       design-for-manufacture notes
+verification.md              full layered check report
+checks.json                  machine-readable checks
+step_status.json             honest STEP availability status
+manifest.json                sha256 of every file
+```
+
+`step_status.json` reports STEP as **unavailable**: writing real STEP needs an
+OpenCASCADE-class kernel, which is out of scope for the zero-dependency core.
+No placeholder `.step` file is emitted.
+
+---
+
+## HTTP API
+
+`serve` starts a threaded `http.server` on `127.0.0.1:8765` by default. The UI
+uses only these endpoints, so scripts can drive the same session:
+
+| method | path | body / query |
+|---|---|---|
+| GET | `/api/state` | spec, checks, summary, scene stats, derivation report |
+| GET | `/api/schema` | field registry, groups, complications, presets, ideas |
+| GET | `/api/scene` | per-part vertices/faces for the software renderer |
+| GET | `/api/builds` | last build manifest |
+| POST | `/api/prompt` | `{prompt, use_llm}` → applied patches, questions, state |
+| POST | `/api/set` | `{path, value, force}`; `409` if the path is locked |
+| POST | `/api/patch` | `{ops:[…]}` |
+| POST | `/api/lock` | `{path, locked}` |
+| POST | `/api/spec` | `{spec}` replace the whole document |
+| POST | `/api/reset` | `{preset?, name?}` |
+| POST | `/api/build` | `{per_part?}` → files and manifest |
+| GET | `/api/download/file` | `?path=<relative path inside the build>` |
+| GET | `/api/download/zip` | package as one archive |
+
+Example:
+
+```bash
+curl -s http://127.0.0.1:8765/api/state | python3 -m json.tool | head
+curl -s -X POST http://127.0.0.1:8765/api/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"36 mm titanium quartz watch, white dial","use_llm":false}'
+curl -s -X POST http://127.0.0.1:8765/api/build \
+  -H 'Content-Type: application/json' -d '{"per_part":true}'
+curl -s -o package.zip http://127.0.0.1:8765/api/download/zip
+```
+
+Downloads are restricted to the build directory; traversal attempts return
+`403`. The server binds to localhost, has no authentication and is not intended
+for exposure to a network.
+
+---
+
+## Optional LLM
+
+Rules always run and always produce a complete result. To let an
+OpenAI-compatible model propose extra patches:
+
+```bash
+export WATCHCAD_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
+export WATCHCAD_LLM_KEY=...            # optional
+export WATCHCAD_LLM_MODEL=...          # optional
+python3 -m watchcad prompt "..." -o spec.json
+```
+
+Setting `WATCHCAD_LLM_URL` enables the optional pass; pass `--no-llm` (CLI) or
+`"use_llm": false` (API) to force rules only. The endpoint receives the prompt,
+the current spec and the field registry; its reply is validated as dotted-path
+patches. Invalid, out-of-range or locked values are dropped. With no variables
+set, no network request is attempted.
+
+---
+
+## Architecture
+
+```text
+watchcad/
+  schema.py      field registry, Spec, provenance, locks, patches, validation
+  modules.py     complication registry: height, torque, envelope, conflicts
+  gears.py       exact Fraction ratio search; presentation tooth profiles
+  solver.py      derivation order, train layout, stack z-levels, torque, mass
+  mesh.py        dependency-free mesh kernel + STL/OBJ/glTF writers
+  parts.py       every component builder; build_scene()
+  verify.py      layered checks, same-plane collision, fixes
+  drawing.py     SVG, ASCII DXF and hand-written PDF from one canvas
+  exporters.py   BOM, assembly, test plan, DFM, docs, manifest
+  build.py       orchestration, determinism and cache
+  nlp.py         rule parser, presets, essential questions, optional LLM
+  api.py         ThreadingHTTPServer studio, session state, downloads
+  cli.py         new / prompt / verify / build / export / presets / show / serve
+web/
+  index.html, style.css, app.js   studio UI + canvas orbit/zoom/pan renderer
+tests/
+  test_watchcad.py               33 stdlib unittest tests
+  ui_smoke.js                    dependency-free browser/API smoke harness
+examples/                         seven verified specs
+```
+
+Some deliberate design choices:
+
+- **Exact ratios.** Wheel/pinion combinations are enumerated as `Fraction`s, so
+  target ratios are achieved exactly (error is reported in ppm) instead of
+  being approximated by floating-point searching.
+- **Stack from the crystal down.** Z-levels are anchored at the top, so a
+  design stays visually coherent when the case gets thicker or thinner.
+- **Planes, not just radii.** Wheels on different heights may overlap in plan;
+  same-plane collisions are checked with real clearances.
+- **Barrel bore = 34 % of movement width.** A documented empirical rule, kept in
+  one place and surfaced as an `estimated` check rather than a hidden constant.
+- **No fake STEP, no fake physics.** The package says what it cannot do.
+
+---
+
+## Honest limitations
+
+- **STEP is unavailable** without an OpenCASCADE-style kernel. STL/OBJ/glTF are
+  real meshes; the DXF is 2D geometry for drawings, not a solid model.
+- **Gear tooth profiles are presentation-grade** radial-cycloidal
+  approximations. Ratios are exact; contact stress, backlash and true involute
+  conjugate action are not modelled.
+- **Torque, spring and mass models are empirical** with documented constants.
+  They are `estimated`, not validated against a specific calibre.
+- **Dial openings (date, moonphase, subdials) are surface features** on the dial
+  mesh, not boolean cuts through the solid.
+- **No automatic brand/calibre lookup.** The `sourced` provenance tag, URL and
+  timestamp are supported, but fetching official pages is left to the caller or
+  to the optional LLM; nothing scrapes the web on its own.
+- **No screw threads, fillets, chamfers, jewels as bearings, lubrication,
+  escapement dynamics, FEA, tolerance Monte-Carlo or CAM toolpaths.**
+- **Bench properties are `needs_test`.** Rate, amplitude, water resistance,
+  shock, magnetism and thermal behaviour cannot be certified by this tool.
+- **The web UI is a software renderer** (depth-sorted canvas triangles), not a
+  GPU CAD viewer; very large assemblies are intentionally kept modest. It
+  offers orbit, pan, zoom, group visibility and view presets, but not
+  selection-aware editing, exploded views, section planes or measurement.
+- **Hosted/multi-user deployment is out of scope.** The server is a local
+  single-session studio with no authentication.
+- **Deferred from the original brief:** image/sketch input, a design critic,
+  Pareto optimisation, a RAG knowledge base, learned layout proposals, the
+  Electron shell, module marketplace and live collaboration. The deterministic
+  core exists so these can be added without changing the spec contract.
+
+---
+
+## Tests and verification coverage
+
+The suite covers the parts that must not silently break:
+
+- schema defaults, round-trip, provenance, versions, locks, diff/patch,
+  validation;
+- exact gear ratios and bounded tooth outlines;
+- mesh volume/winding and all three mesh exporters;
+- mechanical and quartz solving, stack ordering, centre distances, checksum;
+- layered verdicts, failure fixes, complication conflicts;
+- four drawing views, SVG/DXF/PDF structure;
+- package contents, manifest hashes, STEP status, build cache;
+- prompt parsing, preset coverage, locks and complication conflicts;
+- the full HTTP session: state, schema, scene, set, lock `409`, prompt, build,
+  file/zip download, traversal `403`;
+- CLI `new`, `verify` and `export`.
+
+The UI was exercised headlessly with Node against the real API (boot, copilot
+brief, undo, number steppers, explode 0–250%, deep zoom, per-part picking,
+opaque materials, gear/layer views, zoom, projection sanity) and in real
+Firefox through Marionette (rendered screenshots, stepper click, copilot brief,
+hover + part selection, sidebar close/reopen with persistence, zero runtime
+errors).
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). The original project brief remains the property
+of its author.

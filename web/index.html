@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>watchcad — parametric watch studio</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="mark">W</div>
+      <div>
+        <h1>WATCHCAD</h1>
+        <p>parametric watch studio</p>
+      </div>
+    </div>
+    <div id="summaryBar" class="summary"></div>
+    <div class="top-actions">
+      <button id="btnSave" class="btn ghost" title="download the spec JSON">Save spec</button>
+      <button id="btnLoad" class="btn ghost" title="load a spec JSON">Load</button>
+      <input id="fileLoad" type="file" accept="application/json,.json" hidden>
+      <button id="btnNew" class="btn ghost" title="start from the default spec">New</button>
+      <button id="btnBuildTop" class="btn primary">Build package</button>
+    </div>
+  </header>
+
+  <main class="layout" id="layout">
+    <aside class="left" id="leftPanel">
+      <section class="panel">
+        <h2>Model</h2>
+        <dl id="facts" class="facts"></dl>
+        <div id="why" class="why"></div>
+        <div class="view-actions">
+          <button class="btn small" data-view="three">3/4 view</button>
+          <button class="btn small" data-view="dial">Dial</button>
+          <button class="btn small" data-view="crown">Crown</button>
+          <button class="btn small" data-view="gears">Gears</button>
+          <button class="btn small" data-view="layers">Layers</button>
+          <button class="btn small" data-view="reset">Fit</button>
+        </div>
+      </section>
+
+      <nav class="tabs">
+        <button data-tab="spec" class="active">Spec</button>
+        <button data-tab="checks">Checks <span id="checkCount"></span></button>
+        <button data-tab="package">Package</button>
+        <button class="tab-close" data-close="left" title="Close the specs sidebar" aria-label="Close specs sidebar">×</button>
+      </nav>
+
+      <div id="tab-spec" class="tab-panel active">
+        <div id="specForm"></div>
+      </div>
+
+      <div id="tab-checks" class="tab-panel">
+        <div id="checkSummary" class="check-summary"></div>
+        <div id="checkFilters" class="filters"></div>
+        <div id="checkList"></div>
+      </div>
+
+      <div id="tab-package" class="tab-panel">
+        <div id="packageBody"></div>
+      </div>
+    </aside>
+
+    <section class="viewport">
+      <div class="viewer-badge">deterministic mesh · mm</div>
+      <div id="partHud" class="part-hud" hidden>
+        <span class="part-swatch"></span>
+        <div class="part-copy">
+          <b id="partName">—</b>
+          <span id="partMeta"></span>
+        </div>
+        <button class="part-clear" data-part-clear title="Clear part selection" aria-label="Clear part selection">×</button>
+      </div>
+      <canvas id="viewer"></canvas>
+      <div id="groupToggles" class="group-toggles"></div>
+      <div class="viewer-tools">
+        <label class="explode-control" title="Separate every part along the vertical axis so its layer is visible">
+          <span>Explode</span>
+          <input id="explode" type="range" min="0" max="250" step="1" value="0" aria-label="Vertical explode">
+          <b id="explodeValue">0%</b>
+        </label>
+        <div class="viewer-buttons">
+          <button class="viewer-btn" data-zoom="out" title="Zoom out">−</button>
+          <button class="viewer-btn" data-zoom="in" title="Zoom in">+</button>
+          <button class="viewer-btn wide" data-view="reset" title="Fit the visible parts">Fit</button>
+        </div>
+        <span id="layerInfo" class="layer-info">— layers</span>
+      </div>
+      <div class="viewer-hud">
+        <span id="viewerInfo">loading model…</span>
+        <span class="hint">drag orbit · wheel zoom to cursor · shift-drag pan · click a part</span>
+      </div>
+      <div id="loading" class="loading"><div><div class="spinner"></div>solving geometry</div></div>
+    </section>
+
+    <aside class="right" id="rightPanel">
+      <section class="panel copilot">
+        <div class="panel-head">
+          <h2>Design copilot</h2>
+          <span id="engineChip" class="engine-chip" title="The rule parser always runs. The optional LLM only proposes spec patches.">local rules</span>
+          <button class="panel-close" data-close="right" title="Close the copilot sidebar" aria-label="Close copilot sidebar">×</button>
+        </div>
+        <div id="chatLog" class="chat-log"></div>
+        <textarea id="prompt" placeholder="Tell the copilot what to design or change…"></textarea>
+        <div class="brief-actions">
+          <button id="btnParse" class="btn primary">Send brief</button>
+          <label class="checkline" title="Only works when WATCHCAD_LLM_URL is set; the rules parser is always used as a base.">
+            <input type="checkbox" id="useLlm"> LLM patch
+          </label>
+        </div>
+        <div id="examples" class="examples"></div>
+      </section>
+    </aside>
+  </main>
+
+  <button class="panel-rail rail-left" id="railSpecs" data-open="left" hidden
+    title="Open the specs sidebar" aria-label="Open specs sidebar">Specs</button>
+  <button class="panel-rail rail-right" id="railCopilot" data-open="right" hidden
+    title="Open the copilot sidebar" aria-label="Open copilot sidebar">Copilot</button>
+
+  <div id="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

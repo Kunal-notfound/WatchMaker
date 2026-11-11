@@ -1,0 +1,260 @@
+/* Headless smoke harness for the watchcad studio (no DOM package required).
+
+   Start the studio first, then run:
+
+       python3 -m watchcad serve --port 8766
+       node tests/ui_smoke.js
+
+   Override WATCHCAD_BASE when using another host or port. */
+const fs = require("fs");
+const path = require("path");
+const vm = require("vm");
+
+const BASE = process.env.WATCHCAD_BASE || "http://127.0.0.1:8766";
+const realFetch = global.fetch;
+
+class ClassList {
+  constructor() { this.set = new Set(); }
+  add(...names) { names.forEach((name) => this.set.add(name)); }
+  remove(...names) { names.forEach((name) => this.set.delete(name)); }
+  toggle(name, force) {
+    const on = force === undefined ? !this.set.has(name) : Boolean(force);
+    if (on) this.set.add(name); else this.set.delete(name);
+    return on;
+  }
+  contains(name) { return this.set.has(name); }
+}
+
+class El {
+  constructor(id = "") {
+    this.id = id;
+    this.innerHTML = "";
+    this.textContent = "";
+    this.value = "";
+    this.checked = false;
+    this.className = "";
+    this.classList = new ClassList();
+    this.dataset = {};
+    this.style = {};
+    this.clientWidth = 1200;
+    this.clientHeight = 800;
+    this.width = 1200;
+    this.height = 800;
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
+    this.listeners = {};
+    this.lastElementChild = { innerHTML: "" };
+  }
+  addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
+  removeEventListener() {}
+  setPointerCapture() {}
+  releasePointerCapture() {}
+  hasPointerCapture() { return false; }
+  getBoundingClientRect() { return { left: 0, top: 0, width: this.clientWidth, height: this.clientHeight }; }
+  getContext() { return ctx2d; }
+  querySelector() { return null; }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+  contains() { return false; }
+  matches() { return false; }
+  click() {
+    for (const fn of this.listeners.click || []) fn({ target: this, preventDefault() {} });
+  }
+}
+
+const ctx2d = new Proxy({
+  globalAlpha: 1, lineJoin: "round", fillStyle: "", strokeStyle: "", lineWidth: 1,
+}, {
+  get(target, key) {
+    if (key in target) return target[key];
+    return (...args) => args;
+  },
+  set(target, key, value) { target[key] = value; return true; },
+});
+
+const elements = new Map();
+const el = (id) => {
+  if (!elements.has(id)) elements.set(id, new El(id));
+  return elements.get(id);
+};
+el("viewer");
+el("loading");
+
+const document = {
+  activeElement: null,
+  querySelector(selector) {
+    if (selector.startsWith("#")) return el(selector.slice(1));
+    return null;
+  },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  createElement() { return new El(); },
+};
+
+const window = { devicePixelRatio: 1, addEventListener() {} };
+const stored = new Map();
+window.localStorage = {
+  getItem: (key) => (stored.has(key) ? stored.get(key) : null),
+  setItem: (key, value) => stored.set(key, String(value)),
+  removeItem: (key) => stored.delete(key),
+};
+const context = {
+  console, document, window,
+  localStorage: window.localStorage,
+  fetch: (path, options) => realFetch(BASE + path, options),
+  setTimeout, clearTimeout, setInterval, clearInterval,
+  requestAnimationFrame: (fn) => { fn(); return 1; },
+  structuredClone, JSON, Math, Number, String, Array, Object, Float32Array, Uint32Array, Uint16Array, Set, Map,
+  Blob: global.Blob,
+  URL: global.URL,
+  confirm: () => true,
+  alert: () => {},
+};
+context.globalThis = context;
+context.self = context;
+vm.createContext(context);
+
+const appPath = path.join(__dirname, "..", "web", "app.js");
+const source = fs.readFileSync(appPath, "utf8")
+  + `\nglobalThis.__t = {
+    get STATE() { return STATE; }, get SCHEMA() { return SCHEMA; },
+    get CHAT() { return CHAT; }, get V() { return V; },
+    boot, setView, setExplodeValue, zoomBy, runPrompt, undoPrompt,
+    renderChat, setField, syncFormValues, isVisible,
+    setPanelClosed, restorePanels, pickAt, selectPartAt, clearPartSelection,
+    get selected() { return V.selected; },
+  };\n`;
+vm.runInContext(source, context, { filename: "app.js" });
+
+const failures = [];
+const check = (condition, message) => {
+  if (condition) console.log(`  ok   ${message}`);
+  else { failures.push(message); console.log(`  FAIL ${message}`); }
+};
+const waitFor = async (fn, label, timeout = 15000) => {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    try { if (fn()) return; } catch { /* not ready */ }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+};
+
+(async () => {
+  const t = context.__t;
+  await waitFor(() => t.STATE && t.V.mesh, "boot + mesh");
+  console.log("boot");
+  check(t.STATE.spec.data.case.diameter_mm > 0, "state loaded");
+  check(t.V.mesh.triangles > 1000, `mesh loaded (${t.V.mesh.triangles} tris)`);
+  check(t.V.mesh.bandCount >= 5, `vertical bands = ${t.V.mesh.bandCount}`);
+  check(t.V.mesh.vertBand.length === t.V.mesh.pos.length / 3, "every vertex has a layer band");
+  check(t.V.mesh.triBand.length === t.V.mesh.triangles, "every triangle has a layer band");
+  check(t.V.mesh.triRange.length === t.V.mesh.triangles, "every triangle maps to a part");
+  check(t.V.mesh.alphas.every((alpha) => alpha === 1), "all parts render opaque");
+  check(t.V.mesh.selectedColors.length === t.V.mesh.triangles, "selection colors are precomputed");
+
+  console.log("fields");
+  const form = el("specForm").innerHTML;
+  check(form.includes('data-number'), "numeric fields render number inputs");
+  check(form.includes('class="stepper"'), "numeric fields render steppers");
+  check(!form.includes("data-slider"), "no slider markup remains");
+  check(!form.includes('type="range"'), "no range input remains in spec fields");
+
+  console.log("explode");
+  const before = t.V.dist;
+  t.setExplodeValue(100, true);
+  check(t.V.explode === 1, "explode reaches 100%");
+  check(el("explodeValue").textContent === "100%", "explode label updates");
+  check(t.V.dist !== before, "fit recalculates distance");
+  check(/layers/.test(el("layerInfo").textContent), `layer readout: ${el("layerInfo").textContent}`);
+  check(t.V.mesh.bandZ[t.V.mesh.bandCount - 1] > t.V.mesh.bandZ[0], "bands are sorted vertically");
+  t.setExplodeValue(250, true);
+  check(t.V.explode === 2.5, "explode extends to 250%");
+  check(Number(el("explode").value) === 250, "explode slider reaches 250%");
+  check(el("explodeValue").textContent === "250%", "explode label shows the extended range");
+  t.setExplodeValue(100, true);
+
+  console.log("views");
+  t.setView("gears");
+  check(t.V.isolate instanceof Set, "gears view isolates the movement");
+  check(t.V.isolate.has("Movement") && t.V.isolate.has("Complications"), "gears view keeps movement + complications");
+  check(t.V.explode >= 0.85, "gears view separates the gear layers");
+  check(t.isVisible("Movement") && !t.isVisible("Dial"), "dial hidden in gears view");
+  t.setView("layers");
+  check(t.V.isolate === null, "layers view shows the full assembly");
+  check(t.V.explode === 1, "layers view opens the stack fully");
+  t.setView("reset");
+  check(t.V.focus.every((value) => Number.isFinite(value)), "fit produces a finite focus point");
+
+  console.log("picking");
+  let hit = null, hitX = 0, hitY = 0;
+  for (let y = 120; y < 700 && !hit; y += 18) {
+    for (let x = 140; x < 1100; x += 18) {
+      const candidate = t.pickAt(x, y);
+      if (candidate) { hit = candidate; hitX = x; hitY = y; break; }
+    }
+  }
+  check(Boolean(hit), `ray pick finds a part${hit ? ` (${hit.name})` : ""}`);
+  if (hit) {
+    t.selectPartAt(hitX, hitY);
+    check(t.V.selected === hit.index, "click selects the picked part");
+    check(el("partHud").hidden === false, "part readout appears");
+    check(el("partName").textContent === hit.name, `part readout names ${hit.name}`);
+    check(el("partMeta").textContent.includes("mm"), `part readout reports size: ${el("partMeta").textContent}`);
+    t.clearPartSelection();
+    check(t.V.selected === null && el("partHud").hidden === true, "selection can be cleared");
+  }
+
+  console.log("panels");
+  check(!el("leftPanel").hidden && !el("rightPanel").hidden, "both sidebars start open");
+  t.setPanelClosed("left", true);
+  check(el("leftPanel").hidden, "left specs panel closes");
+  check(el("railSpecs").hidden === false, "specs reopen rail appears");
+  check(el("layout").classList.contains("hide-left"), "layout drops the left column");
+  check(stored.get("watchcad.panel.left") === "closed", "left panel state persists");
+  t.setPanelClosed("right", true);
+  check(el("rightPanel").hidden, "right copilot panel closes");
+  check(el("railCopilot").hidden === false, "copilot reopen rail appears");
+  check(el("layout").classList.contains("hide-right"), "layout drops the right column");
+  t.restorePanels();
+  check(el("leftPanel").hidden && el("rightPanel").hidden, "closed panels survive a reload");
+  t.setPanelClosed("left", false);
+  check(!el("leftPanel").hidden && el("railSpecs").hidden, "left panel reopens from its rail");
+  check(!el("layout").classList.contains("hide-left"), "layout restores the left column");
+  t.setPanelClosed("right", false);
+  check(!el("rightPanel").hidden && el("railCopilot").hidden, "right panel reopens from its rail");
+
+  console.log("zoom");
+  const distance = t.V.dist;
+  t.zoomBy(0.8);
+  check(t.V.dist < distance, "zoom in reduces camera distance");
+  t.zoomBy(1.25);
+  check(Math.abs(t.V.dist - distance) < 1e-6, "zoom out restores the distance");
+  for (let i = 0; i < 24; i += 1) t.zoomBy(0.8);
+  check(t.V.dist < distance * 0.15, `zoom reaches a much closer range (${t.V.dist.toFixed(2)})`);
+  check(t.V.dist <= t.V.focusRadius * 0.06 + 1e-6, "zoom clamps at the near limit");
+  t.setView("reset");
+
+  console.log("copilot");
+  check(t.CHAT.messages.length >= 1, "copilot has an opening message");
+  check(el("chatLog").innerHTML.includes("Design copilot") === false, "chat log does not duplicate the panel title");
+  const original = t.STATE.spec.data.case.diameter_mm;
+  await t.runPrompt("Make it 40 mm titanium with a dive bezel");
+  check(t.STATE.spec.data.case.diameter_mm === 40, `brief changed diameter to ${t.STATE.spec.data.case.diameter_mm}`);
+  check(t.CHAT.messages.some((m) => m.role === "user"), "user message recorded");
+  check(t.CHAT.messages.some((m) => m.role === "assistant" && m.patches?.length), "assistant returned change chips");
+  check(el("chatLog").innerHTML.includes('data-undo="1"'), "undo button rendered");
+  check(el("engineChip").textContent.length > 0, `engine chip: ${el("engineChip").textContent}`);
+
+  console.log("undo");
+  await t.undoPrompt();
+  check(t.STATE.spec.data.case.diameter_mm === original, "undo restores the previous diameter");
+  check(t.CHAT.prevSpec === null, "undo stack is consumed");
+  check(el("chatLog").innerHTML.includes("Reverted"), "undo is acknowledged in the chat");
+
+  console.log(failures.length ? `\n${failures.length} failure(s)` : "\nall checks passed");
+  process.exit(failures.length ? 1 : 0);
+})().catch((error) => {
+  console.error("harness error:", error.stack || error);
+  process.exit(1);
+});
