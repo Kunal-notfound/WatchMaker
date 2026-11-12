@@ -41,7 +41,7 @@ python3 -m watchcad export dress.json --format pdf -o out/dress.pdf
 Run the test suite:
 
 ```bash
-python3 -m unittest discover -s tests -v     # 33 tests, ~4 s
+python3 -m unittest discover -s tests -v     # 57 tests, ~16 s
 
 # browser smoke test (Node 18+, no npm packages)
 python3 -m watchcad serve --port 8766 &
@@ -81,6 +81,12 @@ The generated specs are in [`examples/`](examples/).
   the previous spec through `/api/spec`). The rule parser always runs; the
   optional LLM patch only adds or corrects spec fields. The engine chip shows
   which path answered.
+- **Agent controls.** The copilot header has an autonomy selector (suggest /
+  approval / safe / autonomous), Stop, Undo, Redo and History. Runs stream a
+  tool-by-tool timeline with iteration numbers; the result shows a spec diff,
+  the verification before/after and any approval or variant cards. Tool
+  arguments and raw results expand per step. The session chip identifies the
+  browser's isolated session.
 - **Collapsible sidebars.** The specs tree sits on the left and the copilot on
   the right. Each has a close button; the 3D viewport expands into the freed
   space and a slim rail stays at the edge to reopen it. The open/closed choice
@@ -217,6 +223,56 @@ No placeholder `.step` file is emitted.
 
 ---
 
+## Autonomous design agent
+
+The studio can run an autonomous, tool-using design loop on top of the same
+deterministic engine. The model orchestrates; it never writes geometry, a mesh
+or executable code. Each step is a validated tool call:
+
+| kind | tools |
+|---|---|
+| read | `get_current_spec`, `get_verification_report`, `inspect_component`, `get_field_dependencies`, `compare_specs`, `get_design_history`, `inspect_geometry` |
+| act | `update_spec`, `apply_patch`, `run_solver`, `run_verification`, `build_package` |
+
+Acting tools run on a shadow copy of the spec. The live design is replaced only
+after the solver and verifier have run, and a failed attempt is rolled back.
+Locked fields are refused by the tool executor itself, not merely by the prompt.
+The loop is bounded (three repair iterations by default, configurable) and every
+run reports the verification summary before and after the change.
+
+### Autonomy modes
+
+| mode | behaviour |
+|---|---|
+| `suggest` | Propose the validated change and its diff. Nothing is staged or written. |
+| `approval` | Stage the change on a shadow copy, return an approval token, and write only after `POST /api/agent/approve`. |
+| `safe` | Commit only when the change does not increase the number of failing checks; otherwise roll back. |
+| `autonomous` | Commit after the solver and verifier succeed, even if unrelated checks still fail. A repair request (`"fix the failing checks"`) will attempt bounded verifier-guided repairs first. |
+
+Precedence is fixed: user locks and constraints, then values stated explicitly
+in the current request, then the model's interpretation, then the heuristic
+parser, then defaults. The UI exposes the mode, a live tool/iteration timeline,
+a spec diff, approval controls, stop, undo/redo, history and proposed variants.
+
+```bash
+# propose only
+curl -s -X POST http://127.0.0.1:8765/api/agent/run \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"make the dial blue","mode":"suggest","use_llm":false}'
+
+# autonomous, isolated browser session
+curl -s -X POST http://127.0.0.1:8765/api/agent/run \
+  -H 'Content-Type: application/json' \
+  -H 'X-WatchCAD-Session: my-session' \
+  -d '{"prompt":"fix the failing checks","mode":"autonomous"}'
+```
+
+Sessions are isolated by `X-WatchCAD-Session`, a `?session=` query parameter or
+a `session_id` body field. The default session keeps using the process-wide
+`STUDIO`, so existing scripts and `/api/prompt` are unchanged.
+
+---
+
 ## HTTP API
 
 `serve` starts a threaded `http.server` on `127.0.0.1:8765` by default. The UI
@@ -254,6 +310,34 @@ Downloads are restricted to the build directory; traversal attempts return
 `403`. The server binds to localhost, has no authentication and is not intended
 for exposure to a network.
 
+Agent and session endpoints:
+
+| method | path | body / query |
+|---|---|---|
+| POST | `/api/agent/run` | `{prompt, mode?, use_llm?, max_iterations?, stream?}`; streaming returns SSE frames |
+| POST | `/api/agent/approve` | `{token}` → apply a staged change |
+| POST | `/api/agent/reject` | `{token?}` → discard a staged change |
+| POST | `/api/agent/cancel` | `{run_id?}` → stop a running loop |
+| POST | `/api/agent/undo` | restore the previous version |
+| POST | `/api/agent/redo` | restore the next version |
+| POST | `/api/agent/variant` | `{variant:{changes:[…]}}` → validate and apply one proposal |
+| GET | `/api/agent/history` | versions, conversation, design memory, pending approval |
+| GET | `/api/agent/version` | `?id=<version-id-or-index>` → full historical spec |
+| GET | `/api/agent/tools` | tool catalogue plus knowledge summary |
+| GET | `/api/agent/nlp` | `?q=<text>` → deterministic intent |
+| GET | `/api/agent/knowledge` | `?q=<text>&category=…` → materials/components |
+| GET | `/api/agent/variants` | deterministic variation proposals |
+| GET | `/api/session` | current session, conversation and memory |
+| GET | `/api/sessions` | list isolated sessions |
+| POST | `/api/session/new` | `{title?}` → create a session |
+| POST | `/api/session/drop` | drop the current non-default session |
+
+`POST /api/agent/run` with `"stream": true` emits `text/event-stream` frames of
+type `start`, `timeline`, `result` or `error`, followed by an `end` event.
+Without streaming it returns the same result object as JSON. The existing
+`/api/prompt` fields (`patches`, `questions`, `notes`, `engine`, `applied`,
+`skipped_locked`) are preserved.
+
 ---
 
 ## Optional LLM
@@ -265,6 +349,7 @@ OpenAI-compatible model propose extra patches:
 export WATCHCAD_LLM_URL=http://127.0.0.1:11434/v1/chat/completions
 export WATCHCAD_LLM_KEY=...            # optional
 export WATCHCAD_LLM_MODEL=...          # optional
+export WATCHCAD_LLM_TIMEOUT=30         # optional, seconds
 python3 -m watchcad prompt "..." -o spec.json
 ```
 
@@ -273,6 +358,13 @@ Setting `WATCHCAD_LLM_URL` enables the optional pass; pass `--no-llm` (CLI) or
 the current spec and the field registry; its reply is validated as dotted-path
 patches. Invalid, out-of-range or locked values are dropped. With no variables
 set, no network request is attempted.
+
+For the agent, the same endpoint is called with native OpenAI tool definitions.
+A model can read state, propose field changes and ask for the solver or
+verifier to run; it cannot bypass the tool executor, alter derived fields or
+inspect mesh vertices. If the endpoint fails, times out or returns malformed
+tool arguments, the run falls back to the deterministic local planner and says
+so in the engine label and timeline.
 
 ---
 
@@ -291,12 +383,24 @@ watchcad/
   exporters.py   BOM, assembly, test plan, DFM, docs, manifest
   build.py       orchestration, determinism and cache
   nlp.py         rule parser, presets, essential questions, optional LLM
-  api.py         ThreadingHTTPServer studio, session state, downloads
+  llm.py         optional OpenAI-compatible client with native tool calls
+  api.py         ThreadingHTTPServer studio, sessions, agent endpoints, downloads
   cli.py         new / prompt / verify / build / export / presets / show / serve
+  agent/
+    orchestrator.py   run loop, planning, bounded repair, commit/stage/rollback
+    planner.py        deterministic intent detection, local plan, variants
+    tools.py          typed tool schemas and read/action handlers
+    tool_executor.py  argument validation, shadow copy, diff, commit, cancel
+    evaluator.py      verification outcome and repair candidates
+    context.py        sessions, conversation, design memory, versions, approvals
+    models.py         JSON-serialisable agent state and timeline dataclasses
+    prompts.py        system prompt and model context
+    knowledge.py      materials, components and finishes reference
 web/
   index.html, style.css, app.js   studio UI + canvas orbit/zoom/pan renderer
 tests/
-  test_watchcad.py               33 stdlib unittest tests
+  test_watchcad.py               35 engine/API/CLI tests
+  test_agent.py                  22 deterministic agent/API tests
   ui_smoke.js                    dependency-free browser/API smoke harness
 examples/                         seven verified specs
 ```
@@ -336,14 +440,20 @@ Some deliberate design choices:
   shock, magnetism and thermal behaviour cannot be certified by this tool.
 - **The web UI is a software renderer** (depth-sorted canvas triangles), not a
   GPU CAD viewer; very large assemblies are intentionally kept modest. It
-  offers orbit, pan, zoom, group visibility and view presets, but not
-  selection-aware editing, exploded views, section planes or measurement.
+  offers orbit, pan, zoom, group visibility, view presets, exploded views and
+  per-part picking, but not section planes or measurement.
+- **Sessions are in-memory.** Isolated sessions, conversation memory, approvals
+  and version history live for the life of the server process; there is no
+  database, user account or authentication layer. Restarting the server returns
+  to the starter design.
 - **Hosted/multi-user deployment is out of scope.** The server is a local
-  single-session studio with no authentication.
-- **Deferred from the original brief:** image/sketch input, a design critic,
-  Pareto optimisation, a RAG knowledge base, learned layout proposals, the
-  Electron shell, module marketplace and live collaboration. The deterministic
-  core exists so these can be added without changing the spec contract.
+  studio; the session header separates browser tabs, not untrusted users.
+- **The agent is bounded, not open-ended.** It can interpret a request, use
+  validated tools, repair within three iterations by default, critique,
+  explain, propose variants and build a package. It does not perform Pareto
+  optimisation, learned layout proposals, image/sketch input, the Electron
+  shell, a module marketplace or live collaboration. The deterministic core
+  exists so those can be added without changing the spec contract.
 
 ---
 
@@ -362,6 +472,10 @@ The suite covers the parts that must not silently break:
 - prompt parsing, preset coverage, locks and complication conflicts;
 - the full HTTP session: state, schema, scene, set, lock `409`, prompt, build,
   file/zip download, traversal `403`;
+- the agent: shadow-copy commits, suggest/approval/autonomous modes, locked-field
+  denial, bounded verifier-guided repair, undo/redo, variants, tool-argument
+  validation, cancellation, scripted model tool calls, LLM fallback, prompt
+  precedence, intent detection and the streaming agent endpoints;
 - CLI `new`, `verify` and `export`.
 
 The UI was exercised headlessly with Node against the real API (boot, copilot

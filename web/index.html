@@ -98,16 +98,54 @@
     <aside class="right" id="rightPanel">
       <section class="panel copilot">
         <div class="panel-head">
-          <h2>Design copilot</h2>
-          <span id="engineChip" class="engine-chip" title="The rule parser always runs. The optional LLM only proposes spec patches.">local rules</span>
-          <button class="panel-close" data-close="right" title="Close the copilot sidebar" aria-label="Close copilot sidebar">×</button>
+          <h2>Design agent</h2>
+          <span id="engineChip" class="engine-chip" title="The rule parser always runs. The optional LLM only chooses validated tools.">local rules</span>
+          <span id="sessionChip" class="session-chip" title="This browser session is isolated from other designs">default</span>
+          <button class="panel-close" data-close="right" title="Close the agent sidebar" aria-label="Close agent sidebar">×</button>
         </div>
+
+        <div class="agent-controls">
+          <label class="autonomy" title="Suggest only: show changes. Require approval: stage changes. Autonomous: apply verified safe changes.">
+            <span>Autonomy</span>
+            <select id="autonomy">
+              <option value="suggest">Suggest only</option>
+              <option value="approval">Require approval</option>
+              <option value="safe">Safe changes only</option>
+              <option value="autonomous" selected>Autonomous</option>
+            </select>
+          </label>
+          <button id="btnStop" class="btn small danger" hidden title="Stop the running agent; nothing unverified is committed">Stop</button>
+          <button id="btnUndo" class="btn small" title="Restore the previous design version">Undo</button>
+          <button id="btnRedo" class="btn small" title="Restore the next design version">Redo</button>
+          <button id="btnHistory" class="btn small" title="Show design history and memory">History</button>
+        </div>
+
+        <div id="agentStatus" class="agent-status" hidden></div>
+        <div id="agentApproval" class="agent-approval" hidden></div>
+
+        <details id="agentTimelineBox" class="agent-box" open>
+          <summary><span>Execution timeline</span><b id="agentIterations"></b></summary>
+          <div id="agentTimeline" class="agent-timeline"></div>
+        </details>
+
+        <details id="agentDiffBox" class="agent-box">
+          <summary><span>Spec diff</span><b id="agentChangeCount"></b></summary>
+          <div id="agentDiff" class="agent-diff"></div>
+        </details>
+
+        <details id="agentVariantsBox" class="agent-box" hidden>
+          <summary><span>Design alternatives</span><b id="agentVariantCount"></b></summary>
+          <div id="agentVariants" class="agent-variants"></div>
+        </details>
+
+        <div id="agentHistory" class="agent-history" hidden></div>
+
         <div id="chatLog" class="chat-log"></div>
-        <textarea id="prompt" placeholder="Tell the copilot what to design or change…"></textarea>
+        <textarea id="prompt" placeholder="Ask the agent to design, explain, critique, repair or compare…"></textarea>
         <div class="brief-actions">
-          <button id="btnParse" class="btn primary">Send brief</button>
-          <label class="checkline" title="Only works when WATCHCAD_LLM_URL is set; the rules parser is always used as a base.">
-            <input type="checkbox" id="useLlm"> LLM patch
+          <button id="btnParse" class="btn primary">Run agent</button>
+          <label class="checkline" title="Only works when WATCHCAD_LLM_URL is set; the validated tool layer is always used.">
+            <input type="checkbox" id="useLlm"> LLM planning
           </label>
         </div>
         <div id="examples" class="examples"></div>

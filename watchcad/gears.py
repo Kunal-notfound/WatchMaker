@@ -206,9 +206,10 @@ def gear_profile(teeth: int, module: float, points: int = 5,
     pitch_angle = 2 * math.pi / teeth
     half_pitch = pitch_angle / 2
 
-    # tooth thickness at the pitch circle: half the circular pitch for wheels,
-    # a little stouter for small pinions
-    tooth_half = (0.32 if teeth < 12 else 0.25) * pitch_angle
+    # Tooth thickness at the pitch circle is half the circular pitch for both
+    # wheels and pinions.  A thicker pinion tooth (previously 0.32) closes the
+    # mating gap and makes the two outlines interfere even at the correct phase.
+    tooth_half = 0.24 * pitch_angle
     root_half = min(half_pitch * 0.96, tooth_half + (half_pitch - tooth_half) * 0.78)
     tip_half = tooth_half * 0.34
 
@@ -247,6 +248,106 @@ def gear_profile(teeth: int, module: float, points: int = 5,
                 tooth_thickness_mm=2 * tooth_half * r_pitch,
                 pitch_mm=2 * math.pi * r_pitch)
 
+
+def mesh_rotation(wheel_teeth: int, pinion_teeth: int,
+                  line_angle: float) -> tuple[float, float]:
+    """Angles that put a wheel tooth and a pinion gap on the centre line.
+
+    The profiles start with a tooth centred on local angle zero.  A pinion gap
+    is half a pitch away from its tooth centre.  Rotating the pinion so that gap
+    faces the wheel gives a valid, backlash-friendly mesh without trial and
+    error.
+    """
+    pinion_pitch = 2.0 * math.pi / max(6, int(pinion_teeth))
+    return line_angle, line_angle + math.pi - pinion_pitch / 2.0
+
+
+def profile_polygon(teeth: int, module: float, rotation: float = 0.0,
+                    center: tuple[float, float] = (0.0, 0.0),
+                    points: int | None = None) -> tuple[list[tuple[float, float]], dict]:
+    """A profile placed in world coordinates (rotation in radians)."""
+    prof = gear_profile(teeth, module,
+                        points=points if points is not None
+                        else (3 if teeth > 40 else 4))
+    ca, sa = math.cos(rotation), math.sin(rotation)
+    cx, cy = center
+    placed = [(x * ca - y * sa + cx, x * sa + y * ca + cy)
+              for x, y in prof["points"]]
+    return placed, prof
+
+
+def _segments_intersect(a, b, c, d) -> bool:
+    def cross(o, p, q):
+        return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0])
+
+    d1 = cross(c, d, a)
+    d2 = cross(c, d, b)
+    d3 = cross(a, b, c)
+    d4 = cross(a, b, d)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _point_in_polygon(point, poly) -> bool:
+    x, y = point
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and \
+                x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _segments(poly, near=None, window: float = 0.0):
+    out = []
+    for i in range(len(poly)):
+        a = poly[i]
+        b = poly[(i + 1) % len(poly)]
+        if near is not None:
+            x0, x1 = min(a[0], b[0]), max(a[0], b[0])
+            y0, y1 = min(a[1], b[1]), max(a[1], b[1])
+            if x1 < near[0] - window or x0 > near[0] + window:
+                continue
+            if y1 < near[1] - window or y0 > near[1] + window:
+                continue
+        out.append((a, b))
+    return out
+
+
+def polygons_intersect(a, b, near=None, window: float = 0.0) -> bool:
+    """True when two closed polygons overlap.
+
+    Passing ``near`` and ``window`` restricts the test to segments close to a
+    contact point, which keeps the meshing check cheap.  Without a window this
+    is an exact segment/containment test for the sampled outlines.
+    """
+    seg_a = _segments(a, near, window)
+    seg_b = _segments(b, near, window)
+    for p0, p1 in seg_a:
+        for q0, q1 in seg_b:
+            if _segments_intersect(p0, p1, q0, q1):
+                return True
+    if near is not None:
+        return False
+    return _point_in_polygon(a[0], b) or _point_in_polygon(b[0], a)
+
+
+def meshing_outlines(wheel_teeth: int, pinion_teeth: int, module: float,
+                     wheel_pos: tuple[float, float],
+                     pinion_pos: tuple[float, float],
+                     points: int | None = None):
+    """Wheel and pinion outlines placed and phased for one mesh."""
+    theta = math.atan2(pinion_pos[1] - wheel_pos[1],
+                       pinion_pos[0] - wheel_pos[0])
+    wheel_rot, pinion_rot = mesh_rotation(wheel_teeth, pinion_teeth, theta)
+    wheel, wp = profile_polygon(wheel_teeth, module, wheel_rot, wheel_pos, points)
+    pinion, pp = profile_polygon(pinion_teeth, module, pinion_rot, pinion_pos, points)
+    contact = (wheel_pos[0] + wp["r_pitch"] * math.cos(theta),
+               wheel_pos[1] + wp["r_pitch"] * math.sin(theta))
+    return wheel, pinion, contact
 
 
 def escape_wheel_ratio(beat_rate_bph: float, escape_teeth: int = 15) -> float:

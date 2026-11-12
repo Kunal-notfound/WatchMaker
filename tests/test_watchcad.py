@@ -108,6 +108,17 @@ class GearTests(unittest.TestCase):
         self.assertLess(wheel["r_root"], wheel["r_pitch"])
         self.assertLess(wheel["r_pitch"], wheel["r_tip"])
 
+    def test_meshing_outlines_interleave_and_catch_bad_phase(self):
+        wheel, pinion, contact = gears.meshing_outlines(
+            60, 6, 0.12, (0.0, 0.0), (3.96, 0.0))
+        window = 0.36
+        self.assertFalse(gears.polygons_intersect(
+            wheel, pinion, near=contact, window=window))
+        # Same rotation with an even pinion puts tooth against tooth.
+        unphased, _ = gears.profile_polygon(6, 0.12, 0.0, (3.96, 0.0))
+        self.assertTrue(gears.polygons_intersect(
+            wheel, unphased, near=contact, window=window))
+
 
 class MeshTests(unittest.TestCase):
     def test_box_volume(self):
@@ -232,6 +243,13 @@ class VerifyTests(unittest.TestCase):
         checks = verify(spec, build_scene(spec))
         self.assertIn("spec.complication_conflicts",
                       [c["id"] for c in checks if c["passed"] is False])
+
+    def test_default_meshing_teeth_do_not_interfere(self):
+        spec = solved()
+        checks = verify(spec, build_scene(spec))
+        clearance = next(c for c in checks if c["id"] == "geometry.gear_interference")
+        self.assertTrue(clearance["passed"], clearance["detail"])
+        self.assertIn("clear", clearance["detail"])
 
 
 class DrawingTests(unittest.TestCase):

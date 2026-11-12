@@ -40,6 +40,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import exporters
+from .agent.context import AgentCancelled, AgentTimeout, RunControl, SessionManager
+from .agent.evaluator import count_failures
+from .agent.knowledge import categories as knowledge_categories
+from .agent.knowledge import lookup as knowledge_lookup
+from .agent.knowledge import summary as knowledge_summary
+from .agent.orchestrator import AgentOrchestrator, apply_variant, normalize_mode
+from .agent.planner import detect_intent, build_variants
+from .agent.tools import tool_catalog
 from .build import BuildResult, build, slugify
 from .modules import MODULES, QUARTZ_MODULES
 from .nlp import describe, ideas, parse, preset_prompt
@@ -146,6 +154,10 @@ def _starter_spec() -> Spec:
 
 STUDIO = Studio()
 
+# The default session binds to the module-level ``STUDIO`` on every lookup, so
+# tests (and embedders) can replace it.  Other sessions get their own studio.
+SESSIONS = SessionManager(lambda: STUDIO, lambda: Studio())
+
 
 # ---------------------------------------------------------------------------
 # HTTP
@@ -246,48 +258,99 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             self._error(500, f"{type(exc).__name__}: {exc}")
 
+    # -- sessions ---------------------------------------------------------
+    def _session_id(self, query: dict | None = None, body: dict | None = None) -> str:
+        value = self.headers.get("X-WatchCAD-Session") or ""
+        if not value and query:
+            value = (query.get("session") or [""])[0]
+        if not value and body:
+            value = str(body.get("session_id") or "")
+        return value or "default"
+
+    def _session(self, query: dict | None = None, body: dict | None = None):
+        return SESSIONS.get(self._session_id(query, body))
+
     def _api_get(self, route: str, query: dict) -> None:
+        session = self._session(query)
+        studio = session.studio
         if route == "/api/state":
-            self._json(200, STUDIO.snapshot())
+            payload = studio.snapshot({"session": session.conversation_payload(),
+                                       "agent": session.last_agent})
+            self._json(200, payload)
         elif route == "/api/schema":
-            self._json(200, _schema_payload())
+            self._json(200, _schema_payload(studio))
         elif route == "/api/scene":
-            with STUDIO.lock:
-                parts = [p.to_viewer() for p in STUDIO.scene.get("parts", [])]
+            with studio.lock:
+                parts = [p.to_viewer() for p in studio.scene.get("parts", [])]
                 payload = {"parts": parts,
-                           "tree": STUDIO.scene.get("tree", {}),
-                           "mass_g": STUDIO.scene.get("mass_g", 0),
-                           "bounds": STUDIO.scene.get("bounds", {}),
-                           "triangles": STUDIO.scene.get("triangles", 0)}
+                           "tree": studio.scene.get("tree", {}),
+                           "mass_g": studio.scene.get("mass_g", 0),
+                           "bounds": studio.scene.get("bounds", {}),
+                           "triangles": studio.scene.get("triangles", 0)}
             self._json(200, payload)
         elif route == "/api/builds":
-            self._json(200, STUDIO.last_build.to_dict() if STUDIO.last_build else {"build": None})
+            self._json(200, studio.last_build.to_dict() if studio.last_build else {"build": None})
+        elif route == "/api/session":
+            self._json(200, session.to_dict())
+        elif route == "/api/sessions":
+            self._json(200, {"sessions": SESSIONS.list(),
+                             "current": session.session_id})
+        elif route == "/api/agent/tools":
+            self._json(200, {"tools": tool_catalog(),
+                             "knowledge": knowledge_summary(),
+                             "knowledge_categories": knowledge_categories()})
+        elif route == "/api/agent/history":
+            payload = session.conversation_payload()
+            payload["memory"] = session.memory.to_dict()
+            payload["history"] = session.history(40)
+            payload["pending"] = session.pending
+            self._json(200, payload)
+        elif route == "/api/agent/nlp":
+            self._json(200, detect_intent((query.get("q") or [""])[0]).to_dict())
+        elif route == "/api/agent/knowledge":
+            q = (query.get("q") or [""])[0]
+            self._json(200, knowledge_lookup(q, category=(query.get("category") or [None])[0]))
+        elif route == "/api/agent/version":
+            key = (query.get("id") or [""])[0]
+            target = next((v for v in session.versions
+                           if str(v.version_id) == key or str(v.index) == key), None)
+            if target is None:
+                self._error(404, f"unknown version {key}")
+                return
+            self._json(200, target.to_dict(include_spec=True))
+        elif route == "/api/agent/variants":
+            self._json(200, {"variants": build_variants(studio)})
         elif route == "/api/download/file":
             self._download_file(query)
         elif route == "/api/download/zip":
-            self._download_zip()
+            self._download_zip(query)
         else:
             self._error(404, f"unknown endpoint {route}")
 
     def _api_post(self, route: str, body: dict) -> None:
+        session = self._session(body=body)
+        studio = session.studio
+
         if route == "/api/prompt":
             prompt = str(body.get("prompt", ""))
             if not prompt.strip():
                 self._error(400, "prompt is empty")
                 return
-            with STUDIO.lock:
-                result = parse(prompt, base=STUDIO.solved,
+            with studio.lock:
+                result = parse(prompt, base=studio.solved,
                                use_llm=bool(body.get("use_llm", True)),
                                name=body.get("name") or None)
-                STUDIO.spec = result.spec
-                STUDIO.rebuild()
-                payload = STUDIO.snapshot({
+                studio.spec = result.spec
+                studio.rebuild()
+                session.checkpoint("Prompt: " + prompt[:60], "prompt")
+                payload = studio.snapshot({
                     "patches": result.patches,
                     "questions": result.questions,
                     "notes": result.notes,
                     "engine": result.engine,
                     "applied": result.applied,
                     "skipped_locked": result.skipped,
+                    "session": session.conversation_payload(),
                 })
             self._json(200, payload)
 
@@ -299,29 +362,33 @@ class Handler(BaseHTTPRequestHandler):
             if "value" not in body:
                 self._error(400, "value is required")
                 return
-            ok = STUDIO.set(path, body["value"], force=bool(body.get("force", False)))
+            ok = studio.set(path, body["value"], force=bool(body.get("force", False)))
             if not ok:
                 self._error(409, f"{path} is locked")
                 return
-            self._json(200, STUDIO.snapshot())
+            session.checkpoint(f"Set {path}", "manual")
+            self._json(200, studio.snapshot())
 
         elif route == "/api/patch":
             ops = body.get("ops") or []
             if not isinstance(ops, list):
                 self._error(400, "ops must be a list")
                 return
-            applied = STUDIO.patch(ops)
-            self._json(200, STUDIO.snapshot({"applied": applied}))
+            applied = studio.patch(ops)
+            if applied:
+                session.checkpoint("Manual patch", "manual")
+            self._json(200, studio.snapshot({"applied": applied}))
 
         elif route == "/api/lock":
             path = str(body.get("path", ""))
             if not path:
                 self._error(400, "path is required")
                 return
-            with STUDIO.lock:
-                STUDIO.spec.lock(path, bool(body.get("locked", True)))
-                STUDIO.rebuild()
-                payload = STUDIO.snapshot()
+            with studio.lock:
+                studio.spec.lock(path, bool(body.get("locked", True)))
+                studio.rebuild()
+                session.checkpoint(f"Lock {path}", "lock")
+                payload = studio.snapshot()
             self._json(200, payload)
 
         elif route == "/api/spec":
@@ -331,11 +398,12 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._error(400, f"invalid spec: {exc}")
                 return
-            with STUDIO.lock:
-                STUDIO.spec = spec
-                STUDIO.last_build = None
-                STUDIO.rebuild()
-                snapshot = STUDIO.snapshot()
+            with studio.lock:
+                studio.spec = spec
+                studio.last_build = None
+                studio.rebuild()
+                session.checkpoint("Loaded a specification", "manual")
+                snapshot = studio.snapshot()
             self._json(200, snapshot)
 
         elif route == "/api/reset":
@@ -346,30 +414,219 @@ class Handler(BaseHTTPRequestHandler):
                 spec = parse(prompt, name=name).spec
             else:
                 spec = new_spec(name)
-            with STUDIO.lock:
-                STUDIO.spec = spec
-                STUDIO.last_build = None
-                STUDIO.rebuild()
-                payload = STUDIO.snapshot()
+            with studio.lock:
+                studio.spec = spec
+                studio.last_build = None
+                studio.rebuild()
+                session.checkpoint("Reset the design", "manual", force=True)
+                payload = studio.snapshot()
             self._json(200, payload)
 
         elif route == "/api/build":
-            self._build(bool(body.get("per_part", True)), bool(body.get("force", False)))
+            self._build(session, bool(body.get("per_part", True)),
+                        bool(body.get("force", False)))
 
+        # -- agent --------------------------------------------------------
+        elif route == "/api/agent/run":
+            self._agent_run(session, body)
+        elif route == "/api/agent/approve":
+            self._agent_approve(session, body)
+        elif route == "/api/agent/reject":
+            self._agent_reject(session, body)
+        elif route == "/api/agent/cancel":
+            self._agent_cancel(session, body)
+        elif route == "/api/agent/undo":
+            self._agent_history(session, "undo")
+        elif route == "/api/agent/redo":
+            self._agent_history(session, "redo")
+        elif route == "/api/agent/variant":
+            self._agent_variant(session, body)
+        elif route == "/api/session/new":
+            created = SESSIONS.create(str(body.get("title") or ""))
+            self._json(200, created.to_dict())
+        elif route == "/api/session/drop":
+            dropped = SESSIONS.drop(session.session_id)
+            self._json(200, {"dropped": dropped,
+                             "sessions": SESSIONS.list()})
         else:
             self._error(404, f"unknown endpoint {route}")
 
+    # -- agent -----------------------------------------------------------
+    def _agent_run(self, session, body: dict) -> None:
+        prompt = str(body.get("prompt", "")).strip()
+        if not prompt:
+            self._error(400, "prompt is empty")
+            return
+        mode = normalize_mode(body.get("mode") or body.get("autonomy"))
+        control = RunControl(timeout_s=float(body.get("timeout_s") or 150))
+        session.runs[control.run_id] = control
+        stream = bool(body.get("stream", False))
+        write = self._start_sse(control) if stream else None
+        if write:
+            write({"type": "start", "run_id": control.run_id,
+                   "session_id": session.session_id, "mode": mode,
+                   "intent": detect_intent(prompt).name})
+        try:
+            orchestrator = AgentOrchestrator(
+                session, build_root=str(BUILD_ROOT))
+            result = orchestrator.run(
+                prompt, mode=mode,
+                use_llm=body.get("use_llm") if "use_llm" in body else None,
+                max_iterations=int(body.get("max_iterations") or 3),
+                max_tool_rounds=int(body.get("max_tool_rounds") or 8),
+                emit=(lambda event: write({"type": "timeline", "event": event}))
+                if write else None,
+                control=control)
+            payload = result.to_dict()
+            payload["snapshot"] = session.studio.snapshot()
+            payload["session"] = session.conversation_payload()
+            payload["pending"] = session.pending
+            if write:
+                write({"type": "result", "result": payload})
+            else:
+                self._json(200, payload)
+        except AgentCancelled as exc:
+            payload = {"status": "cancelled", "error": str(exc),
+                       "response": "Stopped. No changes were committed."}
+            if write:
+                write({"type": "error", "error": payload})
+            else:
+                self._error(409, str(exc))
+        except AgentTimeout as exc:
+            payload = {"status": "timeout", "error": str(exc),
+                       "response": "The run exceeded its time budget."}
+            if write:
+                write({"type": "error", "error": payload})
+            else:
+                self._error(504, str(exc))
+        finally:
+            session.runs.pop(control.run_id, None)
+            if write:
+                self._end_sse()
+
+    def _agent_approve(self, session, body: dict) -> None:
+        token = str(body.get("token") or "")
+        try:
+            pending = session.approve(token)
+        except KeyError as exc:
+            self._error(409, str(exc))
+            return
+        except ValueError as exc:
+            self._error(409, str(exc))
+            return
+        payload = session.studio.snapshot({
+            "approved": True,
+            "request": pending.get("request"),
+            "changes": pending.get("ops", []),
+            "agent": pending.get("agent"),
+            "session": session.conversation_payload(),
+        })
+        self._json(200, payload)
+
+    def _agent_reject(self, session, body: dict) -> None:
+        token = str(body.get("token") or "")
+        try:
+            pending = session.reject(token or None)
+        except KeyError as exc:
+            self._error(409, str(exc))
+            return
+        except ValueError as exc:
+            self._error(409, str(exc))
+            return
+        payload = session.studio.snapshot({
+            "rejected": True,
+            "request": pending.get("request"),
+            "session": session.conversation_payload(),
+        })
+        self._json(200, payload)
+
+    def _agent_cancel(self, session, body: dict) -> None:
+        run_id = str(body.get("run_id") or "")
+        cancelled = []
+        for key, control in list(session.runs.items()):
+            if run_id and key != run_id:
+                continue
+            control.cancel()
+            cancelled.append(key)
+        self._json(200, {"cancelled": cancelled,
+                         "session_id": session.session_id})
+
+    def _agent_history(self, session, action: str) -> None:
+        target = session.undo() if action == "undo" else session.redo()
+        if target is None:
+            self._error(409, f"nothing to {action}")
+            return
+        payload = session.studio.snapshot({
+            "version": target.to_dict(),
+            "session": session.conversation_payload(),
+        })
+        self._json(200, payload)
+
+    def _agent_variant(self, session, body: dict) -> None:
+        variant = body.get("variant")
+        if not isinstance(variant, dict):
+            variant = {"label": body.get("label") or "Selected alternative",
+                       "changes": body.get("changes") or []}
+        if not variant.get("changes") and not variant.get("spec"):
+            self._error(400, "variant needs changes or a spec")
+            return
+        mode = normalize_mode(body.get("mode") or "autonomous")
+        result = apply_variant(session, variant, mode=mode,
+                               emit=None)
+        payload = result.to_dict()
+        payload["snapshot"] = session.studio.snapshot()
+        payload["session"] = session.conversation_payload()
+        payload["pending"] = session.pending
+        self._json(200, payload)
+
+    # -- streaming -------------------------------------------------------
+    def _start_sse(self, control: RunControl):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError):
+            control.cancel()
+            return None
+
+        alive = {"ok": True}
+
+        def write(event: dict) -> None:
+            if not alive["ok"]:
+                return
+            try:
+                data = _jsonable(event)
+                self.wfile.write(f"data: {data}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                alive["ok"] = False
+                control.cancel()
+
+        return write
+
+    def _end_sse(self) -> None:
+        try:
+            self.wfile.write(b"event: end\ndata: {\"type\":\"end\"}\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     # -- build and download ----------------------------------------------
-    def _build(self, per_part: bool, force: bool) -> None:
-        with STUDIO.lock:
-            spec = STUDIO.solved
+    def _build(self, session, per_part: bool, force: bool) -> None:
+        studio = session.studio
+        with studio.lock:
+            spec = studio.solved
             slug = slugify(spec.get("meta.name") or "watch")
             checksum = (spec.get("derived.checksum") or "")[:8]
-            out = BUILD_ROOT / f"{slug}-{checksum}"
+            out = BUILD_ROOT / session.session_id / f"{slug}-{checksum}"
             result = build(spec, out_dir=str(out), per_part=per_part, force=force,
-                           scene=STUDIO.scene, checks=STUDIO.checks)
+                           scene=studio.scene, checks=studio.checks)
             result.files = [f for f in result.files if os.path.isfile(f)]
-            STUDIO.last_build = result
+            studio.last_build = result
             # fresh archive for the download button
             archive = out / "package.zip"
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -377,17 +634,18 @@ class Handler(BaseHTTPRequestHandler):
                     if os.path.abspath(path) == os.path.abspath(archive):
                         continue
                     zf.write(path, os.path.relpath(path, out))
-            payload = STUDIO.snapshot()
+            payload = studio.snapshot()
         self._json(200, payload)
 
-    def _build_root(self) -> Path | None:
-        with STUDIO.lock:
-            if STUDIO.last_build is None:
+    def _build_root(self, query: dict | None = None) -> Path | None:
+        session = self._session(query)
+        with session.studio.lock:
+            if session.studio.last_build is None:
                 return None
-            return Path(STUDIO.last_build.root).resolve()
+            return Path(session.studio.last_build.root).resolve()
 
     def _download_file(self, query: dict) -> None:
-        root = self._build_root()
+        root = self._build_root(query)
         if root is None:
             self._error(409, "build the package first")
             return
@@ -398,8 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._serve_file(target, target.name)
 
-    def _download_zip(self) -> None:
-        root = self._build_root()
+    def _download_zip(self, query: dict) -> None:
+        root = self._build_root(query)
         if root is None:
             self._error(409, "build the package first")
             return
@@ -427,7 +685,8 @@ class Handler(BaseHTTPRequestHandler):
 # Schema payload
 # ---------------------------------------------------------------------------
 
-def _schema_payload() -> dict:
+def _schema_payload(studio=None) -> dict:
+    studio = studio or STUDIO
     groups = {}
     for group in FORM_GROUPS:
         fields = SCHEMA.get(group, {})
@@ -450,7 +709,7 @@ def _schema_payload() -> dict:
             {"id": k, "width_mm": v["width_mm"], "height_mm": v["height_mm"]}
             for k, v in QUARTZ_MODULES.items()
         ],
-        "starter": STUDIO.snapshot()["spec"],
+        "starter": studio.snapshot()["spec"],
     }
 
 

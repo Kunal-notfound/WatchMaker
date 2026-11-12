@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 
+from . import gears
 from .modules import MODULES, compose
 from .schema import Spec
 
@@ -161,6 +162,12 @@ def _geometry_checks(spec, scene, train, stack) -> list[dict]:
         out.append(check("geometry.gear_clearance", "geometry", "Wheels in the same plane do not collide",
                          not overlaps, "calculated",
                          "clear" if not overlaps else "; ".join(overlaps)))
+        conflicts = _tooth_conflicts(train)
+        out.append(check("geometry.gear_interference", "geometry",
+                         "Meshing tooth outlines interleave", not conflicts,
+                         "calculated",
+                         "all meshing pairs clear" if not conflicts else
+                         "tooth interference: " + "; ".join(conflicts)))
         # exact centre-distance closure: distance must equal (wheel+pinion) * module / 2
         pos = {n["name"]: n for n in layout}
         bad = []
@@ -181,6 +188,31 @@ def _geometry_checks(spec, scene, train, stack) -> list[dict]:
                          ", ".join(f"{s['wheel_teeth']}/{s['pinion_teeth']}"
                                    for s in train.get("stages", []))))
     return out
+
+
+def _tooth_conflicts(train: dict) -> list[str]:
+    """Check real outline intersection for every meshing wheel/pinion pair.
+
+    Only segments near the pitch contact can interfere, so the polygon test is
+    restricted to a small window there.  This catches tooth shapes that are too
+    thick or phases that put two teeth on the centre line without turning
+    verification into a full assembly sweep.
+    """
+    layout = {n["name"]: n for n in (train.get("layout") or [])}
+    conflicts = []
+    for st in train.get("stages") or []:
+        a = layout.get(st.get("driver"))
+        b = layout.get(st.get("driven"))
+        if not a or not b:
+            continue
+        module = float(st.get("module_mm") or 0.12)
+        wheel, pinion, contact = gears.meshing_outlines(
+            int(st["wheel_teeth"]), int(st["pinion_teeth"]), module,
+            (a["x"], a["y"]), (b["x"], b["y"]))
+        if gears.polygons_intersect(wheel, pinion, near=contact,
+                                    window=max(0.4, module * 3.0)):
+            conflicts.append(f"{st['driver']}/{st['driven']}")
+    return conflicts
 
 
 def _kinematics_checks(spec, train) -> list[dict]:

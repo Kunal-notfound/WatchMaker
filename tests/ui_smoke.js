@@ -122,6 +122,8 @@ const source = fs.readFileSync(appPath, "utf8")
     boot, setView, setExplodeValue, zoomBy, runPrompt, undoPrompt,
     renderChat, setField, syncFormValues, isVisible,
     setPanelClosed, restorePanels, pickAt, selectPartAt, clearPartSelection,
+    approveAgent, applyVariant, undoTurn, redoTurn, toggleAgentHistory,
+    get AGENT() { return AGENT; },
     get selected() { return V.selected; },
   };\n`;
 vm.runInContext(source, context, { filename: "app.js" });
@@ -251,6 +253,43 @@ const waitFor = async (fn, label, timeout = 15000) => {
   check(t.STATE.spec.data.case.diameter_mm === original, "undo restores the previous diameter");
   check(t.CHAT.prevSpec === null, "undo stack is consumed");
   check(el("chatLog").innerHTML.includes("Reverted"), "undo is acknowledged in the chat");
+
+  console.log("agent");
+  const startColor = t.STATE.spec.data.dial.color;
+  el("autonomy").value = "suggest";
+  await t.runPrompt("make the dial blue");
+  check(t.AGENT.result?.status === "suggested", `suggest status: ${t.AGENT.result?.status}`);
+  check(t.STATE.spec.data.dial.color === startColor, "suggest mode does not write the design");
+  check((t.AGENT.changes || []).some((change) => change.path === "dial.color"),
+    "suggest exposes the validated diff");
+  check(el("agentTimeline").innerHTML.includes("tl-kind"), "timeline rendered tool events");
+  check(el("agentDiff").innerHTML.includes("dial.color"), "diff view names the changed field");
+  check(el("agentStatus").innerHTML.includes("suggested"), "status strip reports the run");
+
+  el("autonomy").value = "approval";
+  await t.runPrompt("make the dial blue");
+  check(t.AGENT.result?.status === "awaiting_approval", "approval run stages the change");
+  check(Boolean(t.AGENT.pending?.token), "approval token exposed");
+  check(el("agentApproval").hidden === false, "approval card is visible");
+  await t.approveAgent(true);
+  check(t.STATE.spec.data.dial.color === "blue", "approved change is applied");
+  check(!t.AGENT.pending, "approval card clears after applying");
+
+  el("autonomy").value = "suggest";
+  await t.runPrompt("show me alternatives");
+  check(t.AGENT.result?.intent === "variations", "variation intent detected");
+  check((t.AGENT.variants || []).length > 0, "variants rendered");
+  check(el("agentVariants").innerHTML.includes("data-variant"), "variant cards have an apply control");
+
+  el("agentHistory").hidden = true;
+  await t.toggleAgentHistory();
+  check(Boolean(t.AGENT.history), "history endpoint loaded");
+  check(el("agentHistory").innerHTML.includes("Design history"), "history panel rendered");
+
+  await t.undoTurn();
+  check(t.STATE.spec.data.dial.color === startColor, "agent undo restores the previous version");
+  await t.redoTurn();
+  check(t.STATE.spec.data.dial.color === "blue", "agent redo restores the approved version");
 
   console.log(failures.length ? `\n${failures.length} failure(s)` : "\nall checks passed");
   process.exit(failures.length ? 1 : 0);

@@ -194,8 +194,25 @@ def movement_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
     drum.translated(b["x"], b["y"], 0)
     parts.append(drum)
     barrel_teeth = (train.get("stages") or [{"wheel_teeth": 84}])[0]["wheel_teeth"]
-    parts.append(_gear_mesh("barrel_wheel", 0.12, barrel_teeth, z_bridge - 0.22,
-                            layout.get("barrel", {}), BRASS, 5))
+    stages = train.get("stages", [])
+    barrel_pos = layout.get("barrel", {})
+    centre_pos = layout.get("centre", {"x": 0.0, "y": 0.0})
+    if stages:
+        st0 = stages[0]
+        theta = math.atan2(centre_pos.get("y", 0.0) - barrel_pos.get("y", 0.0),
+                           centre_pos.get("x", 0.0) - barrel_pos.get("x", 0.0))
+        wheel_rot, pinion_rot = gears.mesh_rotation(
+            st0["wheel_teeth"], st0["pinion_teeth"], theta)
+        parts.append(_gear_mesh("barrel_wheel", st0["module_mm"], st0["wheel_teeth"],
+                                z_wheel + 0.06, barrel_pos, BRASS, 5,
+                                phase_deg=math.degrees(wheel_rot)))
+        parts.append(_gear_mesh("centre_pinion", st0["module_mm"],
+                                st0["pinion_teeth"], z_wheel + 0.06,
+                                centre_pos, DARK_STEEL, 5,
+                                phase_deg=math.degrees(pinion_rot)))
+    else:
+        parts.append(_gear_mesh("barrel_wheel", 0.12, barrel_teeth,
+                                z_bridge - 0.22, barrel_pos, BRASS, 5))
     lid = M.disc(bd / 2 - 0.2, z_bridge, z_bridge + 0.25, segments=40)
     lid.name, lid.color, lid.role = "barrel_lid", "#e0c98d", "movement"
     parts.append(lid.translated(b["x"], b["y"], 0))
@@ -208,13 +225,20 @@ def movement_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
             if st["driver"] == "barrel":
                 continue
             pos = layout.get(st["driver"]) or layout.get(st["driven"]) or {"x": 0, "y": 0}
+            pinion_pos = layout.get(st["driven"], pos)
+            theta = math.atan2(pinion_pos.get("y", 0.0) - pos.get("y", 0.0),
+                               pinion_pos.get("x", 0.0) - pos.get("x", 0.0))
+            wheel_rot, pinion_rot = gears.mesh_rotation(
+                st["wheel_teeth"], st["pinion_teeth"], theta)
             plane = pos.get("plane", idx)
             wheel = _gear_mesh(f"{st['driver']}_wheel", st["module_mm"], st["wheel_teeth"],
-                               z_wheel + 0.06 + plane * 0.28, pos, BRASS, idx)
+                               z_wheel + 0.06 + plane * 0.28, pos, BRASS, idx,
+                               phase_deg=math.degrees(wheel_rot))
             parts.append(wheel)
             pinion = _gear_mesh(f"{st['driven']}_pinion", st["module_mm"], st["pinion_teeth"],
                                 z_wheel + 0.06 + plane * 0.28,
-                                layout.get(st["driven"], pos), DARK_STEEL, idx)
+                                pinion_pos, DARK_STEEL, idx,
+                                phase_deg=math.degrees(pinion_rot))
             parts.append(pinion)
             arbor = M.disc(0.35, z_plate + 0.1, z_bridge + 0.2, segments=16)
             arbor.name, arbor.role, arbor.material, arbor.color = "arbor", "movement", "steel", DARK_STEEL
@@ -276,14 +300,16 @@ def movement_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
 
 
 def _gear_mesh(name: str, module: float, teeth: int, z: float, pos: dict,
-               color: str, seed: int = 0) -> M.Mesh:
+               color: str, seed: int = 0,
+               phase_deg: float | None = None) -> M.Mesh:
     teeth = max(6, min(200, int(round(teeth))))
     prof = gears.gear_profile(teeth, max(0.05, module), points=3 if teeth > 40 else 4)
     m = M.extrude(prof["points"], z, z + 0.22, name)
-    m.rotated_z(seed * 13.7)
+    m.rotated_z(seed * 13.7 if phase_deg is None else phase_deg)
     m.translated(pos.get("x", 0.0), pos.get("y", 0.0), 0)
     m.color, m.role, m.material = color, "movement", "brass"
     m.meta = {"teeth": teeth, "module_mm": module, "pitch_diameter_mm": round(prof["r_pitch"] * 2, 3),
+              "phase_deg": round(seed * 13.7 if phase_deg is None else phase_deg, 4),
               "profile": prof["profile"]}
     return m
 

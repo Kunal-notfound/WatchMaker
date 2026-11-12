@@ -406,6 +406,10 @@ def parse(prompt: str, base: Spec | None = None, use_llm: bool = True,
         notes.append("cost target noted; this build does not price labour or tooling")
 
     # -- optional LLM patches --------------------------------------------
+    # Precedence (highest first): user locks and constraints, an explicit
+    # statement in this prompt, the model's interpretation, heuristics and
+    # presets, then schema defaults.  The model is useful for wording the rule
+    # parser missed, but it must never override a value the user stated.
     engine = "rules"
     if use_llm and os.environ.get("WATCHCAD_LLM_URL") and text:
         llm_patches, err = _llm_parse(text, spec)
@@ -413,10 +417,16 @@ def parse(prompt: str, base: Spec | None = None, use_llm: bool = True,
             engine = "rules+llm"
             for op in llm_patches:
                 path = op.get("path", "")
-                if path and path not in seen and _path_allowed(path):
-                    seen[path] = 2
-                    explicit.add(path)
-                    patches.append(op)
+                if not path or not _path_allowed(path):
+                    continue
+                if path in explicit:
+                    notes.append(f"kept the user's stated value for {path} "
+                                 "(the model patch was not applied)")
+                    continue
+                if path in seen:
+                    patches[:] = [p for p in patches if p["path"] != path]
+                seen[path] = 2
+                patches.append(op)
             if err:
                 notes.append(err)
 

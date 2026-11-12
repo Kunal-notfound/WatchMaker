@@ -8,6 +8,20 @@ let SCHEMA = null;
 let STATE = null;
 let IDEAS = {};
 const CHAT = { messages: [], typing: false, prevSpec: null, engine: "local rules" };
+const AGENT = {
+  running: false,
+  runId: null,
+  sessionId: null,
+  engine: "local rules",
+  events: [],
+  result: null,
+  changes: [],
+  variants: [],
+  pending: null,
+  history: null,
+  error: null,
+};
+const AGENT_MODES = ["suggest", "approval", "safe", "autonomous"];
 let activeTab = "spec";
 let checkFilter = "all";
 let sceneToken = 0;
@@ -27,12 +41,32 @@ const fmt = (value, digits = 2) => {
 const slug = (text) => String(text || "watch").toLowerCase()
   .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "watch";
 
+function currentSession() {
+  try {
+    let id = window.localStorage?.getItem("watchcad.session");
+    if (!id) {
+      id = `web-${Math.random().toString(36).slice(2, 10)}`;
+      window.localStorage?.setItem("watchcad.session", id);
+    }
+    return id;
+  } catch {
+    return "default";
+  }
+}
+
+function withSession(url) {
+  const separator = String(url).includes("?") ? "&" : "?";
+  return `${url}${separator}session=${encodeURIComponent(currentSession())}`;
+}
+
 async function api(path, body) {
-  const options = body === undefined ? {} : {
+  const options = body === undefined ? { headers: {} } : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   };
+  options.headers = options.headers || {};
+  options.headers["X-WatchCAD-Session"] = currentSession();
   const response = await fetch(path, options);
   let data = {};
   try { data = await response.json(); } catch { /* empty response */ }
@@ -74,6 +108,14 @@ async function boot() {
   $("#fileLoad").addEventListener("change", loadSpecFile);
   $("#btnNew").addEventListener("click", resetSpec);
   $("#btnBuildTop").addEventListener("click", buildPackage);
+  $("#btnStop").addEventListener("click", stopAgent);
+  $("#btnUndo").addEventListener("click", undoTurn);
+  $("#btnRedo").addEventListener("click", redoTurn);
+  $("#btnHistory").addEventListener("click", toggleAgentHistory);
+  $("#autonomy").addEventListener("change", (event) => {
+    try { window.localStorage?.setItem("watchcad.autonomy", event.target.value); } catch { /* ignore */ }
+    toast(`autonomy: ${event.target.value}`);
+  });
   $("#examples").addEventListener("click", (event) => {
     const button = event.target.closest("[data-preset]");
     if (!button) return;
@@ -88,6 +130,10 @@ async function boot() {
   document.addEventListener("click", onGlobalClick);
   setupViewer();
   restorePanels();
+  try {
+    const savedMode = window.localStorage?.getItem("watchcad.autonomy");
+    if (AGENT_MODES.includes(savedMode)) $("#autonomy").value = savedMode;
+  } catch { /* private mode or a non-browser harness */ }
 
   try {
     const [schema, state] = await Promise.all([api("/api/schema"), api("/api/state")]);
@@ -112,12 +158,15 @@ function renderAll() {
   renderChecks();
   renderPackage();
   renderChat();
+  renderAgent();
 }
 
 function applyState(state, options = {}) {
+  if (!state || !state.spec) return;
   const previous = STATE && STATE.spec && STATE.spec.data.derived
     ? STATE.spec.data.derived.checksum : "";
   STATE = state;
+  if (state.session) AGENT.sessionId = state.session.session_id || AGENT.sessionId;
   const checksum = state.spec?.data?.derived?.checksum || "";
   renderHeader();
   renderFacts();
@@ -126,6 +175,7 @@ function applyState(state, options = {}) {
   if (options.spec === false) syncFormValues();
   else renderSpec();
   if (options.scene !== false && checksum !== previous) scheduleScene();
+  renderSessionChip();
 }
 
 /* --------------------------------------------------------------- header */
@@ -191,10 +241,16 @@ function renderExamples() {
   ).join("");
 }
 
-/* --------------------------------------------------------------- copilot */
+/* ----------------------------------------------------------------- agent */
 const cloneSpec = (spec) => {
   try { return structuredClone(spec); } catch { return JSON.parse(JSON.stringify(spec)); }
 };
+
+function currentMode() {
+  const select = $("#autonomy");
+  const value = select && select.value;
+  return AGENT_MODES.includes(value) ? value : "autonomous";
+}
 
 function seedChat() {
   if (CHAT.messages.length || !STATE) return;
@@ -203,72 +259,541 @@ function seedChat() {
   const m = spec.movement || {};
   CHAT.messages.push({
     role: "assistant",
-    lead: `Hi — I’m your design copilot. Right now this is a ${fmt(c.diameter_mm, 0)} mm `
-      + `${c.material || "steel"} ${m.kind || "mechanical"} watch. Tell me what to change and I’ll edit the spec.`,
-    notes: ["I only write spec fields. The solver owns every dimension, so the model and the checks stay honest."],
+    lead: `Hi — I’m the design agent. This is currently a ${fmt(c.diameter_mm, 0)} mm `
+      + `${c.material || "steel"} ${m.kind || "mechanical"} watch. I can inspect the engine, `
+      + `change validated spec fields, repair failures and explain the result.`,
+    notes: ["The solver owns every dimension; I only choose validated tools. Nothing is committed unless verification succeeds."],
     suggestions: [
       "Make it 40 mm titanium with a dive bezel",
       "Add a date and a chronograph",
-      "38 mm dress watch, midnight blue dial, applied numerals",
+      "Critique this design and suggest alternatives",
+      "Fix the failing checks",
     ],
   });
 }
 
+function setAgentRunning(on) {
+  AGENT.running = Boolean(on);
+  const stop = $("#btnStop");
+  if (stop) stop.hidden = !AGENT.running;
+  const send = $("#btnParse");
+  if (send) send.disabled = AGENT.running;
+  const mode = $("#autonomy");
+  if (mode) mode.disabled = AGENT.running;
+  renderAgentStatus();
+}
+
+function renderSessionChip() {
+  const chip = $("#sessionChip");
+  if (!chip) return;
+  const id = AGENT.sessionId || currentSession();
+  chip.textContent = String(id).replace(/^web-/, "").slice(0, 12);
+  chip.title = `Session ${id}: its conversation, history and design memory are isolated`;
+}
+
 async function runPrompt(textOverride) {
   const prompt = String(textOverride ?? $("#prompt").value ?? "").trim();
-  if (!prompt) { toast("tell the copilot what to change first", true); return; }
+  if (!prompt) { toast("tell the agent what to change first", true); return; }
+  if (AGENT.running) { toast("the agent is already running", true); return; }
   const before = STATE && STATE.spec ? cloneSpec(STATE.spec) : null;
   CHAT.messages.push({ role: "user", text: prompt });
   $("#prompt").value = "";
   CHAT.typing = true;
+  AGENT.events = [];
+  AGENT.result = null;
+  AGENT.changes = [];
+  AGENT.variants = [];
+  AGENT.error = null;
+  AGENT.pending = null;
   renderChat();
-  setLoading(true, "thinking about the brief");
+  renderAgent();
+  setAgentRunning(true);
+  setLoading(true, "agent inspecting the design");
+
   try {
-    const state = await api("/api/prompt", {
+    const payload = await streamAgent({
       prompt,
-      use_llm: $("#useLlm").checked,
-    });
+      mode: currentMode(),
+      use_llm: Boolean($("#useLlm") && $("#useLlm").checked),
+      stream: true,
+    }, handleAgentEvent);
+    if (!payload) throw new Error(AGENT.error || "the agent returned no result");
+    AGENT.result = payload;
+    AGENT.changes = payload.changes || [];
+    AGENT.variants = payload.variants || [];
+    AGENT.engine = payload.engine || AGENT.engine;
+    CHAT.engine = AGENT.engine;
     CHAT.prevSpec = before;
-    CHAT.engine = state.engine || "rules";
-    CHAT.messages.push(assistantFromPrompt(state));
-    applyState(state);
-    toast(`applied ${state.applied} field${state.applied === 1 ? "" : "s"} from the brief`);
+    CHAT.messages.push(assistantFromAgent(payload));
+    applyAgentResult(payload);
+    const status = payload.status || "complete";
+    const applied = Number(payload.applied || 0);
+    if (status === "awaiting_approval") {
+      toast("changes are ready for your approval");
+    } else if (status === "suggested") {
+      toast("proposal ready; nothing was applied");
+    } else if (applied) {
+      toast(`agent applied ${applied} field${applied === 1 ? "" : "s"}`);
+    } else {
+      toast(`agent finished: ${status.replaceAll("_", " ")}`);
+    }
   } catch (error) {
     CHAT.messages.push({
       role: "assistant",
-      lead: `That one caught me out: ${error.message}`,
-      notes: ["Nothing was changed. Try rephrasing, or edit the fields directly."],
+      lead: `The run could not finish: ${error.message}`,
+      notes: ["Nothing unverified was committed. Check the execution timeline for the failing step."],
       bad: true,
     });
+    AGENT.error = error.message;
     toast(error.message, true);
   } finally {
     CHAT.typing = false;
+    setAgentRunning(false);
     renderChat();
+    renderAgent();
     setLoading(false);
   }
 }
 
-function assistantFromPrompt(state) {
-  const applied = Number(state.applied || 0);
-  const skipped = state.skipped_locked || [];
-  const questions = state.questions || [];
-  const patches = state.patches || [];
-  const notes = state.notes || [];
-  let lead;
-  if (applied) {
-    lead = `Done — I changed ${applied} spec field${applied === 1 ? "" : "s"}. The mesh is rebuilding now.`;
-  } else if (questions.length) {
-    lead = "I need one more detail before I can change the model.";
-  } else {
-    lead = "I couldn’t turn that into a spec change. Try a size, material, style, movement, or complication.";
+function assistantFromAgent(result) {
+  const changes = result.changes || [];
+  const applied = Number(result.applied || 0);
+  const status = String(result.status || "");
+  const notes = [...(result.notes || [])];
+  for (const item of result.unresolved || []) {
+    if (!notes.includes(`Unresolved: ${item}`)) notes.push(`Unresolved: ${item}`);
   }
-  if (skipped.length) {
-    lead += ` I left ${skipped.length} locked field${skipped.length === 1 ? "" : "s"} untouched.`;
+  const state = result;
+  let lead = String(result.response || result.final_message || "").trim();
+  if (!lead) {
+    lead = status === "awaiting_approval"
+      ? `I prepared ${changes.length} change(s) and stopped for approval.`
+      : status === "suggested"
+        ? `I prepared ${changes.length} proposal(s) without applying them.`
+        : "The agent finished without a written answer.";
   }
+  if (result.error) lead = `${lead} ${result.error}`;
   return {
-    role: "assistant", lead, applied, engine: state.engine || "rules",
-    notes, questions, patches, skipped, undoable: applied > 0,
+    role: "assistant",
+    lead,
+    applied,
+    engine: result.engine || "rules",
+    notes,
+    questions: state.questions || [],
+    patches: changes.map((change) => ({
+      path: change.path, value: change.to, from: change.from,
+    })),
+    skipped: [],
+    undoable: status === "complete" && applied > 0,
   };
+}
+
+function parseSseFrame(frame, dispatch) {
+  const data = [];
+  for (const line of String(frame || "").split(/\r?\n/)) {
+    if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (!data.length) return;
+  try { dispatch(JSON.parse(data.join("\n"))); } catch { /* partial frame */ }
+}
+
+async function streamAgent(body, onEvent) {
+  const response = await fetch("/api/agent/run", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-WatchCAD-Session": currentSession(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let data = {};
+    try { data = await response.json(); } catch { /* empty response */ }
+    throw new Error(data.error || `HTTP ${response.status}`);
+  }
+  const type = String(response.headers?.get("content-type") || "");
+  let final = null;
+  const dispatch = (event) => {
+    if (!event || !event.type) return;
+    if (event.type === "result") final = event.result || null;
+    onEvent(event);
+  };
+  const canStream = response.body && typeof response.body.getReader === "function"
+    && typeof TextDecoder !== "undefined" && type.includes("text/event-stream");
+  if (canStream) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split = buffer.indexOf("\n\n");
+      while (split >= 0) {
+        parseSseFrame(buffer.slice(0, split), dispatch);
+        buffer = buffer.slice(split + 2);
+        split = buffer.indexOf("\n\n");
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) parseSseFrame(buffer, dispatch);
+  } else if (type.includes("text/event-stream") || !type.includes("application/json")) {
+    const text = await response.text();
+    for (const frame of String(text).split(/\n\n/)) parseSseFrame(frame, dispatch);
+  } else {
+    const data = await response.json();
+    dispatch({ type: "result", result: data });
+    final = data;
+  }
+  return final;
+}
+
+function handleAgentEvent(event) {
+  if (event.type === "start") {
+    AGENT.runId = event.run_id || AGENT.runId;
+    AGENT.sessionId = event.session_id || AGENT.sessionId;
+    AGENT.engine = event.mode ? `${event.mode} run` : AGENT.engine;
+    renderAgentStatus();
+    return;
+  }
+  if (event.type === "timeline" && event.event) {
+    const item = event.event;
+    if (!AGENT.events.some((known) => known.seq && known.seq === item.seq)) {
+      AGENT.events.push(item);
+    }
+    renderAgentTimeline();
+    renderAgentStatus();
+    return;
+  }
+  if (event.type === "result") {
+    AGENT.result = event.result || AGENT.result;
+    return;
+  }
+  if (event.type === "error") {
+    AGENT.error = (event.error && (event.error.error || event.error.response)) || "agent error";
+  }
+}
+
+function applyAgentResult(result) {
+  if (result.snapshot) {
+    const snapshot = { ...result.snapshot };
+    snapshot.session = result.session || snapshot.session;
+    applyState(snapshot);
+  }
+  if (result.session) AGENT.sessionId = result.session.session_id || AGENT.sessionId;
+  AGENT.engine = result.engine || AGENT.engine;
+  AGENT.pending = result.pending || null;
+  if (!AGENT.pending && result.status === "awaiting_approval" && result.pending_token) {
+    AGENT.pending = {
+      token: result.pending_token,
+      request: result.objective || "",
+      ops: (result.staged_ops || []).map((op) => ({
+        path: op.path, value: op.value,
+      })),
+    };
+  }
+  renderAgent();
+}
+
+function formatAgentValue(value) {
+  if (value && typeof value === "object") {
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  return String(value ?? "—");
+}
+
+function renderAgent() {
+  renderSessionChip();
+  renderAgentStatus();
+  renderAgentTimeline();
+  renderAgentDiff();
+  renderAgentVariants();
+  renderApproval();
+}
+
+function renderAgentStatus() {
+  const node = $("#agentStatus");
+  if (!node) return;
+  if (AGENT.running) {
+    node.hidden = false;
+    node.className = "agent-status running";
+    node.innerHTML = `<span class="spinner"></span>Agent running · ${esc(currentMode())} mode`;
+    return;
+  }
+  const result = AGENT.result;
+  if (!result && !AGENT.error) { node.hidden = true; node.innerHTML = ""; return; }
+  node.hidden = false;
+  if (AGENT.error) {
+    node.className = "agent-status bad";
+    node.innerHTML = `Run failed · ${esc(AGENT.error)}`;
+    return;
+  }
+  const status = String(result.status || "complete");
+  const after = result.verification_after || {};
+  const changes = (result.changes || []).length;
+  const kind = status === "complete" ? "ok"
+    : status === "awaiting_approval" || status === "suggested" ? "warn" : "bad";
+  const bits = [
+    `<b>${esc(status.replaceAll("_", " "))}</b>`,
+    `${esc(result.mode || currentMode())} mode`,
+    `${esc(result.intent || "modify")} intent`,
+    changes ? `${changes} change${changes === 1 ? "" : "s"}` : "no changes",
+    `${Number(after.fail || 0)} failing`,
+  ];
+  node.className = `agent-status ${kind}`;
+  node.innerHTML = bits.join(`<span class="sep">·</span>`);
+}
+
+function renderAgentTimeline() {
+  const holder = $("#agentTimeline");
+  if (!holder) return;
+  const events = AGENT.events || [];
+  holder.innerHTML = events.length
+    ? events.map((event) => {
+        const status = String(event.status || "done");
+        const iteration = Number(event.iteration || 0);
+        const data = event.data || {};
+        const detail = event.detail ? `<p>${esc(event.detail)}</p>` : "";
+        let extra = "";
+        if (data.arguments && Object.keys(data.arguments).length) {
+          extra = `<div class="tl-data">${esc(shortJson(data.arguments))}</div>`;
+        } else if (data.path) {
+          extra = `<div class="tl-data">${esc(data.path)} = ${esc(formatAgentValue(data.value))}</div>`;
+        } else if (data.changes) {
+          extra = `<div class="tl-data">${esc(shortJson(data.changes))}</div>`;
+        }
+        return `<details class="tl ${esc(status)}" ${status === "error" || status === "warning" ? "open" : ""}>
+          <summary><span class="tl-dot"></span><b>${esc(event.title || event.kind)}</b>
+          <span class="tl-kind">${esc(event.kind || "")}</span>
+          ${iteration ? `<em class="tl-iter">iteration ${iteration}</em>` : ""}</summary>
+          ${detail}${extra}</details>`;
+      }).join("")
+    : `<div class="empty-note">No run yet. Ask the agent to design, inspect, explain or repair.</div>`;
+  const iterations = Math.max(0, ...events.map((event) => Number(event.iteration || 0)));
+  const label = $("#agentIterations");
+  if (label) label.textContent = iterations ? `${iterations} iteration${iterations === 1 ? "" : "s"}` : "";
+}
+
+function shortJson(value, limit = 240) {
+  let text;
+  try { text = JSON.stringify(value); } catch { text = String(value); }
+  text = String(text ?? "");
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function renderAgentDiff() {
+  const holder = $("#agentDiff");
+  if (!holder) return;
+  const changes = AGENT.changes || [];
+  const count = $("#agentChangeCount");
+  if (count) count.textContent = changes.length ? String(changes.length) : "";
+  holder.innerHTML = changes.length
+    ? changes.map((change) => `<div class="diff-row">
+        <span class="diff-path">${esc(change.path)}</span>
+        <span class="diff-from">${esc(formatAgentValue(change.from))}</span>
+        <span class="diff-arrow">→</span>
+        <span class="diff-to">${esc(formatAgentValue(change.to))}</span>
+      </div>`).join("")
+    : `<div class="empty-note">No verified change in this run.</div>`;
+}
+
+function renderAgentVariants() {
+  const box = $("#agentVariantsBox");
+  const holder = $("#agentVariants");
+  if (!box || !holder) return;
+  const variants = AGENT.variants || [];
+  box.hidden = !variants.length;
+  const count = $("#agentVariantCount");
+  if (count) count.textContent = variants.length ? String(variants.length) : "";
+  holder.innerHTML = variants.map((variant, index) => {
+    const changes = variant.changes || [];
+    const after = variant.verification || {};
+    return `<div class="variant">
+      <div class="variant-head"><b>${esc(variant.label || `Alternative ${index + 1}`)}</b>
+        <button class="btn small" data-variant="${index}">Apply</button></div>
+      <p>${esc(variant.rationale || "")}</p>
+      <div class="chips">${changes.map((change) =>
+        `<span>${esc(change.path)} → ${esc(formatAgentValue(change.to))}</span>`).join("")}</div>
+      <div class="variant-meta">${Number(after.fail || 0)} failing · checksum ${esc(String(variant.checksum || "").slice(0, 8))}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderApproval() {
+  const holder = $("#agentApproval");
+  if (!holder) return;
+  const pending = AGENT.pending;
+  if (!pending || !pending.token) { holder.hidden = true; holder.innerHTML = ""; return; }
+  const ops = pending.ops || [];
+  holder.hidden = false;
+  holder.innerHTML = `<div class="approval-head">Approval required</div>
+    <p>${esc(pending.request || "The agent prepared a change for this design.")}</p>
+    <div class="agent-diff">${ops.map((op) => `<div class="diff-row">
+      <span class="diff-path">${esc(op.path)}</span>
+      <span class="diff-arrow">→</span>
+      <span class="diff-to">${esc(formatAgentValue(op.value))}</span>
+    </div>`).join("")}</div>
+    <div class="approval-actions">
+      <button class="btn primary small" data-approve="1">Approve and apply</button>
+      <button class="btn small" data-reject="1">Reject</button>
+    </div>`;
+}
+
+async function approveAgent(approve) {
+  const token = AGENT.pending && AGENT.pending.token;
+  if (!token) { toast("nothing is waiting for approval", true); return; }
+  setLoading(true, approve ? "applying the approved change" : "rejecting the change");
+  try {
+    const state = await api(approve ? "/api/agent/approve" : "/api/agent/reject", { token });
+    AGENT.pending = null;
+    AGENT.changes = approve
+      ? (state.changes || []).map((op) => ({ path: op.path, to: op.value, from: op.from }))
+      : [];
+    CHAT.messages.push({
+      role: "assistant",
+      lead: approve
+        ? "Approved and applied. The deterministic solver and verifier ran on the staged spec."
+        : "Rejected. The live design was not changed.",
+    });
+    applyState(state);
+    renderChat();
+    renderAgent();
+    toast(approve ? "approved and applied" : "change rejected");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function applyVariant(index) {
+  const variant = (AGENT.variants || [])[Number(index)];
+  if (!variant) { toast("that alternative is no longer available", true); return; }
+  setAgentRunning(true);
+  setLoading(true, `applying “${variant.label || "alternative"}”`);
+  try {
+    const result = await api("/api/agent/variant", {
+      variant,
+      mode: currentMode(),
+    });
+    AGENT.result = result;
+    AGENT.changes = result.changes || [];
+    AGENT.variants = result.variants || AGENT.variants;
+    AGENT.pending = result.pending || null;
+    CHAT.engine = result.engine || CHAT.engine;
+    CHAT.messages.push(assistantFromAgent(result));
+    applyAgentResult(result);
+    renderChat();
+    toast(result.status === "awaiting_approval"
+      ? "alternative staged for approval"
+      : "alternative applied through the validated tool pipeline");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setAgentRunning(false);
+    setLoading(false);
+  }
+}
+
+async function stopAgent() {
+  if (!AGENT.running) return;
+  try {
+    await api("/api/agent/cancel", { run_id: AGENT.runId || "" });
+    toast("stop requested; no unverified change will be committed");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function toggleAgentHistory() {
+  const box = $("#agentHistory");
+  if (!box) return;
+  if (!box.hidden) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = `<div class="empty-note">loading history…</div>`;
+  try {
+    AGENT.history = await api("/api/agent/history");
+    renderAgentHistory();
+  } catch (error) {
+    box.innerHTML = `<div class="empty-note bad">${esc(error.message)}</div>`;
+  }
+}
+
+function renderAgentHistory() {
+  const box = $("#agentHistory");
+  if (!box || !AGENT.history) return;
+  const data = AGENT.history;
+  const versions = data.versions || data.history || [];
+  const memory = data.memory || {};
+  const rows = versions.length ? versions.slice().reverse().map((version) =>
+    `<div class="history-row">
+      <span class="history-index">v${esc(version.index)}</span>
+      <span class="history-label">${esc(version.label || "")}</span>
+      <span class="history-kind">${esc(version.kind || "")}</span>
+      <span class="history-check">${esc(String(version.checksum || "").slice(0, 8))}</span>
+    </div>`).join("") : `<div class="empty-note">No versions yet.</div>`;
+  const constraints = (memory.constraints || []).slice(-5);
+  box.innerHTML = `<div class="history-head">Design history
+      <button class="btn small" data-history-close="1">Close</button></div>
+    ${rows}
+    <div class="history-memory">
+      <div><b>Intent</b> ${esc(memory.intent || "—")}</div>
+      <div><b>Locks</b> ${esc((memory.locked_fields || []).join(", ") || "none")}</div>
+      <div><b>Constraints</b> ${esc(constraints.join("; ") || "none")}</div>
+    </div>`;
+}
+
+async function undoTurn() {
+  if (AGENT.running) { toast("stop the agent first", true); return; }
+  setLoading(true, "restoring the previous version");
+  try {
+    let state;
+    try {
+      state = await api("/api/agent/undo", {});
+    } catch (error) {
+      if (!CHAT.prevSpec) throw error;
+      state = await api("/api/spec", { spec: CHAT.prevSpec });
+    }
+    CHAT.prevSpec = null;
+    for (const message of CHAT.messages) message.undoable = false;
+    AGENT.changes = [];
+    AGENT.result = null;
+    AGENT.variants = [];
+    AGENT.pending = null;
+    CHAT.messages.push({ role: "assistant", lead: "Reverted. We’re back to the previous design version." });
+    applyState(state);
+    renderChat();
+    renderAgent();
+    toast("reverted the last design version");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function redoTurn() {
+  if (AGENT.running) { toast("stop the agent first", true); return; }
+  setLoading(true, "restoring the next version");
+  try {
+    const state = await api("/api/agent/redo", {});
+    AGENT.changes = [];
+    AGENT.result = null;
+    CHAT.messages.push({ role: "assistant", lead: "Restored the next design version." });
+    applyState(state);
+    renderChat();
+    renderAgent();
+    toast("restored the next version");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+/* Legacy alias used by the smoke harness and by older chat links. */
+async function undoPrompt() {
+  return undoTurn();
 }
 
 function renderChat() {
@@ -320,24 +845,6 @@ function updateEngineChip() {
   const engine = CHAT.engine || "rules";
   chip.textContent = engine.includes("llm") ? "rules + llm" : "local rules";
   chip.classList.toggle("llm", engine.includes("llm"));
-}
-
-async function undoPrompt() {
-  if (!CHAT.prevSpec) { toast("nothing to undo", true); return; }
-  setLoading(true, "reverting the brief");
-  try {
-    const state = await api("/api/spec", { spec: CHAT.prevSpec });
-    CHAT.prevSpec = null;
-    for (const message of CHAT.messages) message.undoable = false;
-    CHAT.messages.push({ role: "assistant", lead: "Reverted. We’re back to the previous spec." });
-    applyState(state);
-    renderChat();
-    toast("reverted the last brief");
-  } catch (error) {
-    toast(error.message, true);
-  } finally {
-    setLoading(false);
-  }
 }
 
 /* ----------------------------------------------------------------- spec */
@@ -676,7 +1183,7 @@ function renderPackage() {
       const size = bytes > 1024 * 1024 ? `${(bytes / 1048576).toFixed(1)} MB`
         : bytes > 1024 ? `${(bytes / 1024).toFixed(0)} kB` : `${bytes || 0} B`;
       return `<div class="file-row">
-        <a href="/api/download/file?path=${encodeURIComponent(path)}" download>${esc(name)}</a>
+        <a href="${esc(withSession(`/api/download/file?path=${encodeURIComponent(path)}`))}" download>${esc(name)}</a>
         <span>${size}</span></div>`;
     }).join("");
     return `<div class="file-group"><h3>${esc(dir)}</h3>${rows}</div>`;
@@ -684,7 +1191,7 @@ function renderPackage() {
 
   holder.innerHTML = `${banner}${stats}
     <div style="display:flex;gap:6px;flex-wrap:wrap">
-      <a class="btn primary" href="/api/download/zip" download>Download package.zip</a>
+      <a class="btn primary" href="${esc(withSession("/api/download/zip"))}" download>Download package.zip</a>
       <button class="btn" data-build="1">Build again</button>
     </div>
     <div style="margin-top:9px;font:10px var(--mono);color:var(--dim);word-break:break-all">
@@ -804,6 +1311,14 @@ function onGlobalClick(event) {
   if (suggest) { runPrompt(suggest.dataset.suggest); return; }
   const undo = event.target.closest("[data-undo]");
   if (undo) { undoPrompt(); return; }
+  const variant = event.target.closest("[data-variant]");
+  if (variant) { applyVariant(variant.dataset.variant); return; }
+  const approve = event.target.closest("[data-approve]");
+  if (approve) { approveAgent(true); return; }
+  const reject = event.target.closest("[data-reject]");
+  if (reject) { approveAgent(false); return; }
+  const historyClose = event.target.closest("[data-history-close]");
+  if (historyClose) { const box = $("#agentHistory"); if (box) box.hidden = true; return; }
   const lock = event.target.closest("[data-lock]");
   if (lock) { toggleLock(lock.dataset.lock); return; }
   const filter = event.target.closest("[data-filter]");
@@ -1567,5 +2082,22 @@ function normalize(vector) {
   const length = Math.hypot(vector[0], vector[1], vector[2]) || 1;
   return [vector[0] / length, vector[1] / length, vector[2] / length];
 }
+
+/* Read-only inspection hook for smoke tests and browser automation.
+   Classic-script `const`/`let` bindings are not window properties, so expose
+   getters here rather than duplicating state on the global object. */
+try {
+  Object.defineProperty(window, "WatchCAD", {
+    value: Object.freeze({
+      get ready() { return Boolean(STATE && V && V.mesh); },
+      get STATE() { return STATE; },
+      get SCHEMA() { return SCHEMA; },
+      get CHAT() { return CHAT; },
+      get AGENT() { return AGENT; },
+      get V() { return V; },
+      modes: AGENT_MODES.slice(),
+    }),
+  });
+} catch { /* non-browser harnesses run app.js in a bare VM context */ }
 
 boot();
