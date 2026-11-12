@@ -98,6 +98,12 @@ window.localStorage = {
   setItem: (key, value) => stored.set(key, String(value)),
   removeItem: (key) => stored.delete(key),
 };
+class FakeFileReader {
+  readAsDataURL(file) {
+    this.result = file?.dataUrl || "data:image/png;base64,iVBORw0KGgo=";
+    this.onload?.();
+  }
+}
 const context = {
   console, document, window,
   localStorage: window.localStorage,
@@ -107,6 +113,8 @@ const context = {
   structuredClone, JSON, Math, Number, String, Array, Object, Float32Array, Uint32Array, Uint16Array, Set, Map,
   Blob: global.Blob,
   URL: global.URL,
+  TextDecoder: global.TextDecoder,
+  FileReader: FakeFileReader,
   confirm: () => true,
   alert: () => {},
 };
@@ -123,6 +131,8 @@ const source = fs.readFileSync(appPath, "utf8")
     renderChat, setField, syncFormValues, isVisible,
     setPanelClosed, restorePanels, pickAt, selectPartAt, clearPartSelection,
     approveAgent, applyVariant, undoTurn, redoTurn, toggleAgentHistory,
+    sendChat, newChat, loadConversations, toggleSettings, toggleChatHistory,
+    deleteChatMessage, renderAttachments, attachImages,
     get AGENT() { return AGENT; },
     get selected() { return V.selected; },
   };\n`;
@@ -290,6 +300,72 @@ const waitFor = async (fn, label, timeout = 15000) => {
   check(t.STATE.spec.data.dial.color === startColor, "agent undo restores the previous version");
   await t.redoTurn();
   check(t.STATE.spec.data.dial.color === "blue", "agent redo restores the approved version");
+
+  console.log("chat composer");
+  el("autonomy").value = "safe";
+  await t.attachImages({ target: { value: "", files: [
+    { name: "reference.png", size: 1024, dataUrl: "data:image/png;base64,iVBORw0KGgo=" },
+  ] } });
+  check(t.CHAT.attachments.length === 1, "image attachment is staged");
+  check(el("attachmentStrip").hidden === false && el("attachmentStrip").innerHTML.includes("<img"),
+    "attachment strip renders the preview");
+  t.CHAT.attachments = [];
+  t.renderAttachments();
+  check(el("attachmentStrip").hidden === true, "attachment strip clears");
+
+  await t.sendChat("Make the case 41 mm");
+  check(Boolean(t.CHAT.conversationId), "chat created a persisted conversation");
+  check(t.STATE.spec.data.case.diameter_mm === 41,
+    `chat changed the diameter to ${t.STATE.spec.data.case.diameter_mm}`);
+  check(t.CHAT.messages.some((message) => message.role === "user"),
+    "chat recorded the user turn");
+  const answer = t.CHAT.messages[t.CHAT.messages.length - 1];
+  check(answer?.role === "assistant" && !answer.streaming, "SSE stream finished into an answer");
+  check(el("chatLog").innerHTML.includes("41"), "streamed answer is in the chat log");
+  check(el("chatStatus").hidden === true, "streaming status is cleared");
+  check(t.CHAT.messages.some((message) => (message.patches || []).length),
+    "chat shows validated change chips");
+
+  await t.loadConversations();
+  check((t.CHAT.conversations || []).some((row) => row.id === t.CHAT.conversationId),
+    "conversation appears in the history sidebar");
+  await t.toggleChatHistory();
+  check(el("chatSidebar").hidden === false, "history sidebar opens");
+  await t.toggleChatHistory();
+
+  await t.toggleSettings();
+  check(el("settingsBox").hidden === false, "settings panel opens");
+  check(Boolean((el("settingsHint").textContent || "").trim()), "settings reports the model state");
+  await t.toggleSettings();
+
+  const firstUser = t.CHAT.messages.find((message) => message.role === "user");
+  await t.sendChat("Make the case 40 mm", { editId: firstUser.id });
+  check(t.STATE.spec.data.case.diameter_mm === 40, "edited message replaced the turn");
+  check(t.CHAT.messages.length === 2, "edit left a single question and answer");
+
+  await t.sendChat("", { regenerate: true });
+  check(t.CHAT.messages.length === 2 && t.CHAT.messages[1].role === "assistant",
+    "regenerate replaced the answer in place");
+
+  const lastAnswer = t.CHAT.messages.length - 1;
+  const lastId = t.CHAT.messages[lastAnswer].id;
+  await t.deleteChatMessage(lastAnswer);
+  check(Boolean(lastId) && t.CHAT.messages.length === 1 && t.CHAT.messages[0].role === "user",
+    "message delete is persisted");
+
+  const previousChat = t.CHAT.conversationId;
+  await t.newChat();
+  check(t.CHAT.conversationId && t.CHAT.conversationId !== previousChat,
+    "new chat starts a separate conversation");
+  check(t.STATE.spec.data.case.diameter_mm === 40, "new chat clones the current design");
+
+  el("autonomy").value = "approval";
+  await t.sendChat("Make the case 39 mm");
+  check(t.STATE.spec.data.case.diameter_mm === 40, "chat approval stages without applying");
+  check(Boolean(t.CHAT.pending?.token), "chat approval exposes a token");
+  await t.approveAgent(true);
+  check(t.STATE.spec.data.case.diameter_mm === 39, "chat approval applies after confirmation");
+  check(!t.CHAT.pending, "chat approval clears after applying");
 
   console.log(failures.length ? `\n${failures.length} failure(s)` : "\nall checks passed");
   process.exit(failures.length ? 1 : 0);

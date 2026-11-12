@@ -152,6 +152,33 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         "Results state whether a value is verified reference or an estimate.",
         _obj({"query": _STRING, "category": _STRING}, ["query"]),
     ),
+    "research_topic": ToolSpec(
+        "research_topic",
+        "Research a watch-engineering topic. Returns curated reference entries "
+        "with their evidence status, plus configured live web results with URLs "
+        "and retrieval timestamps. Never invents a source.",
+        _obj({"query": _STRING, "category": _STRING,
+              "include_web": _BOOL, "limit": _INT}, ["query"]),
+    ),
+    "fetch_source": ToolSpec(
+        "fetch_source",
+        "Retrieve one public http(s) source and return its readable text, URL "
+        "and retrieval timestamp. Use it before citing a web snippet as fact.",
+        _obj({"url": _STRING}, ["url"]),
+    ),
+    "undo_design": ToolSpec(
+        "undo_design",
+        "Restore the previous verified design version. Use only when the user "
+        "asks to undo or revert a design change.",
+        _obj({}),
+        mutating=False, read_only=False,
+    ),
+    "redo_design": ToolSpec(
+        "redo_design",
+        "Restore the next design version after an undo.",
+        _obj({}),
+        mutating=False, read_only=False,
+    ),
 }
 
 
@@ -700,6 +727,49 @@ def lookup_reference(ctx: ToolContext, query: str, category: str = "", **_) -> d
     return lookup(query, category=category or None)
 
 
+def research_topic(ctx: ToolContext, query: str, category: str = "",
+                   include_web: bool = True, limit: int = 5, **_) -> dict:
+    ctx.check()
+    from .research import research
+
+    return research(query, category=category or None,
+                    include_web=bool(include_web), limit=int(limit or 5))
+
+
+def fetch_source(ctx: ToolContext, url: str, **_) -> dict:
+    ctx.check()
+    from .research import fetch_source as retrieve
+
+    return retrieve(url)
+
+
+def _history_move(ctx: ToolContext, action: str) -> dict:
+    ctx.check()
+    session = ctx.session
+    if session is None:
+        raise ToolError("design history needs a session")
+    target = session.undo() if action == "undo" else session.redo()
+    if target is None:
+        raise ToolError(f"there is no version to {action}")
+    return {
+        "message": f"restored '{target.label}'",
+        "version": target.to_dict(),
+        "spec": _clean_json(ctx.studio.solved.to_dict().get("data", {})),
+        "checksum": ctx.studio.solved.get("derived.checksum"),
+        "summary": dict(ctx.studio.summary or {}),
+        "can_undo": session.can_undo(),
+        "can_redo": session.can_redo(),
+    }
+
+
+def undo_design(ctx: ToolContext, **_) -> dict:
+    return _history_move(ctx, "undo")
+
+
+def redo_design(ctx: ToolContext, **_) -> dict:
+    return _history_move(ctx, "redo")
+
+
 HANDLERS: dict[str, Callable[..., dict]] = {
     "get_current_spec": get_current_spec,
     "get_verification_report": get_verification_report,
@@ -714,4 +784,8 @@ HANDLERS: dict[str, Callable[..., dict]] = {
     "run_verification": run_verification,
     "build_package": build_package,
     "lookup_reference": lookup_reference,
+    "research_topic": research_topic,
+    "fetch_source": fetch_source,
+    "undo_design": undo_design,
+    "redo_design": redo_design,
 }

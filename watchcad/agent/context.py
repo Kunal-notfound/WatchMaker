@@ -417,6 +417,18 @@ class SessionManager:
         text = cls._VALID.sub("-", text)[:64].strip("-.")
         return text or "default"
 
+    def has(self, session_id: str | None = "default") -> bool:
+        """True when a session for this id is already live in memory."""
+        sid = self.normalize_id(session_id)
+        with self._lock:
+            return sid in self._sessions
+
+    def controls(self, session_id: str | None = "default") -> list[RunControl]:
+        sid = self.normalize_id(session_id)
+        with self._lock:
+            session = self._sessions.get(sid)
+            return list(session.runs.values()) if session else []
+
     def get(self, session_id: str | None = "default") -> Session:
         sid = self.normalize_id(session_id)
         with self._lock:

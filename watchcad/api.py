@@ -23,6 +23,19 @@ Endpoints (JSON unless noted):
     POST /api/build           {per_part?} -> package files
     GET  /api/download/file   ?path=<relative path inside the build>
     GET  /api/download/zip    package as one archive
+
+Conversation endpoints:
+
+    GET  /api/conversations              ?q=<search>
+    POST /api/conversations              {title?, design_session?}
+    GET  /api/conversations/<id>         transcript, design snapshot, tool events
+    POST /api/conversations/<id>/rename  {title}
+    POST /api/conversations/<id>/delete
+    POST /api/chat                       {conversation_id?, message, images?, stream?}
+    POST /api/chat/stop                  {conversation_id?, run_id?}
+    POST /api/chat/approve|reject        {conversation_id, token?}
+    GET  /api/settings                   non-secret model/research settings
+    POST /api/settings                   update non-secret settings
 """
 
 from __future__ import annotations
@@ -40,7 +53,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import exporters
-from .agent.context import AgentCancelled, AgentTimeout, RunControl, SessionManager
+from . import settings as app_settings
+from .agent.chat import ConversationRuntime
+from .agent.context import (
+    AgentCancelled, AgentTimeout, RunControl, SessionManager,
+    _clean_spec as _clean_spec_payload,
+)
 from .agent.evaluator import count_failures
 from .agent.knowledge import categories as knowledge_categories
 from .agent.knowledge import lookup as knowledge_lookup
@@ -49,11 +67,13 @@ from .agent.orchestrator import AgentOrchestrator, apply_variant, normalize_mode
 from .agent.planner import detect_intent, build_variants
 from .agent.tools import tool_catalog
 from .build import BuildResult, build, slugify
+from .llm import LLMConfig
 from .modules import MODULES, QUARTZ_MODULES
 from .nlp import describe, ideas, parse, preset_prompt
 from .parts import build_scene
 from .schema import ESSENTIAL, SCHEMA, Spec, new_spec
 from .solver import solve
+from .store import ConversationStore, default_db_path, new_id as new_store_id
 from .verify import summary, verify
 
 WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
@@ -157,6 +177,143 @@ STUDIO = Studio()
 # The default session binds to the module-level ``STUDIO`` on every lookup, so
 # tests (and embedders) can replace it.  Other sessions get their own studio.
 SESSIONS = SessionManager(lambda: STUDIO, lambda: Studio())
+
+# Persistent conversations and designs.  The store is created lazily so that
+# importing the API cannot create files as a side effect.  Tests may replace
+# ``STORE`` with an isolated in-memory/temporary database.
+STORE: ConversationStore | None = None
+_STORE_LOCK = threading.RLock()
+
+# Test/integration hooks: set these to a scripted client and config to run the
+# conversational runtime without any network access.
+LLM_CLIENT = None
+LLM_CONFIG: LLMConfig | None = None
+
+
+def get_store() -> ConversationStore:
+    global STORE
+    with _STORE_LOCK:
+        if STORE is None:
+            STORE = ConversationStore(default_db_path())
+        return STORE
+
+
+def _conversation_config() -> LLMConfig:
+    if LLM_CONFIG is not None:
+        return LLM_CONFIG
+    config = LLMConfig.from_env()
+    if LLM_CLIENT is not None and not config.available:
+        # Injected clients are usable even when no environment endpoint exists.
+        return LLMConfig(url="mock://injected", model="scripted",
+                         provider="injected")
+    return config
+
+
+def _restore_design(session, payload: dict, label: str = "Restored design") -> bool:
+    """Replace a fresh session's studio with a persisted specification."""
+    try:
+        spec = Spec.from_dict(payload)
+    except (TypeError, ValueError, KeyError):
+        return False
+    with session.studio.lock:
+        session.studio.spec = spec
+        session.studio.last_build = None
+        session.studio.rebuild()
+    with session._lock:
+        session.versions.clear()
+        session.redo_stack.clear()
+        session.take_checkpoint(label, "restore", force=True)
+    return True
+
+
+def _session_for_conversation(conversation: dict):
+    """Resolve (and if necessary restore) the design session of a conversation."""
+    sid = SESSIONS.normalize_id(conversation.get("design_session") or "default")
+    existed = SESSIONS.has(sid)
+    session = SESSIONS.get(sid)
+    if not existed:
+        stored = get_store().get_design(sid)
+        spec = (stored or {}).get("spec") if isinstance(stored, dict) else None
+        if isinstance(spec, dict) and spec.get("data"):
+            _restore_design(session, spec, "Restored conversation design")
+    return session
+
+
+def _save_design(session, conversation_id: str = "", label: str = "") -> None:
+    try:
+        studio = session.studio
+        get_store().save_design(
+            session.session_id, _clean_spec_payload(studio.spec),
+            checksum=str(studio.solved.get("derived.checksum") or ""),
+            label=label, conversation_id=conversation_id or None)
+    except Exception:  # noqa: BLE001 - persistence must not break an API call
+        pass
+
+
+def _create_conversation(source_session, body: dict) -> tuple[dict, object]:
+    """Create a conversation with its own design session.
+
+    A new conversation clones the design the user is currently looking at (so
+    it starts from real work), then diverges independently.  Supplying an
+    explicit ``design_session`` reuses that design instead.
+    """
+    requested = str(body.get("design_session") or "").strip()
+    sid = SESSIONS.normalize_id(requested or new_store_id("dsn"))
+    existed = SESSIONS.has(sid)
+    session = SESSIONS.get(sid)
+    if not existed:
+        stored = get_store().get_design(sid) if requested else None
+        spec = (stored or {}).get("spec") if isinstance(stored, dict) else None
+        if isinstance(spec, dict) and spec.get("data"):
+            _restore_design(session, spec, "Restored conversation design")
+        else:
+            try:
+                clone = source_session.studio.spec.copy()
+                with session.studio.lock:
+                    session.studio.spec = clone
+                    session.studio.last_build = None
+                    session.studio.rebuild()
+                with session._lock:
+                    session.versions.clear()
+                    session.redo_stack.clear()
+                    session.take_checkpoint("Conversation started", "initial",
+                                            force=True)
+            except Exception:  # noqa: BLE001 - fall back to the starter design
+                pass
+    title = str(body.get("title") or "").strip()
+    conversation = get_store().create_conversation(
+        title=title or "New conversation", design_session=sid)
+    _save_design(session, conversation["id"], "conversation start")
+    return conversation, session
+
+
+def _conversation_payload(conversation: dict, session, *,
+                          include_snapshot: bool = False) -> dict:
+    store = get_store()
+    cid = conversation["id"]
+    payload = {
+        "conversation": conversation,
+        "messages": store.messages(cid),
+        "tool_events": store.tool_events(cid, 40),
+        "design_refs": store.design_refs(cid, 20),
+        "pending": session.pending,
+        "session": session.conversation_payload(),
+        "design": {
+            "session_id": session.session_id,
+            "checksum": str(session.studio.solved.get("derived.checksum") or ""),
+        },
+    }
+    if include_snapshot:
+        payload["snapshot"] = session.studio.snapshot()
+    return payload
+
+
+def _conversation_route_ids(route: str) -> tuple[str, list[str]]:
+    parts = [part for part in route.split("/") if part]
+    # ["api", "conversations", "<id>", ...]
+    if len(parts) < 3:
+        return "", []
+    return urllib.parse.unquote(parts[2]), parts[3:]
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +430,17 @@ class Handler(BaseHTTPRequestHandler):
     def _api_get(self, route: str, query: dict) -> None:
         session = self._session(query)
         studio = session.studio
+        if route == "/api/conversations":
+            search = (query.get("q") or [""])[0]
+            self._json(200, {"conversations": get_store().list_conversations(search),
+                             "current": session.session_id})
+            return
+        if route.startswith("/api/conversations/"):
+            self._conversation_get(route)
+            return
+        if route == "/api/settings":
+            self._json(200, self._settings_payload())
+            return
         if route == "/api/state":
             payload = studio.snapshot({"session": session.conversation_payload(),
                                        "agent": session.last_agent})
@@ -330,6 +498,30 @@ class Handler(BaseHTTPRequestHandler):
     def _api_post(self, route: str, body: dict) -> None:
         session = self._session(body=body)
         studio = session.studio
+
+        if route == "/api/conversations":
+            conversation, target = _create_conversation(session, body)
+            payload = _conversation_payload(conversation, target,
+                                            include_snapshot=True)
+            self._json(200, payload)
+            return
+        if route.startswith("/api/conversations/"):
+            self._conversation_post(route, body)
+            return
+        if route == "/api/chat":
+            self._chat(body)
+            return
+        if route == "/api/chat/stop":
+            self._chat_stop(body)
+            return
+        if route in ("/api/chat/approve", "/api/chat/reject"):
+            self._chat_approval(body, route.endswith("approve"))
+            return
+        if route == "/api/settings":
+            patch = body.get("settings") if isinstance(body.get("settings"), dict) else body
+            app_settings.save_settings(patch)
+            self._json(200, self._settings_payload())
+            return
 
         if route == "/api/prompt":
             prompt = str(body.get("prompt", ""))
@@ -577,6 +769,188 @@ class Handler(BaseHTTPRequestHandler):
         payload["snapshot"] = session.studio.snapshot()
         payload["session"] = session.conversation_payload()
         payload["pending"] = session.pending
+        self._json(200, payload)
+
+    # -- conversations ---------------------------------------------------
+    def _settings_payload(self) -> dict:
+        config = _conversation_config()
+        return {
+            "settings": app_settings.public_settings(),
+            "llm": config.public_dict(),
+            "research": {"configured": bool(config.search_url),
+                         "provider": config.search_provider},
+            "database": str(get_store().path),
+        }
+
+    def _conversation_get(self, route: str) -> None:
+        conversation_id, action = _conversation_route_ids(route)
+        conversation = get_store().get_conversation(conversation_id)
+        if conversation is None:
+            self._error(404, f"unknown conversation {conversation_id}")
+            return
+        session = _session_for_conversation(conversation)
+        if not action:
+            self._json(200, _conversation_payload(conversation, session,
+                                                  include_snapshot=True))
+        elif action == ["messages"]:
+            self._json(200, {"messages": get_store().messages(conversation_id)})
+        elif action == ["tool-events"]:
+            self._json(200, {"tool_events": get_store().tool_events(conversation_id)})
+        else:
+            self._error(404, f"unknown conversation endpoint {route}")
+
+    def _conversation_post(self, route: str, body: dict) -> None:
+        conversation_id, action = _conversation_route_ids(route)
+        conversation = get_store().get_conversation(conversation_id)
+        if conversation is None:
+            self._error(404, f"unknown conversation {conversation_id}")
+            return
+        session = _session_for_conversation(conversation)
+
+        if action == ["rename"]:
+            title = str(body.get("title") or "").strip()
+            if not title:
+                self._error(400, "title is required")
+                return
+            conversation = get_store().rename_conversation(conversation_id, title) \
+                or conversation
+            self._json(200, {"conversation": conversation})
+            return
+        if action == ["delete"]:
+            deleted = get_store().delete_conversation(conversation_id)
+            self._json(200, {"deleted": deleted, "conversation_id": conversation_id})
+            return
+        if len(action) == 3 and action[0] == "messages" and action[2] == "delete":
+            deleted = get_store().delete_message(action[1])
+            self._json(200, {"deleted": deleted,
+                             "messages": get_store().messages(conversation_id)})
+            return
+        self._error(404, f"unknown conversation endpoint {route}")
+
+    def _chat(self, body: dict) -> None:
+        conversation_id = str(body.get("conversation_id") or "").strip()
+        source_session = self._session(body=body)
+        if conversation_id:
+            conversation = get_store().get_conversation(conversation_id)
+            if conversation is None:
+                self._error(404, f"unknown conversation {conversation_id}")
+                return
+            session = _session_for_conversation(conversation)
+        else:
+            conversation, session = _create_conversation(source_session, body)
+            conversation_id = conversation["id"]
+
+        message = str(body.get("message") or body.get("prompt") or "")
+        images = body.get("images") or []
+        if isinstance(images, str):
+            images = [images]
+        if not isinstance(images, list):
+            images = []
+        mode = normalize_mode(body.get("mode") or body.get("autonomy") or "safe")
+        control = RunControl(timeout_s=float(body.get("timeout_s") or 180))
+        session.runs[control.run_id] = control
+        stream = bool(body.get("stream", False))
+        write = self._start_sse(control) if stream else None
+        try:
+            runtime = ConversationRuntime(
+                session, get_store(), conversation_id,
+                llm_client=LLM_CLIENT, llm_config=_conversation_config(),
+                build_root=str(BUILD_ROOT))
+            result = runtime.run(
+                message, images=[str(item) for item in images],
+                mode=mode,
+                use_llm=(body.get("use_llm") if "use_llm" in body else None),
+                max_tool_rounds=int(body.get("max_tool_rounds") or 12),
+                emit=write, control=control,
+                regenerate=bool(body.get("regenerate", False)),
+                edit_message_id=str(body.get("edit_message_id") or ""))
+            conversation = get_store().get_conversation(conversation_id) or conversation
+            payload = result.to_dict()
+            payload["conversation"] = conversation
+            payload["messages"] = get_store().messages(conversation_id)
+            payload["tool_events"] = get_store().tool_events(conversation_id, 40)
+            payload["session"] = session.conversation_payload()
+            payload["design"] = {
+                "session_id": session.session_id,
+                "checksum": str(session.studio.solved.get("derived.checksum") or ""),
+            }
+            if write:
+                write({"type": "result", "result": payload})
+            else:
+                self._json(200, payload)
+        finally:
+            session.runs.pop(control.run_id, None)
+            if write:
+                self._end_sse()
+
+    def _chat_stop(self, body: dict) -> None:
+        conversation_id = str(body.get("conversation_id") or "")
+        run_id = str(body.get("run_id") or "")
+        controls = []
+        if conversation_id:
+            conversation = get_store().get_conversation(conversation_id)
+            if conversation:
+                controls = SESSIONS.controls(conversation.get("design_session"))
+        if not controls:
+            controls = SESSIONS.controls(body.get("session_id")
+                                         or self._session_id(body=body))
+        cancelled = []
+        for control in controls:
+            if run_id and control.run_id != run_id:
+                continue
+            control.cancel()
+            cancelled.append(control.run_id)
+        self._json(200, {"cancelled": cancelled,
+                         "conversation_id": conversation_id})
+
+    def _chat_approval(self, body: dict, approve: bool) -> None:
+        conversation_id = str(body.get("conversation_id") or "").strip()
+        conversation = get_store().get_conversation(conversation_id)
+        if conversation is None:
+            self._error(404, f"unknown conversation {conversation_id}")
+            return
+        session = _session_for_conversation(conversation)
+        token = str(body.get("token") or "")
+        try:
+            if approve:
+                if not token and session.pending:
+                    token = str(session.pending.get("token") or "")
+                pending = session.approve(token)
+                _save_design(session, conversation_id, "approved change")
+                checks = session.studio.checks or []
+                after = summary(checks)
+                changes = pending.get("ops") or []
+                text = (f"Applied {len(changes)} approved change(s) through the "
+                        f"validated pipeline. Verification: "
+                        f"{after.get('fail', 0)} failing check(s).")
+                get_store().add_message(
+                    conversation_id, "assistant", text, kind="assistant",
+                    data={"engine": "local rules", "status": "complete",
+                          "approved": True, "changes": changes,
+                          "verification": after})
+            else:
+                pending = session.reject(token or None)
+                get_store().add_message(
+                    conversation_id, "assistant",
+                    "I left the design unchanged; the staged change was discarded.",
+                    kind="assistant",
+                    data={"engine": "local rules", "status": "rejected"})
+        except KeyError as exc:
+            self._error(409, str(exc))
+            return
+        except ValueError as exc:
+            self._error(409, str(exc))
+            return
+        conversation = get_store().get_conversation(conversation_id) or conversation
+        payload = {
+            "approved": approve,
+            "request": pending.get("request"),
+            "changes": pending.get("ops") or [],
+            "snapshot": session.studio.snapshot(),
+            "session": session.conversation_payload(),
+            "conversation": conversation,
+            "messages": get_store().messages(conversation_id),
+        }
         self._json(200, payload)
 
     # -- streaming -------------------------------------------------------

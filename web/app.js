@@ -7,7 +7,23 @@ const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 let SCHEMA = null;
 let STATE = null;
 let IDEAS = {};
-const CHAT = { messages: [], typing: false, prevSpec: null, engine: "local rules" };
+const CHAT = {
+  messages: [],
+  typing: false,
+  prevSpec: null,
+  engine: "local rules",
+  conversationId: null,
+  conversations: [],
+  attachments: [],
+  edits: [],
+  editId: "",
+  runId: "",
+  streaming: false,
+  status: "",
+  pending: null,
+  historyOpen: false,
+  settingsOpen: false,
+};
 const AGENT = {
   running: false,
   runId: null,
@@ -32,6 +48,104 @@ let toastTimer = 0;
 const esc = (value) => String(value)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
   .replaceAll('"', "&quot;");
+
+/* --------------------------------------------------------------- markdown */
+function mdInline(text) {
+  let out = esc(text);
+  out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  out = out.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    '<a href="$2" target="_blank" rel="noreferrer noopener">$1</a>');
+  return out;
+}
+
+function mdRow(line) {
+  return String(line).trim().replace(/^\|/, "").replace(/\|$/, "").split("|")
+    .map((cell) => cell.trim());
+}
+
+/* A deliberately small, escaped Markdown renderer: headings, lists, tables,
+   fenced code, quotes, bold/italic/inline-code and safe http(s) links. */
+function renderMarkdown(text) {
+  const lines = String(text ?? "").replaceAll("\r\n", "\n").split("\n");
+  const out = [];
+  let para = [];
+  let i = 0;
+  const flush = () => {
+    if (!para.length) return;
+    out.push(`<p>${para.map(mdInline).join("<br>")}</p>`);
+    para = [];
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*```/.test(line)) {
+      flush();
+      const lang = line.trim().replace(/^```/, "").trim();
+      const code = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) {
+        code.push(lines[i]);
+        i += 1;
+      }
+      i += 1;
+      out.push(`<pre><code${lang ? ` data-lang="${esc(lang)}"` : ""}>${esc(code.join("\n"))}</code></pre>`);
+      continue;
+    }
+    if (/^\s*$/.test(line)) { flush(); i += 1; continue; }
+    const heading = line.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      flush();
+      const level = Math.min(6, heading[1].length + 2);
+      out.push(`<h${level}>${mdInline(heading[2])}</h${level}>`);
+      i += 1;
+      continue;
+    }
+    if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      flush(); out.push("<hr>"); i += 1; continue;
+    }
+    if (/^\s*>\s?/.test(line)) {
+      flush();
+      const quote = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        quote.push(lines[i].replace(/^\s*>\s?/, ""));
+        i += 1;
+      }
+      out.push(`<blockquote>${quote.map(mdInline).join("<br>")}</blockquote>`);
+      continue;
+    }
+    if (/^\s*(?:\d+\.|[-*])\s+/.test(line)) {
+      flush();
+      const ordered = /^\s*\d+\./.test(line);
+      const items = [];
+      while (i < lines.length && /^\s*(?:\d+\.|[-*])\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*(?:\d+\.|[-*])\s+/, ""));
+        i += 1;
+      }
+      const tag = ordered ? "ol" : "ul";
+      out.push(`<${tag}>${items.map((item) => `<li>${mdInline(item)}</li>`).join("")}</${tag}>`);
+      continue;
+    }
+    if (line.includes("|") && /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1] || "")) {
+      flush();
+      const header = mdRow(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        rows.push(mdRow(lines[i]));
+        i += 1;
+      }
+      out.push(`<table><thead><tr>${header.map((cell) => `<th>${mdInline(cell)}</th>`).join("")}</tr></thead><tbody>${
+        rows.map((row) => `<tr>${row.map((cell) => `<td>${mdInline(cell)}</td>`).join("")}</tr>`).join("")
+      }</tbody></table>`);
+      continue;
+    }
+    para.push(line);
+    i += 1;
+  }
+  flush();
+  return out.join("");
+}
 
 const fmt = (value, digits = 2) => {
   const n = Number(value);
@@ -96,11 +210,11 @@ function getPath(obj, path) {
 
 /* ------------------------------------------------------------------ boot */
 async function boot() {
-  $("#btnParse").addEventListener("click", () => runPrompt());
+  $("#btnParse").addEventListener("click", () => sendChat());
   $("#prompt").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      runPrompt();
+      sendChat();
     }
   });
   $("#btnSave").addEventListener("click", saveSpec);
@@ -108,19 +222,30 @@ async function boot() {
   $("#fileLoad").addEventListener("change", loadSpecFile);
   $("#btnNew").addEventListener("click", resetSpec);
   $("#btnBuildTop").addEventListener("click", buildPackage);
-  $("#btnStop").addEventListener("click", stopAgent);
+  $("#btnStop").addEventListener("click", stopRun);
   $("#btnUndo").addEventListener("click", undoTurn);
   $("#btnRedo").addEventListener("click", redoTurn);
   $("#btnHistory").addEventListener("click", toggleAgentHistory);
+  $("#btnChats").addEventListener("click", toggleChatHistory);
+  $("#btnNewChat").addEventListener("click", newChat);
+  $("#btnSettings").addEventListener("click", toggleSettings);
+  $("#btnAttach").addEventListener("click", () => $("#chatImages").click());
+  $("#chatImages").addEventListener("change", attachImages);
+  $("#conversationSearch").addEventListener("input", (event) => {
+    loadConversations(event.target.value || "");
+  });
+  $("#settingsBox").addEventListener("click", (event) => {
+    if (event.target.closest("[data-settings-save]")) saveSettings();
+  });
   $("#autonomy").addEventListener("change", (event) => {
     try { window.localStorage?.setItem("watchcad.autonomy", event.target.value); } catch { /* ignore */ }
-    toast(`autonomy: ${event.target.value}`);
+    toast(`mode: ${event.target.value}`);
   });
   $("#examples").addEventListener("click", (event) => {
     const button = event.target.closest("[data-preset]");
     if (!button) return;
     const prompt = IDEAS[button.dataset.preset];
-    if (prompt) runPrompt(prompt);
+    if (prompt) sendChat(prompt);
   });
   $("#specForm").addEventListener("change", onFieldChange);
   $("#specForm").addEventListener("click", onFieldStep);
@@ -141,7 +266,7 @@ async function boot() {
     STATE = state;
     IDEAS = Object.fromEntries((schema.ideas || []).map((item) => [item.id, item.prompt]));
     renderExamples();
-    seedChat();
+    await initChat();
     renderAll();
     ensureViewerSize();
     await loadScene(true);
@@ -259,10 +384,12 @@ function seedChat() {
   const m = spec.movement || {};
   CHAT.messages.push({
     role: "assistant",
-    lead: `Hi — I’m the design agent. This is currently a ${fmt(c.diameter_mm, 0)} mm `
-      + `${c.material || "steel"} ${m.kind || "mechanical"} watch. I can inspect the engine, `
-      + `change validated spec fields, repair failures and explain the result.`,
-    notes: ["The solver owns every dimension; I only choose validated tools. Nothing is committed unless verification succeeds."],
+    lead: `Hello. This is currently a **${fmt(c.diameter_mm, 0)} mm `
+      + `${c.material || "steel"} ${m.kind || "mechanical"} watch**. `
+      + "You can ask me about the design, materials or movements, or ask for a "
+      + "specific change. I only modify the watch through validated CAD tools, "
+      + "and every change is solved and verified before it is committed.",
+    notes: ["The deterministic solver owns every dimension. Nothing is committed unless verification succeeds."],
     suggestions: [
       "Make it 40 mm titanium with a dive bezel",
       "Add a date and a chronograph",
@@ -289,6 +416,600 @@ function renderSessionChip() {
   const id = AGENT.sessionId || currentSession();
   chip.textContent = String(id).replace(/^web-/, "").slice(0, 12);
   chip.title = `Session ${id}: its conversation, history and design memory are isolated`;
+}
+
+/* ------------------------------------------------------------ conversations */
+function rememberConversation(conversation) {
+  try {
+    if (!conversation) return;
+    if (conversation.id) window.localStorage?.setItem("watchcad.conversation", conversation.id);
+    if (conversation.design_session) {
+      window.localStorage?.setItem("watchcad.session", conversation.design_session);
+    }
+  } catch { /* private mode or a non-browser harness */ }
+}
+
+function relativeTime(stamp) {
+  const seconds = Number(stamp) || 0;
+  if (!seconds) return "";
+  const delta = Math.max(0, Date.now() / 1000 - seconds);
+  if (delta < 60) return "just now";
+  if (delta < 3600) return `${Math.round(delta / 60)}m ago`;
+  if (delta < 86400) return `${Math.round(delta / 3600)}h ago`;
+  return `${Math.round(delta / 86400)}d ago`;
+}
+
+async function loadConversations(query = "") {
+  try {
+    const suffix = query ? `?q=${encodeURIComponent(query)}` : "";
+    const data = await api(`/api/conversations${suffix}`);
+    CHAT.conversations = data.conversations || [];
+    renderConversationList();
+  } catch (error) {
+    const holder = $("#conversationList");
+    if (holder) holder.innerHTML = `<div class="empty-note bad">${esc(error.message)}</div>`;
+  }
+}
+
+function renderConversationList() {
+  const holder = $("#conversationList");
+  if (!holder) return;
+  const rows = CHAT.conversations || [];
+  holder.innerHTML = rows.length ? rows.map((conversation) => {
+    const active = conversation.id === CHAT.conversationId;
+    const title = conversation.title || "Untitled conversation";
+    const count = Number(conversation.message_count || 0);
+    return `<div class="conversation-row ${active ? "active" : ""}" data-conversation="${esc(conversation.id)}">
+      <button class="conversation-main" data-open-conversation="${esc(conversation.id)}" title="${esc(title)}">
+        <span class="conversation-title">${esc(title)}</span>
+        <span class="conversation-meta">${count} message${count === 1 ? "" : "s"} · ${esc(relativeTime(conversation.updated_at))}</span>
+      </button>
+      <button class="conversation-act" data-rename-conversation="${esc(conversation.id)}" title="Rename conversation">✎</button>
+      <button class="conversation-act danger" data-delete-conversation="${esc(conversation.id)}" title="Delete conversation">×</button>
+    </div>`;
+  }).join("") : `<div class="empty-note">No saved conversations yet. Say something to start one.</div>`;
+}
+
+function toggleChatHistory() {
+  CHAT.historyOpen = !CHAT.historyOpen;
+  const box = $("#chatSidebar");
+  if (box) box.hidden = !CHAT.historyOpen;
+  const button = $("#btnChats");
+  if (button) button.classList.toggle("active", CHAT.historyOpen);
+  if (CHAT.historyOpen) loadConversations($("#conversationSearch")?.value || "");
+}
+
+function timelineFromToolEvents(events) {
+  return (events || []).map((event, index) => ({
+    seq: index + 1,
+    kind: "tool",
+    title: event.name,
+    status: event.ok ? "ok" : "error",
+    iteration: 0,
+    detail: (event.result || {}).message || (event.result || {}).error || "",
+    data: { tool: event.name, arguments: event.arguments || {} },
+  }));
+}
+
+function messagesFromRows(rows) {
+  return (rows || []).filter((row) => row.role === "user" || row.role === "assistant")
+    .map((row) => {
+      const data = row.data || {};
+      const changes = data.changes || [];
+      return {
+        id: row.id,
+        role: row.role,
+        text: row.content || "",
+        lead: row.content || "",
+        attachments: data.images || [],
+        patches: changes.map((change) => ({
+          path: change.path, value: change.to, from: change.from,
+        })),
+        suggestions: data.suggestions || [],
+        engine: data.engine || "",
+        status: data.status || "",
+        bad: ["error", "cancelled", "timeout"].includes(data.status),
+        undoable: false,
+      };
+    });
+}
+
+function applyConversationPayload(data) {
+  const conversation = data.conversation || {};
+  CHAT.conversationId = conversation.id || CHAT.conversationId;
+  rememberConversation(conversation);
+  if (data.snapshot) applyState(data.snapshot);
+  CHAT.messages = messagesFromRows(data.messages);
+  if (!CHAT.messages.length) {
+    CHAT.messages = [];
+    seedChat();
+  }
+  const lastAssistant = [...CHAT.messages].reverse()
+    .find((message) => message.role === "assistant" && message.engine);
+  CHAT.engine = lastAssistant?.engine || CHAT.engine || "local rules";
+  CHAT.pending = data.pending || null;
+  AGENT.pending = CHAT.pending;
+  if (data.tool_events) {
+    AGENT.events = timelineFromToolEvents(data.tool_events);
+  }
+  renderChat();
+  renderAgent();
+  renderConversationList();
+}
+
+async function openConversation(conversationId, options = {}) {
+  if (AGENT.running) { toast("stop the current run first", true); return; }
+  try {
+    const data = await api(`/api/conversations/${encodeURIComponent(conversationId)}`);
+    applyConversationPayload(data);
+    if (CHAT.historyOpen && !options.keepSidebar) toggleChatHistory();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function newChat() {
+  if (AGENT.running) { toast("stop the current run first", true); return; }
+  try {
+    const data = await api("/api/conversations", { title: "New conversation" });
+    CHAT.messages = [];
+    applyConversationPayload(data);
+    CHAT.messages = [];
+    seedChat();
+    renderChat();
+    const input = $("#prompt");
+    if (input) { input.value = ""; input.focus?.(); }
+    await loadConversations();
+    toast("started a new conversation");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function renameConversation(conversationId) {
+  const current = (CHAT.conversations || []).find((row) => row.id === conversationId);
+  const title = window.prompt?.("Conversation title", current?.title || "");
+  if (title === null || title === undefined || !String(title).trim()) return;
+  try {
+    await api(`/api/conversations/${encodeURIComponent(conversationId)}/rename`,
+      { title: String(title).trim() });
+    await loadConversations($("#conversationSearch")?.value || "");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function deleteConversation(conversationId) {
+  const confirmed = window.confirm?.("Delete this conversation? The design stays in its saved session.")
+    ?? true;
+  if (!confirmed) return;
+  try {
+    await api(`/api/conversations/${encodeURIComponent(conversationId)}/delete`, {});
+    if (conversationId === CHAT.conversationId) {
+      CHAT.conversationId = null;
+      try { window.localStorage?.removeItem("watchcad.conversation"); } catch { /* ignore */ }
+      CHAT.messages = [];
+      seedChat();
+      renderChat();
+    }
+    await loadConversations($("#conversationSearch")?.value || "");
+    toast("conversation deleted");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function initChat() {
+  try {
+    const settings = await api("/api/settings");
+    if (settings.llm?.configured && $("#useLlm")) $("#useLlm").checked = true;
+    if (settings.llm?.configured) CHAT.engine = "llm ready";
+  } catch { /* settings are optional */ }
+  let saved = "";
+  try { saved = window.localStorage?.getItem("watchcad.conversation") || ""; } catch { saved = ""; }
+  if (saved) {
+    try {
+      const data = await api(`/api/conversations/${encodeURIComponent(saved)}`);
+      applyConversationPayload(data);
+      loadConversations();
+      return;
+    } catch { /* the saved transcript may have been deleted */ }
+  }
+  seedChat();
+  loadConversations();
+}
+
+/* ------------------------------------------------------------ chat actions */
+function lastStreamingMessage() {
+  for (let i = CHAT.messages.length - 1; i >= 0; i -= 1) {
+    if (CHAT.messages[i].streaming) return CHAT.messages[i];
+  }
+  return null;
+}
+
+let chatRenderTimer = 0;
+function scheduleChatRender() {
+  if (chatRenderTimer) return;
+  chatRenderTimer = setTimeout(() => {
+    chatRenderTimer = 0;
+    renderChat();
+  }, 45);
+}
+
+function handleChatEvent(event) {
+  if (!event || !event.type) return;
+  if (event.type === "start") {
+    CHAT.runId = event.run_id || CHAT.runId;
+    AGENT.sessionId = event.session_id || AGENT.sessionId;
+    CHAT.status = "Thinking";
+    renderChatStatus();
+    return;
+  }
+  if (event.type === "notice") {
+    CHAT.status = event.text || CHAT.status;
+    renderChatStatus();
+    return;
+  }
+  if (event.type === "status") {
+    CHAT.status = event.text || CHAT.status;
+    if (event.detail) CHAT.status += ` — ${event.detail}`;
+    renderChatStatus();
+    return;
+  }
+  if (event.type === "delta") {
+    const draft = lastStreamingMessage();
+    if (draft) {
+      draft.lead += event.text || "";
+      scheduleChatRender();
+    }
+    return;
+  }
+  if (event.type === "timeline" && event.event) {
+    const item = event.event;
+    if (!AGENT.events.some((known) => known.seq && known.seq === item.seq)) {
+      AGENT.events.push(item);
+    }
+    renderAgentTimeline();
+    return;
+  }
+  if (event.type === "error") {
+    const detail = event.error?.message || event.error?.error || event.error || "assistant error";
+    AGENT.error = detail;
+    CHAT.status = detail;
+    const draft = lastStreamingMessage();
+    if (draft) {
+      draft.bad = true;
+      draft.lead = draft.lead || `The assistant could not finish: ${detail}`;
+    }
+    renderChat();
+    return;
+  }
+  if (event.type === "done") {
+    CHAT.status = event.status && event.status !== "complete"
+      ? String(event.status).replaceAll("_", " ") : "";
+    renderChatStatus();
+  }
+}
+
+async function streamChatTurn(body, onEvent) {
+  const response = await fetch("/api/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-WatchCAD-Session": currentSession(),
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    let data = {};
+    try { data = await response.json(); } catch { /* empty response */ }
+    throw new Error(data.error || `HTTP ${response.status}`);
+  }
+  const type = String(response.headers?.get("content-type") || "");
+  let final = null;
+  const dispatch = (event) => {
+    if (!event || !event.type) return;
+    if (event.type === "result") final = event.result || null;
+    onEvent(event);
+  };
+  const canStream = response.body && typeof response.body.getReader === "function"
+    && typeof TextDecoder !== "undefined" && type.includes("text/event-stream");
+  if (canStream) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split = buffer.indexOf("\n\n");
+      while (split >= 0) {
+        parseSseFrame(buffer.slice(0, split), dispatch);
+        buffer = buffer.slice(split + 2);
+        split = buffer.indexOf("\n\n");
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) parseSseFrame(buffer, dispatch);
+  } else if (type.includes("text/event-stream") || !type.includes("application/json")) {
+    const text = await response.text();
+    for (const frame of String(text).split(/\n\n/)) parseSseFrame(frame, dispatch);
+  } else {
+    const data = await response.json();
+    dispatch({ type: "result", result: data });
+    final = data;
+  }
+  return final;
+}
+
+function applyChatResult(payload, before) {
+  if (!payload) return;
+  if (payload.messages) CHAT.messages = messagesFromRows(payload.messages);
+  if (!CHAT.messages.length) { seedChat(); }
+  CHAT.engine = payload.engine || CHAT.engine;
+  CHAT.pending = payload.pending || null;
+  AGENT.pending = CHAT.pending;
+  AGENT.result = {
+    ...payload,
+    response: payload.text || payload.response || "",
+    verification_after: payload.verification_after || {},
+  };
+  AGENT.changes = payload.changes || [];
+  AGENT.engine = payload.engine || AGENT.engine;
+  AGENT.error = payload.error || null;
+  if (payload.timeline) AGENT.events = payload.timeline;
+  if (payload.snapshot) applyState(payload.snapshot);
+  if (payload.conversation) {
+    CHAT.conversationId = payload.conversation.id || CHAT.conversationId;
+    rememberConversation(payload.conversation);
+  }
+  if (payload.session?.session_id) AGENT.sessionId = payload.session.session_id;
+  if ((payload.changes || []).length && before) CHAT.prevSpec = before;
+  renderChat();
+  renderAgent();
+  loadConversations($("#conversationSearch")?.value || "");
+}
+
+async function sendChat(textOverride, options = {}) {
+  const regenerate = Boolean(options.regenerate);
+  let prompt = String(textOverride ?? $("#prompt").value ?? "").trim();
+  const images = CHAT.attachments.slice();
+  if (!prompt && !images.length && !regenerate) {
+    toast("ask a question or describe a change first", true);
+    return;
+  }
+  if (AGENT.running) { toast("the assistant is already running", true); return; }
+  const editId = options.editId !== undefined ? options.editId : CHAT.editId;
+  if (!regenerate && editId) {
+    const index = CHAT.messages.findIndex((message) => message.id === editId);
+    if (index >= 0) CHAT.messages.splice(index);
+  }
+  if (regenerate) {
+    while (CHAT.messages.length && CHAT.messages[CHAT.messages.length - 1].role === "assistant") {
+      CHAT.messages.pop();
+    }
+    const lastUser = [...CHAT.messages].reverse().find((message) => message.role === "user");
+    prompt = prompt || lastUser?.text || "";
+  } else if (prompt || images.length) {
+    CHAT.messages.push({ role: "user", text: prompt || "Please analyse this image.",
+                         attachments: images });
+  }
+  const before = STATE && STATE.spec ? cloneSpec(STATE.spec) : null;
+  const draft = { role: "assistant", lead: "", streaming: true };
+  CHAT.messages.push(draft);
+
+  CHAT.typing = true;
+  CHAT.streaming = true;
+  CHAT.status = "Thinking";
+  CHAT.editId = "";
+  CHAT.attachments = [];
+  AGENT.events = [];
+  AGENT.result = null;
+  AGENT.changes = [];
+  AGENT.variants = [];
+  AGENT.pending = null;
+  AGENT.error = null;
+  if ($("#prompt")) $("#prompt").value = "";
+  renderChat();
+  renderAgent();
+  renderAttachments();
+  setAgentRunning(true);
+  try {
+    const payload = await streamChatTurn({
+      conversation_id: CHAT.conversationId || "",
+      message: prompt,
+      images,
+      mode: currentMode(),
+      use_llm: Boolean($("#useLlm") && $("#useLlm").checked),
+      stream: true,
+      regenerate,
+      edit_message_id: regenerate ? "" : (editId || ""),
+    }, handleChatEvent);
+    if (!payload) throw new Error(AGENT.error || "the assistant returned no result");
+    applyChatResult(payload, before);
+    const applied = Number((payload.changes || []).length);
+    if (payload.pending && payload.pending.token) {
+      toast("changes are staged for your approval");
+    } else if (applied) {
+      toast(`applied ${applied} validated change${applied === 1 ? "" : "s"}`);
+    }
+  } catch (error) {
+    const transient = lastStreamingMessage();
+    if (transient) {
+      transient.streaming = false;
+      transient.bad = true;
+      transient.lead = transient.lead || `The assistant could not finish: ${error.message}`;
+    }
+    AGENT.error = error.message;
+    CHAT.status = error.message;
+    toast(error.message, true);
+  } finally {
+    for (const message of CHAT.messages) message.streaming = false;
+    CHAT.typing = false;
+    CHAT.streaming = false;
+    if (!AGENT.error) CHAT.status = "";
+    setAgentRunning(false);
+    renderChat();
+    renderAgent();
+  }
+}
+
+async function regenerateChat() {
+  if (!CHAT.conversationId) { toast("send a message before regenerating", true); return; }
+  return sendChat("", { regenerate: true });
+}
+
+function startEditMessage(index) {
+  const message = CHAT.messages[index];
+  if (!message || message.role !== "user") return;
+  CHAT.editId = message.id || "";
+  if (!CHAT.editId) return;
+  const input = $("#prompt");
+  if (input) {
+    input.value = message.text || message.lead || "";
+    input.focus?.();
+  }
+  toast("editing this message — send to replace the turn");
+}
+
+async function copyMessage(index) {
+  const message = CHAT.messages[index];
+  if (!message) return;
+  const text = message.text || message.lead || "";
+  try {
+    if (window.navigator?.clipboard?.writeText) {
+      await window.navigator.clipboard.writeText(text);
+    } else if (document.createElement) {
+      const area = document.createElement("textarea");
+      area.value = text;
+      document.body?.appendChild?.(area);
+      area.select?.();
+      document.execCommand?.("copy");
+      area.remove?.();
+    }
+    toast("copied");
+  } catch {
+    toast("could not copy", true);
+  }
+}
+
+async function deleteChatMessage(index) {
+  const message = CHAT.messages[index];
+  if (!message) return;
+  if (CHAT.conversationId && message.id) {
+    try {
+      const data = await api(`/api/conversations/${encodeURIComponent(CHAT.conversationId)}` +
+        `/messages/${encodeURIComponent(message.id)}/delete`, {});
+      CHAT.messages = messagesFromRows(data.messages);
+      renderChat();
+      loadConversations($("#conversationSearch")?.value || "");
+      return;
+    } catch (error) {
+      toast(error.message, true);
+      return;
+    }
+  }
+  CHAT.messages.splice(index, 1);
+  renderChat();
+}
+
+async function stopRun() {
+  if (CHAT.streaming) {
+    try {
+      await api("/api/chat/stop", {
+        conversation_id: CHAT.conversationId || "",
+        run_id: CHAT.runId || "",
+      });
+      toast("stop requested; nothing unverified will be committed");
+    } catch (error) {
+      toast(error.message, true);
+    }
+    return;
+  }
+  return stopAgent();
+}
+
+/* ------------------------------------------------------------ attachments */
+function renderAttachments() {
+  const strip = $("#attachmentStrip");
+  if (!strip) return;
+  const images = CHAT.attachments || [];
+  strip.hidden = !images.length;
+  strip.innerHTML = images.map((url, index) => `<figure class="attachment">
+    <img src="${esc(url)}" alt="Attached reference">
+    <button data-remove-attachment="${index}" title="Remove attachment">×</button>
+  </figure>`).join("");
+}
+
+function attachImages(event) {
+  const files = Array.from(event.target?.files || []);
+  if (!files.length) return;
+  if (typeof FileReader === "undefined") return;
+  for (const file of files) {
+    if (CHAT.attachments.length >= 4) break;
+    if (Number(file.size || 0) > 1_900_000) {
+      toast(`${file.name || "image"} is too large (max 1.9 MB)`, true);
+      continue;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        CHAT.attachments.push(reader.result);
+        renderAttachments();
+      }
+    };
+    reader.onerror = () => toast(`could not read ${file.name || "image"}`, true);
+    reader.readAsDataURL(file);
+  }
+  if (event.target) event.target.value = "";
+}
+
+/* --------------------------------------------------------------- settings */
+async function toggleSettings() {
+  CHAT.settingsOpen = !CHAT.settingsOpen;
+  const box = $("#settingsBox");
+  if (!box) return;
+  box.hidden = !CHAT.settingsOpen;
+  if (!CHAT.settingsOpen) return;
+  try {
+    const data = await api("/api/settings");
+    const settings = data.settings || {};
+    if ($("#setProvider")) $("#setProvider").value = settings.provider || "";
+    if ($("#setUrl")) $("#setUrl").value = settings.url || "";
+    if ($("#setModel")) $("#setModel").value = settings.model || "";
+    if ($("#setVision")) $("#setVision").value = settings.vision_model || "";
+    if ($("#setSearchUrl")) $("#setSearchUrl").value = settings.search_url || "";
+    const hint = $("#settingsHint");
+    if (hint) {
+      hint.textContent = data.llm?.configured
+        ? `Model configured: ${data.llm.model}. Secrets stay in environment variables.`
+        : "No model configured — the local CAD engine is active. Secrets stay in environment variables.";
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function saveSettings() {
+  try {
+    const settings = {
+      provider: $("#setProvider")?.value || "",
+      url: $("#setUrl")?.value || "",
+      model: $("#setModel")?.value || "",
+      vision_model: $("#setVision")?.value || "",
+      search_url: $("#setSearchUrl")?.value || "",
+    };
+    const data = await api("/api/settings", { settings });
+    const hint = $("#settingsHint");
+    if (hint) {
+      hint.textContent = data.llm?.configured
+        ? `Saved. Model: ${data.llm.model}.`
+        : "Saved. No model endpoint is configured yet.";
+    }
+    toast("settings saved");
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 async function runPrompt(textOverride) {
@@ -644,6 +1365,20 @@ async function approveAgent(approve) {
   if (!token) { toast("nothing is waiting for approval", true); return; }
   setLoading(true, approve ? "applying the approved change" : "rejecting the change");
   try {
+    if (CHAT.pending?.token === token && CHAT.conversationId) {
+      const data = await api(approve ? "/api/chat/approve" : "/api/chat/reject", {
+        conversation_id: CHAT.conversationId,
+        token,
+      });
+      CHAT.pending = null;
+      AGENT.pending = null;
+      CHAT.messages = messagesFromRows(data.messages);
+      if (data.snapshot) applyState(data.snapshot);
+      renderChat();
+      renderAgent();
+      toast(approve ? "approved and applied" : "change rejected");
+      return;
+    }
     const state = await api(approve ? "/api/agent/approve" : "/api/agent/reject", { token });
     AGENT.pending = null;
     AGENT.changes = approve
@@ -799,23 +1534,56 @@ async function undoPrompt() {
 function renderChat() {
   const log = $("#chatLog");
   if (!log) return;
-  log.innerHTML = CHAT.messages.map(messageHTML).join("")
-    + (CHAT.typing
-      ? `<div class="msg assistant"><span class="avatar">W</span>
-          <div class="bubble typing"><span></span><span></span><span></span></div></div>`
-      : "");
+  log.innerHTML = CHAT.messages.map((message, index) => messageHTML(message, index)).join("");
   log.scrollTop = log.scrollHeight;
   updateEngineChip();
+  renderChatStatus();
 }
 
-function messageHTML(message) {
-  if (message.role === "user") {
-    return `<div class="msg user"><span class="avatar">Y</span>
-      <div class="bubble">${esc(message.text)}</div></div>`;
+function messageActions(message, index) {
+  if (message.streaming) return "";
+  const actions = [];
+  const text = message.text || message.lead || "";
+  if (text) actions.push(`<button data-copy-msg="${index}" title="Copy message">Copy</button>`);
+  if (message.role === "user" && message.id) {
+    actions.push(`<button data-edit-msg="${index}" title="Edit this message">Edit</button>`);
   }
-  const body = [`<div class="lead ${message.bad ? "bad" : ""}">${esc(message.lead || "")}</div>`];
+  if (message.role === "assistant" && index === CHAT.messages.length - 1) {
+    actions.push(`<button data-regenerate-msg="${index}" title="Regenerate this answer">Regenerate</button>`);
+  }
+  if (message.id) {
+    actions.push(`<button data-delete-msg="${index}" title="Delete message">Delete</button>`);
+  }
+  return actions.length ? `<div class="msg-actions">${actions.join("")}</div>` : "";
+}
+
+function attachmentHTML(urls) {
+  if (!urls || !urls.length) return "";
+  return `<div class="msg-images">${urls.map((url) =>
+    `<img src="${esc(url)}" alt="Attached reference">`).join("")}</div>`;
+}
+
+function messageHTML(message, index = 0) {
+  const actions = messageActions(message, index);
+  if (message.role === "user") {
+    return `<div class="msg user">
+      <span class="avatar">Y</span>
+      <div class="bubble">${attachmentHTML(message.attachments)}
+        <div class="lead user-text">${renderMarkdown(message.text || message.lead || "")}</div>
+        ${actions}</div></div>`;
+  }
+  const body = [];
+  if (message.lead) {
+    body.push(`<div class="lead ${message.bad ? "bad" : ""}">${renderMarkdown(message.lead)}${
+      message.streaming ? '<span class="stream-cursor"></span>' : ""}</div>`);
+  } else if (message.streaming) {
+    body.push(`<div class="typing"><span></span><span></span><span></span></div>`);
+  }
   for (const note of message.notes || []) {
     body.push(`<div class="note">${esc(note)}</div>`);
+  }
+  if (message.status && message.bad) {
+    body.push(`<div class="msg-status bad">${esc(String(message.status).replaceAll("_", " "))}</div>`);
   }
   if (message.patches && message.patches.length) {
     body.push(`<div class="chips">${message.patches.slice(0, 10).map((patch) => {
@@ -835,8 +1603,30 @@ function messageHTML(message) {
   if (message.undoable) {
     body.push(`<button class="undo" data-undo="1">Undo those changes</button>`);
   }
+  if (actions) body.push(actions);
   return `<div class="msg assistant"><span class="avatar">W</span>
     <div class="bubble">${body.join("")}</div></div>`;
+}
+
+function renderChatStatus() {
+  const node = $("#chatStatus");
+  if (!node) return;
+  const running = CHAT.streaming || CHAT.typing;
+  if (running) {
+    node.hidden = false;
+    node.className = "chat-status running";
+    node.innerHTML = `<span class="spinner small"></span>${esc(CHAT.status || "Thinking")}`;
+    return;
+  }
+  if (CHAT.status && AGENT.error) {
+    node.hidden = false;
+    node.className = "chat-status bad";
+    node.textContent = CHAT.status;
+    return;
+  }
+  node.hidden = true;
+  node.className = "chat-status";
+  node.innerHTML = "";
 }
 
 function updateEngineChip() {
@@ -1307,8 +2097,37 @@ function onGlobalClick(event) {
   if (zoom) { zoomBy(zoom.dataset.zoom === "in" ? 0.8 : 1.25); return; }
   const view = event.target.closest("[data-view]");
   if (view) { setView(view.dataset.view); return; }
+  const openConversationButton = event.target.closest("[data-open-conversation]");
+  if (openConversationButton) {
+    openConversation(openConversationButton.dataset.openConversation);
+    return;
+  }
+  const renameConversationButton = event.target.closest("[data-rename-conversation]");
+  if (renameConversationButton) {
+    renameConversation(renameConversationButton.dataset.renameConversation);
+    return;
+  }
+  const deleteConversationButton = event.target.closest("[data-delete-conversation]");
+  if (deleteConversationButton) {
+    deleteConversation(deleteConversationButton.dataset.deleteConversation);
+    return;
+  }
+  const removeAttachment = event.target.closest("[data-remove-attachment]");
+  if (removeAttachment) {
+    CHAT.attachments.splice(Number(removeAttachment.dataset.removeAttachment), 1);
+    renderAttachments();
+    return;
+  }
+  const copyMessageButton = event.target.closest("[data-copy-msg]");
+  if (copyMessageButton) { copyMessage(Number(copyMessageButton.dataset.copyMsg)); return; }
+  const editMessageButton = event.target.closest("[data-edit-msg]");
+  if (editMessageButton) { startEditMessage(Number(editMessageButton.dataset.editMsg)); return; }
+  const regenerateMessageButton = event.target.closest("[data-regenerate-msg]");
+  if (regenerateMessageButton) { regenerateChat(); return; }
+  const deleteMessageButton = event.target.closest("[data-delete-msg]");
+  if (deleteMessageButton) { deleteChatMessage(Number(deleteMessageButton.dataset.deleteMsg)); return; }
   const suggest = event.target.closest("[data-suggest]");
-  if (suggest) { runPrompt(suggest.dataset.suggest); return; }
+  if (suggest) { sendChat(suggest.dataset.suggest); return; }
   const undo = event.target.closest("[data-undo]");
   if (undo) { undoPrompt(); return; }
   const variant = event.target.closest("[data-variant]");

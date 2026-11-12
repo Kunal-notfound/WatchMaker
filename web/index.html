@@ -95,35 +95,60 @@
       <div id="loading" class="loading"><div><div class="spinner"></div>solving geometry</div></div>
     </section>
 
-    <aside class="right" id="rightPanel">
-      <section class="panel copilot">
+    <aside class="right chat-host" id="rightPanel">
+      <section class="panel copilot chat-panel">
         <div class="panel-head">
-          <h2>Design agent</h2>
-          <span id="engineChip" class="engine-chip" title="The rule parser always runs. The optional LLM only chooses validated tools.">local rules</span>
-          <span id="sessionChip" class="session-chip" title="This browser session is isolated from other designs">default</span>
-          <button class="panel-close" data-close="right" title="Close the agent sidebar" aria-label="Close agent sidebar">×</button>
+          <button id="btnChats" class="btn small ghost icon-btn" title="Show conversation history">Chats</button>
+          <h2>Design assistant</h2>
+          <span id="engineChip" class="engine-chip" title="Local rules are always available. A configured model adds conversational reasoning and tool selection.">local rules</span>
+          <span id="sessionChip" class="session-chip" title="This conversation has its own design session">default</span>
+          <button class="panel-close" data-close="right" title="Close the assistant sidebar" aria-label="Close assistant sidebar">×</button>
         </div>
 
-        <div class="agent-controls">
-          <label class="autonomy" title="Suggest only: show changes. Require approval: stage changes. Autonomous: apply verified safe changes.">
-            <span>Autonomy</span>
+        <div id="chatSidebar" class="chat-sidebar" hidden>
+          <div class="chat-sidebar-head">
+            <input id="conversationSearch" type="search" placeholder="Search chats…" aria-label="Search conversations">
+            <button id="btnNewChat" class="btn small" title="Start a new conversation from the current design">New chat</button>
+          </div>
+          <div id="conversationList" class="conversation-list"></div>
+        </div>
+
+        <div class="chat-toolbar">
+          <label class="autonomy" title="Suggest only: show changes. Require approval: stage changes. Safe: apply only verified improvements. Autonomous: apply verified changes.">
+            <span>Mode</span>
             <select id="autonomy">
               <option value="suggest">Suggest only</option>
               <option value="approval">Require approval</option>
-              <option value="safe">Safe changes only</option>
-              <option value="autonomous" selected>Autonomous</option>
+              <option value="safe">Safe changes</option>
+              <option value="autonomous">Autonomous</option>
             </select>
           </label>
-          <button id="btnStop" class="btn small danger" hidden title="Stop the running agent; nothing unverified is committed">Stop</button>
+          <button id="btnStop" class="btn small danger" hidden title="Stop the running assistant; nothing unverified is committed">Stop</button>
           <button id="btnUndo" class="btn small" title="Restore the previous design version">Undo</button>
           <button id="btnRedo" class="btn small" title="Restore the next design version">Redo</button>
           <button id="btnHistory" class="btn small" title="Show design history and memory">History</button>
+          <button id="btnSettings" class="btn small" title="Model and research settings">Settings</button>
         </div>
 
+        <div id="settingsBox" class="settings-box" hidden>
+          <div class="settings-grid">
+            <label>Provider <input id="setProvider" placeholder="openai-compatible"></label>
+            <label>Endpoint <input id="setUrl" placeholder="https://…/v1"></label>
+            <label>Model <input id="setModel" placeholder="gpt-4o-mini"></label>
+            <label>Vision model <input id="setVision" placeholder="optional"></label>
+            <label>Search endpoint <input id="setSearchUrl" placeholder="optional JSON search URL"></label>
+          </div>
+          <div class="settings-foot">
+            <span id="settingsHint">Secrets stay in environment variables.</span>
+            <button class="btn small primary" data-settings-save="1">Save settings</button>
+          </div>
+        </div>
+
+        <div id="chatStatus" class="chat-status" hidden></div>
         <div id="agentStatus" class="agent-status" hidden></div>
         <div id="agentApproval" class="agent-approval" hidden></div>
 
-        <details id="agentTimelineBox" class="agent-box" open>
+        <details id="agentTimelineBox" class="agent-box">
           <summary><span>Execution timeline</span><b id="agentIterations"></b></summary>
           <div id="agentTimeline" class="agent-timeline"></div>
         </details>
@@ -141,12 +166,17 @@
         <div id="agentHistory" class="agent-history" hidden></div>
 
         <div id="chatLog" class="chat-log"></div>
-        <textarea id="prompt" placeholder="Ask the agent to design, explain, critique, repair or compare…"></textarea>
-        <div class="brief-actions">
-          <button id="btnParse" class="btn primary">Run agent</button>
-          <label class="checkline" title="Only works when WATCHCAD_LLM_URL is set; the validated tool layer is always used.">
-            <input type="checkbox" id="useLlm"> LLM planning
-          </label>
+        <div id="attachmentStrip" class="attachment-strip" hidden></div>
+        <div class="composer">
+          <textarea id="prompt" placeholder="Ask anything — design, materials, movements, trade-offs — or ask for a validated change…"></textarea>
+          <div class="composer-actions">
+            <button id="btnAttach" class="btn small ghost" title="Attach a reference photo or sketch">Image</button>
+            <input id="chatImages" type="file" accept="image/*" multiple hidden>
+            <label class="checkline" title="Use the configured language model. Without one, the deterministic local engine still answers CAD requests.">
+              <input type="checkbox" id="useLlm"> Use model
+            </label>
+            <button id="btnParse" class="btn primary">Send</button>
+          </div>
         </div>
         <div id="examples" class="examples"></div>
       </section>

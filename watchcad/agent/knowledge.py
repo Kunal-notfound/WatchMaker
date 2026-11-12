@@ -137,6 +137,28 @@ KNOWLEDGE: list[dict] = [
 ]
 
 
+STATUS_LABELS = {
+    "reference": "published reference data",
+    "standard": "published standard",
+    "estimate": "engineering estimate, not a measurement",
+}
+
+
+def _decorate(entry: dict) -> dict:
+    """Add honest provenance fields without changing the curated table."""
+    out = dict(entry)
+    status = str(entry.get("status") or "estimate")
+    out["status_label"] = STATUS_LABELS.get(status, status)
+    out["provenance"] = {
+        "kind": "curated" if status in ("reference", "standard") else "estimate",
+        "source_url": entry.get("source_url", ""),
+        "retrieved_at": entry.get("retrieved_at", ""),
+        "note": ("Curated by WatchMaker; no live manufacturer datasheet was "
+                 "fetched for this entry."),
+    }
+    return out
+
+
 def _normalise(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
 
@@ -174,7 +196,7 @@ def lookup(query: str, category: str | None = None) -> dict:
     return {
         "query": query,
         "category": category or "",
-        "matches": matches,
+        "matches": [_decorate(entry) for entry in matches],
         "note": ("status=reference/standard values are published; status=estimate "
                  "values are modelling assumptions and must stay labelled that way."),
     }
