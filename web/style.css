@@ -96,17 +96,30 @@ a { color: var(--blue); }
   display: grid;
   grid-template-columns: 408px minmax(0, 1fr) 372px;
   height: calc(100vh - 62px);
-  transition: grid-template-columns .16s ease;
+  /* Same track count in every state so the browser can interpolate the
+     collapsed column down to 0 instead of snapping between layouts. */
+  transition: grid-template-columns .38s cubic-bezier(.22,.61,.36,1);
 }
-.layout.hide-left { grid-template-columns: minmax(0, 1fr) 372px; }
-.layout.hide-right { grid-template-columns: 408px minmax(0, 1fr); }
-.layout.hide-left.hide-right { grid-template-columns: minmax(0, 1fr); }
+.layout.hide-left { grid-template-columns: 0px minmax(0, 1fr) 372px; }
+.layout.hide-right { grid-template-columns: 408px minmax(0, 1fr) 0px; }
+.layout.hide-left.hide-right { grid-template-columns: 0px minmax(0, 1fr) 0px; }
 [hidden] { display: none !important; }
-.left, .right { overflow-y: auto; background: var(--panel); }
+.left, .right { position: relative; overflow: hidden; background: var(--panel); }
 .left { border-right: 1px solid var(--line); }
 .right { border-left: 1px solid var(--line); }
-.left::-webkit-scrollbar, .right::-webkit-scrollbar, .viewport::-webkit-scrollbar { width: 9px; }
-.left::-webkit-scrollbar-thumb, .right::-webkit-scrollbar-thumb { background: #28313d; border-radius: 9px; }
+/* A fixed-width inner sheet is clipped by the shrinking column, which reads as
+   a slide while the viewport expands smoothly. */
+.sidebar-inner {
+  position: absolute; top: 0; bottom: 0;
+  overflow-y: auto; overflow-x: hidden;
+  transition: opacity .22s ease;
+}
+.left .sidebar-inner { right: 0; width: 408px; }
+.right .sidebar-inner { left: 0; width: 372px; }
+.left.panel-collapsed, .right.panel-collapsed { pointer-events: none; }
+.left.panel-collapsed .sidebar-inner, .right.panel-collapsed .sidebar-inner { opacity: 0; }
+.sidebar-inner::-webkit-scrollbar, .viewport::-webkit-scrollbar { width: 9px; }
+.sidebar-inner::-webkit-scrollbar-thumb { background: #28313d; border-radius: 9px; }
 
 .panel { padding: 15px 15px 16px; border-bottom: 1px solid var(--line); }
 .panel-close, .tab-close {
@@ -129,10 +142,17 @@ a { color: var(--blue); }
   letter-spacing: .14em; text-transform: uppercase;
   writing-mode: vertical-rl; border-radius: 0 7px 7px 0;
   box-shadow: 0 6px 20px rgba(0,0,0,.28);
+  cursor: pointer;
+  transition: left .16s ease, right .16s ease, color .15s ease, border-color .15s ease;
 }
 .panel-rail:hover { color: var(--gold-2); border-color: var(--gold); }
 .panel-rail.rail-left { left: 0; transform: translateY(-50%) rotate(180deg); border-radius: 0 7px 7px 0; }
 .panel-rail.rail-right { right: 0; }
+.panel-rail[data-state="open"] { color: var(--ink); border-color: var(--line-2); }
+/* Keep the tab attached to the sidebar while it is open, and at the viewport
+   edge while it is closed. The rail toggles in both directions. */
+.layout:not(.hide-left) ~ .panel-rail.rail-left { left: 408px; }
+.layout:not(.hide-right) ~ .panel-rail.rail-right { right: 372px; }
 .panel h2, .tab-panel h2 {
   margin: 0 0 11px;
   font-size: 10.5px;
@@ -835,10 +855,22 @@ details.group > summary .count { margin-left: auto; font: 10px var(--mono); colo
   body { overflow: auto; }
   .layout,
   .layout.hide-right { grid-template-columns: 340px minmax(0, 1fr); height: auto; }
-  .layout.hide-left { grid-template-columns: minmax(0, 1fr); }
-  .right { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); max-height: none; }
+  .layout.hide-left,
+  .layout.hide-left.hide-right { grid-template-columns: 0px minmax(0, 1fr); }
+  .right {
+    grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line);
+    max-height: 1200px; overflow: hidden;
+    transition: max-height .38s cubic-bezier(.22,.61,.36,1), opacity .22s ease;
+  }
+  .layout.hide-right .right { max-height: 0; opacity: 0; pointer-events: none; }
+  .sidebar-inner {
+    position: static; width: auto; height: auto;
+    overflow: visible;
+  }
   .viewport { min-height: 56vh; }
   .left { max-height: none; }
+  .layout:not(.hide-left) ~ .panel-rail.rail-left { left: 340px; }
+  .layout:not(.hide-right) ~ .panel-rail.rail-right { right: 0; }
 }
 @media (max-width: 760px) {
   .topbar { height: auto; padding: 10px 12px; flex-wrap: wrap; gap: 10px; }
@@ -847,6 +879,8 @@ details.group > summary .count { margin-left: auto; font: 10px var(--mono); colo
   .viewport { height: 58vh; }
   .summary { order: 3; width: 100%; }
   .top-actions { margin-left: auto; }
+  .layout:not(.hide-left) ~ .panel-rail.rail-left { left: 0; }
+  .left.panel-collapsed, .right.panel-collapsed { display: none; }
 }
 
 /* ------------------------------------------------------------ workspaces */
@@ -1013,3 +1047,6 @@ body.webgl3d .viewport::before { opacity: .45; }
 
 .modal[hidden] { display: none; }
 body[data-workspace="optimise"] .viewport::before { opacity: .35; }
+@media (prefers-reduced-motion: reduce) {
+  .layout, .sidebar-inner, .panel-rail { transition: none; }
+}

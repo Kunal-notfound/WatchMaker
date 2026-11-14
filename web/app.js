@@ -2614,8 +2614,19 @@ function setPanelClosed(side, closed) {
   const layout = $("#layout");
   if (!panel || !layout) return;
   const clipped = Boolean(closed);
-  panel.hidden = clipped;
-  if (rail) rail.hidden = !clipped;
+  panel.classList.toggle("panel-collapsed", clipped);
+  panel.setAttribute?.("aria-hidden", String(clipped));
+  if ("inert" in panel) panel.inert = clipped;
+  if (rail) {
+    // The rail stays visible in both states: it opens a closed sidebar and
+    // closes an open one. Its position tracks the panel edge via CSS.
+    rail.hidden = false;
+    rail.dataset.state = clipped ? "closed" : "open";
+    rail.setAttribute?.("aria-expanded", String(!clipped));
+    rail.title = clipped
+      ? `Show ${side === "left" ? "the specs" : "the AI agent"} sidebar`
+      : `Hide ${side === "left" ? "the specs" : "the AI agent"} sidebar`;
+  }
   layout.classList.toggle(`hide-${side}`, clipped);
   try {
     window.localStorage?.setItem(`watchcad.panel.${side}`, clipped ? "closed" : "open");
@@ -2630,7 +2641,9 @@ function restorePanels() {
 }
 
 function onGlobalClick(event) {
-  const workspace = event.target.closest("[data-workspace]");
+  // Scope this to buttons: <body> carries data-workspace, so a bare
+  // [data-workspace] match would hijack every click in the document.
+  const workspace = event.target.closest("button[data-workspace]");
   if (workspace) { setWorkspace(workspace.dataset.workspace); return; }
   const dialSwatch = event.target.closest("[data-dial-color]");
   if (dialSwatch) { setField("dial.color", dialSwatch.dataset.dialColor); return; }
@@ -2641,6 +2654,13 @@ function onGlobalClick(event) {
   if (event.target.closest("[data-close-provider]")) { closeProviders(); return; }
   const clearPart = event.target.closest("[data-part-clear]");
   if (clearPart) { clearPartSelection(); return; }
+  const panelToggle = event.target.closest("[data-panel-toggle]");
+  if (panelToggle) {
+    const side = panelToggle.dataset.panelToggle;
+    const panel = $(side === "left" ? "#leftPanel" : "#rightPanel");
+    if (panel) setPanelClosed(side, !panel.classList.contains("panel-collapsed"));
+    return;
+  }
   const closer = event.target.closest("[data-close]");
   if (closer) { setPanelClosed(closer.dataset.close, true); return; }
   const opener = event.target.closest("[data-open]");

@@ -134,7 +134,7 @@ const source = fs.readFileSync(appPath, "utf8")
     sendChat, newChat, loadConversations, toggleSettings, toggleChatHistory,
     deleteChatMessage, renderAttachments, attachImages,
     saveProvider, removeProvider, currentSession,
-    runOptimisation, applyCandidate,
+    runOptimisation, applyCandidate, onGlobalClick,
     get AGENT() { return AGENT; }, get DESIGN() { return DESIGN; },
     get selected() { return V.selected; },
   };\n`;
@@ -223,23 +223,64 @@ const waitFor = async (fn, label, timeout = 15000) => {
   }
 
   console.log("panels");
-  check(!el("leftPanel").hidden && !el("rightPanel").hidden, "both sidebars start open");
+  const collapsed = (id) => el(id).classList.contains("panel-collapsed");
+  check(!collapsed("leftPanel") && !collapsed("rightPanel"), "both sidebars start open");
   t.setPanelClosed("left", true);
-  check(el("leftPanel").hidden, "left specs panel closes");
-  check(el("railSpecs").hidden === false, "specs reopen rail appears");
+  check(collapsed("leftPanel"), "left specs panel closes");
+  check(el("railSpecs").hidden === false, "specs rail stays visible when closed");
+  check(el("railSpecs").dataset.state === "closed", "specs rail marks the closed state");
   check(el("layout").classList.contains("hide-left"), "layout drops the left column");
   check(stored.get("watchcad.panel.left") === "closed", "left panel state persists");
   t.setPanelClosed("right", true);
-  check(el("rightPanel").hidden, "right copilot panel closes");
-  check(el("railCopilot").hidden === false, "copilot reopen rail appears");
+  check(collapsed("rightPanel"), "right copilot panel closes");
+  check(el("railCopilot").hidden === false, "AI agent rail stays visible when closed");
+  check(el("railCopilot").dataset.state === "closed", "AI agent rail marks the closed state");
   check(el("layout").classList.contains("hide-right"), "layout drops the right column");
   t.restorePanels();
-  check(el("leftPanel").hidden && el("rightPanel").hidden, "closed panels survive a reload");
+  check(collapsed("leftPanel") && collapsed("rightPanel"), "closed panels survive a reload");
   t.setPanelClosed("left", false);
-  check(!el("leftPanel").hidden && el("railSpecs").hidden, "left panel reopens from its rail");
+  check(!collapsed("leftPanel"), "left panel reopens from its rail");
+  check(el("railSpecs").hidden === false && el("railSpecs").dataset.state === "open",
+    "specs rail stays visible when open");
   check(!el("layout").classList.contains("hide-left"), "layout restores the left column");
   t.setPanelClosed("right", false);
-  check(!el("rightPanel").hidden && el("railCopilot").hidden, "right panel reopens from its rail");
+  check(!collapsed("rightPanel"), "right panel reopens from its rail");
+  check(el("railCopilot").hidden === false && el("railCopilot").dataset.state === "open",
+    "AI agent rail stays visible when open");
+
+  // Delegated clicks: <body data-workspace> must not swallow every click.
+  const fakeClick = (matches) => ({
+    target: {
+      dataset: {},
+      closest(selector) {
+        // Emulate the DOM: body is an ancestor matching [data-workspace],
+        // but it is not a button.
+        if (selector === "[data-workspace]") return { dataset: { workspace: "design" } };
+        if (selector === "button[data-workspace]") return null;
+        return matches[selector] || null;
+      },
+    },
+  });
+  const toggle = (side) => fakeClick({
+    "[data-panel-toggle]": { dataset: { panelToggle: side } },
+  });
+  t.onGlobalClick(fakeClick({ "[data-close]": { dataset: { close: "right" } } }));
+  check(collapsed("rightPanel"), "clicking the close button hides the assistant sidebar");
+  check(el("railCopilot").hidden === false, "closing via click leaves the rail available");
+  t.onGlobalClick(toggle("right"));
+  check(!collapsed("rightPanel"), "clicking the AI agent tab reopens the assistant");
+  t.onGlobalClick(toggle("right"));
+  check(collapsed("rightPanel"), "clicking the AI agent tab closes it again");
+  t.onGlobalClick(fakeClick({ "[data-close]": { dataset: { close: "left" } } }));
+  check(collapsed("leftPanel"), "clicking the tab close hides the specs sidebar");
+  t.onGlobalClick(toggle("left"));
+  check(!collapsed("leftPanel"), "clicking the specs tab reopens the specs sidebar");
+  t.onGlobalClick(toggle("left"));
+  check(collapsed("leftPanel"), "clicking the specs tab closes it again");
+  t.onGlobalClick(toggle("left"));
+  t.onGlobalClick(toggle("right"));
+  check(!collapsed("leftPanel") && !collapsed("rightPanel"),
+    "both sidebars reopen for the remaining checks");
 
   console.log("zoom");
   const distance = t.V.dist;

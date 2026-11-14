@@ -33,6 +33,7 @@
 
   <main class="layout" id="layout">
     <aside class="left" id="leftPanel">
+      <div class="sidebar-inner">
       <section class="panel design-panel" id="designPanel">
         <div class="design-head">
           <h2>Design Studio</h2>
@@ -138,6 +139,7 @@
         <div id="packageBody"></div>
       </div>
       </div>
+      </div>
     </aside>
 
     <section class="viewport">
@@ -174,6 +176,7 @@
     </section>
 
     <aside class="right chat-host" id="rightPanel">
+      <div class="sidebar-inner">
       <section class="panel copilot chat-panel">
         <div class="panel-head">
           <button id="btnChats" class="btn small ghost icon-btn" title="Show conversation history">Chats</button>
@@ -259,13 +262,16 @@
         </div>
         <div id="examples" class="examples"></div>
       </section>
+      </div>
     </aside>
   </main>
 
-  <button class="panel-rail rail-left" id="railSpecs" data-open="left" hidden
-    title="Open the specs sidebar" aria-label="Open specs sidebar">Specs</button>
-  <button class="panel-rail rail-right" id="railCopilot" data-open="right" hidden
-    title="Open the copilot sidebar" aria-label="Open copilot sidebar">Copilot</button>
+  <button class="panel-rail rail-left" id="railSpecs" data-panel-toggle="left"
+    title="Hide or show the specs sidebar" aria-label="Toggle specs sidebar"
+    aria-expanded="true">Specs</button>
+  <button class="panel-rail rail-right" id="railCopilot" data-panel-toggle="right"
+    title="Hide or show the AI agent sidebar" aria-label="Toggle AI agent sidebar"
+    aria-expanded="true">AI agent</button>
 
   <div id="providerModal" class="modal" hidden>
     <div class="modal-card provider-card" role="dialog" aria-modal="true" aria-labelledby="providerTitle">

@@ -80,6 +80,9 @@ The generated specs are in [`examples/`](examples/).
   central viewport never moves: every workspace edits the same solved spec and
   the same Three.js preview. Design Studio is the default, visual surface;
   Engineering Studio contains the full CAD tree, checks and package tools.
+  The **Specs** and **AI agent** edge tabs stay docked beside their sidebars
+  and slide them in and out smoothly in both directions: click to hide, click
+  again to show.
 - **Three.js PBR preview.** `/api/model.glb` is a binary glTF export of the
   solved assembly with per-part materials and vertex normals. The browser
   renders it with physically based materials, image-based lighting from a
