@@ -28,6 +28,12 @@ CASE_COLORS = {
     "bronze": "#b08d57", "ceramic": "#2b3037", "carbon": "#3a3f45",
 }
 
+# Mass uses the material actually selected, not an assumed steel case.
+CASE_MATERIALS = {
+    "316L stainless steel": "steel", "titanium": "titanium",
+    "bronze": "bronze", "ceramic": "ceramic", "carbon": "carbon",
+}
+
 DIAL_COLORS = {
     "black": "#14171c", "blue": "#1c3f6e", "green": "#204436", "white": "#e9e6dd",
     "silver": "#c6c8cb", "grey": "#6a7078", "gray": "#6a7078", "salmon": "#c98d72",
@@ -35,7 +41,8 @@ DIAL_COLORS = {
 }
 
 DENSITY = {"steel": 8.0, "brass": 8.5, "gold": 19.3, "jewel": 3.6,
-           "crystal": 3.98, "dial": 2.7, "spring": 7.9, "titanium": 4.5}
+           "crystal": 3.98, "dial": 2.7, "spring": 7.9, "titanium": 4.5,
+           "bronze": 8.8, "ceramic": 3.2, "carbon": 1.6}
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +60,14 @@ def build_parts(spec: Spec) -> list[M.Mesh]:
 
 
 def dial_color(name: str) -> str:
-    low = (name or "").lower()
+    text = (name or "").strip()
+    if text.startswith("#") and len(text) in (7, 4):
+        body = text[1:]
+        if all(c in "0123456789abcdefABCDEF" for c in body):
+            if len(body) == 3:
+                body = "".join(c * 2 for c in body)
+            return f"#{body.lower()}"
+    low = text.lower()
     for key, color in DIAL_COLORS.items():
         if key in low:
             return color
@@ -69,6 +83,7 @@ def case_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
     l2l = float(spec.get("case.lug_to_lug_mm"))
     lug_w = float(spec.get("case.lug_width_mm"))
     color = CASE_COLORS.get(spec.get("case.material"), STEEL)
+    case_material = CASE_MATERIALS.get(spec.get("case.material"), "steel")
     wall = 1.15
     inner = max(8.0, d / 2 - 1.6)
     bezel_h = 1.6
@@ -79,14 +94,14 @@ def case_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
     # mid case: tube from the caseback lip to the bezel
     parts.append(M.tube(d / 2 - 1.6, d / 2, 1.2, max(1.3, bezel_bottom), segments=96))
     mid = parts[-1]
-    mid.name, mid.color, mid.role, mid.material = "case_mid", color, "case", "steel"
+    mid.name, mid.color, mid.role, mid.material = "case_mid", color, "case", case_material
 
     # bezel with an inward lip that traps the crystal
     lip = crystal_r - 0.05
     bezel = M.revolve([(inner, bezel_bottom), (d / 2, bezel_bottom), (d / 2, t),
                        (lip, t), (lip, t - 0.6), (inner + 0.4, bezel_bottom + 0.2)],
                       segments=96, closed=True)
-    bezel.name, bezel.color, bezel.role, bezel.material = "bezel", color, "case", "steel"
+    bezel.name, bezel.color, bezel.role, bezel.material = "bezel", color, "case", case_material
     parts.append(bezel)
 
     # spacer ring between movement and case wall
@@ -101,12 +116,12 @@ def case_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
         back = M.tube(back_r - 2.2, back_r, 0.0, 1.2, segments=96)
         glass = M.disc(back_r - 2.3, 0.6, 1.2, segments=96)
         glass.name, glass.color, glass.role, glass.material = "caseback_glass", "#9fc4d8", "crystal", "crystal"
-        back.name, back.color, back.role, back.material = "caseback", color, "case", "steel"
+        back.name, back.color, back.role, back.material = "caseback", color, "case", case_material
         parts += [back, glass]
     else:
         back = M.revolve([(0.0, 0.0), (back_r, 0.0), (back_r, 0.9),
                           (back_r - 0.5, 1.2), (0.0, 1.2)], segments=96, closed=True)
-        back.name, back.color, back.role, back.material = "caseback", color, "case", "steel"
+        back.name, back.color, back.role, back.material = "caseback", color, "case", case_material
         parts.append(back)
 
     # lugs: two per side, tapering outward
@@ -116,7 +131,7 @@ def case_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
             lug = M.rounded_slab(lug_w / 2.05, ext + 1.5, 2.6, 1.0, segments=6, name="lug")
             lug.rotated_z(90).translated(lx * lug_w / 4.0,
                                          side * (l2l / 2 - (ext + 1.5) / 2), 1.6)
-            lug.color, lug.role, lug.material = color, "case", "steel"
+            lug.color, lug.role, lug.material = color, "case", case_material
             parts.append(lug)
         # spring bar between the lugs
         bar = M.disc(0.45, 0.0, lug_w + 0.4, segments=16)
@@ -135,14 +150,14 @@ def case_parts(spec: Spec, stack: dict) -> list[M.Mesh]:
     parts.append(tube)
     crown = M.disc(crown_r, 0, 2.0, segments=40)
     crown.verts = [(x + d / 2 + 1.1, y, z + crown_z) for x, y, z in rotate_y(crown.verts, 90)]
-    crown.name, crown.color, crown.role, crown.material = "crown", color, "case", "steel"
+    crown.name, crown.color, crown.role, crown.material = "crown", color, "case", case_material
     parts.append(crown)
 
     if "chronograph" in (spec.get("movement.complications") or {}):
         for py in (-4.6, 4.6):
             pusher = M.tube(0.6, 1.1, 0, 2.2, segments=24)
             pusher.verts = [(x + d / 2 + 0.6, y + py, z + crown_z) for x, y, z in rotate_y(pusher.verts, 90)]
-            pusher.name, pusher.color, pusher.role, pusher.material = "pusher", color, "case", "steel"
+            pusher.name, pusher.color, pusher.role, pusher.material = "pusher", color, "case", case_material
             parts.append(pusher)
 
     # crystal

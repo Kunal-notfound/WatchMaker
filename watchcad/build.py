@@ -3,7 +3,7 @@
 One call turns a spec into a complete package directory:
 
     spec.json / spec.md          source of truth and a readable copy
-    model.stl, model.obj, .gltf  assembly meshes
+    model.stl/.obj/.gltf/.glb    assembly meshes (glTF 2.0 with normals)
     parts/<part>.stl             individual parts
     drawings/*.svg .dxf .pdf     front, section, train, notes
     bom.csv / bom.md             bill of materials
@@ -143,6 +143,7 @@ def build(spec: Spec, out_dir: str | None = None, name: str | None = None,
     add(exporters.write_text(os.path.join(root, "model.obj"), M.to_obj(parts)))
     gltf = M.to_gltf(parts, slug)
     add(exporters.write_text(os.path.join(root, "model.gltf"), json.dumps(gltf)))
+    add(exporters.write_bytes(os.path.join(root, "model.glb"), M.to_glb(parts, slug)))
     if per_part:
         part_dir = os.path.join(root, "parts")
         os.makedirs(part_dir, exist_ok=True)

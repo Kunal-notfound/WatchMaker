@@ -41,7 +41,7 @@ python3 -m watchcad export dress.json --format pdf -o out/dress.pdf
 Run the test suite:
 
 ```bash
-python3 -m unittest discover -s tests -v     # 76 tests, ~20 s
+python3 -m unittest discover -s tests -v     # 98 tests, ~30 s
 
 # browser smoke test (Node 18+, no npm packages)
 python3 -m watchcad serve --port 8766 &
@@ -75,6 +75,18 @@ The generated specs are in [`examples/`](examples/).
 
 ### The studio
 
+- **Three workspaces, one specification.** The top bar switches between
+  **Design Studio**, **Engineering Studio** and **Optimisation Lab**. The
+  central viewport never moves: every workspace edits the same solved spec and
+  the same Three.js preview. Design Studio is the default, visual surface;
+  Engineering Studio contains the full CAD tree, checks and package tools.
+- **Three.js PBR preview.** `/api/model.glb` is a binary glTF export of the
+  solved assembly with per-part materials and vertex normals. The browser
+  renders it with physically based materials, image-based lighting from a
+  procedural room environment, a directional shadow and OrbitControls. A local
+  copy of Three.js 0.160 is vendored under `web/vendor/`, so the studio does not
+  depend on a CDN. If WebGL is unavailable the original software canvas stays
+  active as a complete fallback.
 - **Conversational assistant.** The right panel is a chat-first assistant, not a
   one-shot prompt box. Most messages are answered directly: it can explain a
   material, compare movements, research a standard, inspect the current design
@@ -91,9 +103,19 @@ The generated specs are in [`examples/`](examples/).
   it; regenerate the last answer in place. The image button stages up to four
   reference photos for the turn. A vision-capable model may discuss style and
   proportions, but the assistant never invents exact measurements from a photo.
-- **Model settings.** The **Settings** panel stores the provider, endpoint,
-  model, vision model and optional search endpoint in `out/settings.json`.
-  Secrets stay in environment variables and are never returned to the browser.
+- **Model settings and bring-your-own-key.** The **AI provider** dialog offers
+  Gemini, Cloudflare Workers AI, Groq, OpenRouter and a generic
+  OpenAI-compatible endpoint. It tests a real connection, reports streaming,
+  tool, JSON and image capability, and can save, update or remove the key.
+  Endpoint, provider and model are non-secret and persist in
+  `out/settings.json`. The key itself lives only in server process memory,
+  keyed by browser session: it is never written to settings, `localStorage`,
+  logs, frontend bundles or API responses, and a server restart forgets it.
+  Environment keys still work for headless use. An injected `LLM_CONFIG`
+  takes precedence over both, and a session key overrides the environment key
+  for that session. A persisted endpoint without a key does not auto-enable the
+  model toggle, so the deterministic engine stays in charge until a key is
+  added.
 - **Agent controls.** The copilot header also exposes an autonomy selector
   (suggest / approval / safe / autonomous), Stop, Undo, Redo and History. Runs
   stream a tool-by-tool timeline with iteration numbers; the contextual result
@@ -107,16 +129,31 @@ The generated specs are in [`examples/`](examples/).
 - **Number fields.** Numeric values use a plain number input plus black
   up/down steppers. There are no range sliders in the spec editor. Keyboard
   entry, lock buttons, provenance tags and validation all still apply.
-- **Exploded viewer.** Drag to orbit, wheel to zoom deep toward the cursor,
-  shift-drag to pan. **Explode** moves every part along the vertical axis in
-  rigid z-bands over an extended 0–250% range, so the case, dial, hands,
-  bridges and gear train separate without stretching any mesh. Every part is
-  opaque and individually clickable: click a part to highlight it and see its
-  name, group and bounding size; click empty space, the × in the part chip, or
-  press Escape to clear it. **Gears** isolates the movement and complications
-  and opens the gear layers; **Layers** shows a side view of the fully exploded
-  assembly. The overlay reports visible layers and parts. Deep links: `#gears`,
-  `#layers`, `#dial`, `#crown`, `#three`.
+- **Exploded viewer.** Drag to orbit, wheel to zoom, shift-drag to pan. In the
+  Three.js view the same controls drive a real perspective camera; the classic
+  software viewport keeps cursor-anchored zoom and rigid z-band explosion as a
+  no-WebGL fallback. **Explode** separates case, dial, hands, bridges and gear
+  train without stretching meshes. Every part is individually clickable in
+  both renderers: click a part to highlight it and see its name, group and
+  bounding size; click empty space, the × in the part chip, or press Escape to
+  clear it. **Gears** isolates the movement and complications; **Layers** shows
+  the fully exploded stack. Deep links: `#gears`, `#layers`, `#dial`,
+  `#crown`, `#three`.
+- **Design-first controls.** Design Studio exposes the fields that change the
+  look — case material and finish, dial finish and colour, crystal, hands and
+  indices — as direct selects and swatches. Each control posts to `/api/set`,
+  so the mesh, mass, checks and build package are rebuilt from structured data.
+  Reference images can be attached and sent with a design request; the
+  assistant is required to say when the configured model cannot see them.
+  **Generate alternatives** calls the deterministic variant planner; nothing is
+  applied until you choose a card.
+- **Optimisation Lab.** One objective at a time (weight, material cost,
+  manufacturability, tolerance or assembly). The lab evaluates a deterministic
+  field of real spec changes through the solver, mesh builder and verifier.
+  Candidates show mass, estimated cost, part count, DFM failures, stack margin,
+  failing checks and rank. Applying a candidate sends its changes through the
+  same validated variant pipeline; the design is never patched directly by the
+  optimiser.
 
 ---
 
@@ -214,7 +251,7 @@ Layers: `spec`, `geometry`, `kinematics`, `energy`, `tolerance`,
 
 ```text
 spec.json / spec.md          source of truth + readable summary
-model.stl .obj .gltf         assembly meshes
+model.stl .obj .gltf .glb    assembly meshes (glTF 2.0 with normals)
 parts/<part>.stl             one mesh per component (~114 parts by default)
 drawings/front.svg           front view
 drawings/section.svg         case section
@@ -326,6 +363,10 @@ are still stored with the message, and the reply explains the limitation.
 | POST | `/api/conversations/<id>/messages/<mid>/delete` | delete one message |
 | GET | `/api/settings` | non-secret model/research settings and configuration status |
 | POST | `/api/settings` | update the non-secret settings file |
+| GET | `/api/providers` | provider presets, active non-secret config and capability flags |
+| POST | `/api/providers/save` | `{provider, endpoint, model, vision_model, key}` → persist non-secrets, hold the key in session memory |
+| POST | `/api/providers/test` | `{provider, endpoint, model, key?}` → real probe with redacted errors |
+| POST | `/api/providers/remove` | remove the current session key |
 
 `POST /api/chat` with `"stream": true` emits `text/event-stream` events of type
 `start`, `notice`, `status`, `delta`, `timeline`, `error`, `done` and a final
@@ -395,6 +436,7 @@ uses only these endpoints, so scripts can drive the same session:
 | GET | `/api/state` | spec, checks, summary, scene stats, derivation report |
 | GET | `/api/schema` | field registry, groups, complications, presets, ideas |
 | GET | `/api/scene` | per-part vertices/faces for the software renderer |
+| GET | `/api/model.glb` | binary glTF assembly for the Three.js preview |
 | GET | `/api/builds` | last build manifest |
 | POST | `/api/prompt` | `{prompt, use_llm}` → applied patches, questions, state |
 | POST | `/api/set` | `{path, value, force}`; `409` if the path is locked |
@@ -403,6 +445,7 @@ uses only these endpoints, so scripts can drive the same session:
 | POST | `/api/spec` | `{spec}` replace the whole document |
 | POST | `/api/reset` | `{preset?, name?}` |
 | POST | `/api/build` | `{per_part?}` → files and manifest |
+| POST | `/api/optimise` | `{objective, budget}` → ranked deterministic candidates and provenance |
 | GET | `/api/download/file` | `?path=<relative path inside the build>` |
 | GET | `/api/download/zip` | package as one archive |
 
@@ -487,9 +530,38 @@ dropped, and the run says so. With no variables set, no network request is
 attempted and the local CAD engine remains fully usable.
 
 Secrets (`WATCHCAD_LLM_KEY`, `WATCHCAD_SEARCH_KEY`) are read only from the
-environment. The settings JSON and `/api/settings` expose provider, endpoint,
-model, vision model, temperature, token limit, timeout and retry policy, but
-never a key.
+environment, unless a session key is supplied through the AI provider dialog
+and held in process memory. The settings JSON and `/api/settings` expose
+provider, endpoint, model, vision model, temperature, token limit, timeout and
+retry policy, but never a key.
+
+### Bring your own key, safely
+
+The **AI provider** dialog is the session-only alternative to environment
+variables:
+
+| provider | endpoint style | notes |
+|---|---|---|
+| Google Gemini | OpenAI-compatible Gemini endpoint | streaming, tools, JSON, vision |
+| Cloudflare Workers AI | account-scoped OpenAI-compatible endpoint | replace `<ACCOUNT_ID>` |
+| Groq | OpenAI-compatible inference | streaming, tools, JSON |
+| OpenRouter | one key for many model vendors | vision depends on model id |
+| OpenAI-compatible | any `/v1/chat/completions` endpoint | local servers welcome |
+
+**Test connection** issues small real requests for chat, streaming, tools and
+JSON mode; **Save for session** persists only the non-secret provider, endpoint,
+model and optional vision model, and keeps the key in the server process'
+in-memory `ProviderVault` keyed by `X-WatchCAD-Session`. **Remove key** clears
+that session entry. Keys never enter the settings file, `localStorage`, the
+static bundle, logs or any JSON response; error text is redacted. Custom
+endpoints must use `http://` or `https://`, which still permits a local model
+server. Restarting the server forgets all keys. An injected `LLM_CONFIG` (used
+by tests and embedders) still takes precedence over session keys.
+
+Capabilities are reported with their source. Presets state what the provider is
+expected to support; a successful probe replaces those flags with measured
+results. Image support is inferred from the model name or an explicit vision
+model — it is never claimed just because a provider has a vision-capable cousin.
 
 ---
 
@@ -501,9 +573,11 @@ watchcad/
   modules.py     complication registry: height, torque, envelope, conflicts
   gears.py       exact Fraction ratio search; presentation tooth profiles
   solver.py      derivation order, train layout, stack z-levels, torque, mass
-  mesh.py        dependency-free mesh kernel + STL/OBJ/glTF writers
+  mesh.py        dependency-free mesh kernel + STL/OBJ/glTF/GLB writers
   parts.py       every component builder; build_scene()
   verify.py      layered checks, same-plane collision, fixes
+  optimise.py    deterministic candidate field, metrics, ranking, provenance
+  providers.py   BYOK presets, session key vault, capability probes
   drawing.py     SVG, ASCII DXF and hand-written PDF from one canvas
   exporters.py   BOM, assembly, test plan, DFM, docs, manifest
   build.py       orchestration, determinism and cache
@@ -526,11 +600,15 @@ watchcad/
     research.py       curated + optional live research, provenance, SSRF guard
     knowledge.py      materials, components and finishes reference
 web/
-  index.html, style.css, app.js   chat-first studio UI + canvas renderer
+  index.html, style.css, app.js   workspace UI, design controls, chat, fallback canvas
+  viewer3d.js                     Three.js PBR/IBL preview loaded as an ES module
+  vendor/                         vendored Three.js 0.160 modules and addons
 tests/
-  test_watchcad.py               35 engine/API/CLI tests
-  test_agent.py                  22 deterministic agent/API tests
-  test_chat.py                   19 conversational runtime/API tests
+  test_watchcad.py               engine, glTF/GLB, build, export tests
+  test_agent.py                  deterministic agent/API tests
+  test_chat.py                   conversational runtime/API tests
+  test_optimise.py               optimisation determinism, provenance, schema safety
+  test_providers.py              key isolation, redaction, probe and provider API
   ui_smoke.js                    dependency-free browser/API smoke harness
 examples/                         seven verified specs
 ```

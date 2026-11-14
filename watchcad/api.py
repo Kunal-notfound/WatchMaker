@@ -53,6 +53,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import exporters
+from . import mesh as mesh_kernel
+from . import optimise as optimiser
+from . import providers as provider_vault
 from . import settings as app_settings
 from .agent.chat import ConversationRuntime
 from .agent.context import (
@@ -198,10 +201,23 @@ def get_store() -> ConversationStore:
         return STORE
 
 
-def _conversation_config() -> LLMConfig:
+def _provider_security() -> dict:
+    return {
+        "storage": "process memory, per browser session",
+        "persisted": False,
+        "sessions_with_keys": provider_vault.VAULT.count(),
+    }
+
+
+def _conversation_config(session_id: str | None = None) -> LLMConfig:
     if LLM_CONFIG is not None:
         return LLM_CONFIG
     config = LLMConfig.from_env()
+    if session_id:
+        session_key = provider_vault.VAULT.get(session_id)
+        if session_key:
+            # Session-only BYOK key; never persisted or returned.
+            config.key = session_key
     if LLM_CLIENT is not None and not config.available:
         # Injected clients are usable even when no environment endpoint exists.
         return LLMConfig(url="mock://injected", model="scripted",
@@ -439,7 +455,20 @@ class Handler(BaseHTTPRequestHandler):
             self._conversation_get(route)
             return
         if route == "/api/settings":
-            self._json(200, self._settings_payload())
+            self._json(200, self._settings_payload(session.session_id))
+            return
+        if route == "/api/providers":
+            config = _conversation_config(session.session_id)
+            self._json(200, {
+                "providers": provider_vault.catalog(),
+                "settings": app_settings.public_settings(),
+                "active": dict(config.public_dict(),
+                               session_key=provider_vault.VAULT.has(
+                                   session.session_id)),
+                "capabilities": provider_vault.preset_capabilities(
+                    config.provider, config.model),
+                "security": _provider_security(),
+            })
             return
         if route == "/api/state":
             payload = studio.snapshot({"session": session.conversation_payload(),
@@ -456,6 +485,12 @@ class Handler(BaseHTTPRequestHandler):
                            "bounds": studio.scene.get("bounds", {}),
                            "triangles": studio.scene.get("triangles", 0)}
             self._json(200, payload)
+        elif route == "/api/model.glb":
+            with studio.lock:
+                parts = studio.scene.get("parts", [])
+                name = studio.solved.get("meta.name") or "watch"
+                data = mesh_kernel.to_glb(list(parts), str(name))
+            self._send(200, data, "model/gltf-binary")
         elif route == "/api/builds":
             self._json(200, studio.last_build.to_dict() if studio.last_build else {"build": None})
         elif route == "/api/session":
@@ -520,7 +555,64 @@ class Handler(BaseHTTPRequestHandler):
         if route == "/api/settings":
             patch = body.get("settings") if isinstance(body.get("settings"), dict) else body
             app_settings.save_settings(patch)
-            self._json(200, self._settings_payload())
+            self._json(200, self._settings_payload(session.session_id))
+            return
+        if route == "/api/providers/save":
+            provider = str(body.get("provider") or "openai-compatible").strip()
+            preset = provider_vault.PROVIDERS.get(provider) \
+                or provider_vault.PROVIDERS["openai-compatible"]
+            endpoint = str(body.get("endpoint") or preset["url"]).strip()
+            model = str(body.get("model") or preset["model"]).strip()
+            vision = str(body.get("vision_model") or "").strip()
+            if not provider_vault.endpoint_scheme_ok(endpoint):
+                self._error(400, "endpoint must be http:// or https://")
+                return
+            app_settings.save_settings({
+                "provider": provider,
+                "url": endpoint,
+                "model": model,
+                "vision_model": vision,
+            })
+            key = str(body.get("key") or "").strip()
+            if key:
+                provider_vault.VAULT.set(session.session_id, key)
+            payload = self._settings_payload(session.session_id)
+            payload["providers"] = provider_vault.catalog()
+            payload["active"] = dict(
+                _conversation_config(session.session_id).public_dict(),
+                session_key=provider_vault.VAULT.has(session.session_id))
+            payload["capabilities"] = provider_vault.preset_capabilities(
+                provider, model)
+            payload["security"] = _provider_security()
+            self._json(200, payload)
+            return
+        if route == "/api/providers/remove":
+            provider_vault.VAULT.clear(session.session_id)
+            payload = self._settings_payload(session.session_id)
+            payload["active"] = dict(
+                _conversation_config(session.session_id).public_dict(),
+                session_key=False)
+            payload["capabilities"] = provider_vault.preset_capabilities(
+                _conversation_config(session.session_id).provider,
+                _conversation_config(session.session_id).model)
+            payload["security"] = _provider_security()
+            self._json(200, payload)
+            return
+        if route == "/api/providers/test":
+            result = provider_vault.probe(body, session.session_id)
+            self._json(200, result)
+            return
+        if route == "/api/optimise":
+            try:
+                budget = int(body.get("budget") or 9)
+            except (TypeError, ValueError):
+                budget = 9
+            with studio.lock:
+                result = optimiser.run(
+                    studio.solved,
+                    str(body.get("objective") or "weight"),
+                    budget)
+            self._json(200, result)
             return
 
         if route == "/api/prompt":
@@ -660,7 +752,8 @@ class Handler(BaseHTTPRequestHandler):
                    "intent": detect_intent(prompt).name})
         try:
             orchestrator = AgentOrchestrator(
-                session, build_root=str(BUILD_ROOT))
+                session, build_root=str(BUILD_ROOT),
+                llm_config=_conversation_config(session.session_id))
             result = orchestrator.run(
                 prompt, mode=mode,
                 use_llm=body.get("use_llm") if "use_llm" in body else None,
@@ -772,11 +865,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, payload)
 
     # -- conversations ---------------------------------------------------
-    def _settings_payload(self) -> dict:
-        config = _conversation_config()
+    def _settings_payload(self, session_id: str | None = None) -> dict:
+        config = _conversation_config(session_id)
         return {
             "settings": app_settings.public_settings(),
             "llm": config.public_dict(),
+            "session_key": provider_vault.VAULT.has(session_id) if session_id else False,
             "research": {"configured": bool(config.search_url),
                          "provider": config.search_provider},
             "database": str(get_store().path),
@@ -854,7 +948,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             runtime = ConversationRuntime(
                 session, get_store(), conversation_id,
-                llm_client=LLM_CLIENT, llm_config=_conversation_config(),
+                llm_client=LLM_CLIENT,
+                llm_config=_conversation_config(session.session_id),
                 build_root=str(BUILD_ROOT))
             result = runtime.run(
                 message, images=[str(item) for item in images],

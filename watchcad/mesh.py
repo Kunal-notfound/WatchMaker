@@ -325,6 +325,33 @@ def _normal(a, b, c):
     return nx / ln, ny / ln, nz / ln
 
 
+def vertex_normals(m: Mesh) -> list[Vec]:
+    """Area-weighted smooth normals, indexed like ``m.verts``.
+
+    glTF consumers need a normal attribute for physically based materials.
+    The kernel keeps geometry indexed, so averaging adjacent face normals is
+    deterministic and preserves the original triangle indices.
+    """
+    acc = [[0.0, 0.0, 0.0] for _ in m.verts]
+    for a, b, c in m.faces:
+        ux, uy, uz = (m.verts[b][0] - m.verts[a][0],
+                      m.verts[b][1] - m.verts[a][1],
+                      m.verts[b][2] - m.verts[a][2])
+        vx, vy, vz = (m.verts[c][0] - m.verts[a][0],
+                      m.verts[c][1] - m.verts[a][1],
+                      m.verts[c][2] - m.verts[a][2])
+        nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        for index in (a, b, c):
+            acc[index][0] += nx
+            acc[index][1] += ny
+            acc[index][2] += nz
+    out: list[Vec] = []
+    for nx, ny, nz in acc:
+        length = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+        out.append((nx / length, ny / length, nz / length))
+    return out
+
+
 def to_obj(meshes: list[Mesh]) -> str:
     lines = ["# watchcad assembly"]
     offset = 1
@@ -358,9 +385,13 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
     for m in meshes:
         pos = [c for v in m.verts for c in v]
         pos_bytes = struct.pack(f"<{len(pos)}f", *pos)
+        normals = vertex_normals(m)
+        nrm = [c for v in normals for c in v]
+        nrm_bytes = struct.pack(f"<{len(nrm)}f", *nrm)
         idx = [i for f in m.faces for i in f]
         idx_bytes = struct.pack(f"<{len(idx)}I", *idx)
         pv = add_view(pos_bytes, 34962)
+        nv = add_view(nrm_bytes, 34962)
         iv = add_view(idx_bytes, 34963)
 
         xs, ys, zs = m.verts and ([v[0] for v in m.verts], [v[1] for v in m.verts], [v[2] for v in m.verts]) or ([0], [0], [0])
@@ -368,22 +399,34 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
                           "type": "VEC3", "min": [min(xs), min(ys), min(zs)],
                           "max": [max(xs), max(ys), max(zs)]})
         pos_acc = len(accessors) - 1
+        accessors.append({"bufferView": nv, "componentType": 5126,
+                          "count": len(normals), "type": "VEC3"})
+        nrm_acc = len(accessors) - 1
         accessors.append({"bufferView": iv, "componentType": 5125,
                           "count": len(idx), "type": "SCALAR"})
         idx_acc = len(accessors) - 1
         rgb = _hex_rgb(m.color)
-        materials.append({
+        material = {
             "name": m.name,
             "pbrMetallicRoughness": {
                 "baseColorFactor": [*rgb, 1.0],
                 "metallicFactor": 0.15 if m.role in ("dial", "crystal") else 0.85,
                 "roughnessFactor": 0.6 if m.role == "dial" else 0.3,
             },
-        })
+            "extras": {"role": m.role, "watch_material": m.material},
+        }
+        if m.role == "crystal":
+            material["alphaMode"] = "BLEND"
+            material["doubleSided"] = True
+            material["pbrMetallicRoughness"]["baseColorFactor"] = [*rgb, 0.42]
+            material["pbrMetallicRoughness"]["roughnessFactor"] = 0.08
+        materials.append(material)
         gl_meshes.append({"name": m.name, "primitives": [{
-            "attributes": {"POSITION": pos_acc}, "indices": idx_acc,
+            "attributes": {"POSITION": pos_acc, "NORMAL": nrm_acc},
+            "indices": idx_acc,
             "material": len(materials) - 1}]})
-        nodes.append({"mesh": len(gl_meshes) - 1, "name": m.name})
+        nodes.append({"mesh": len(gl_meshes) - 1, "name": m.name,
+                      "extras": {"role": m.role, "watch_material": m.material}})
 
     buf = b"".join(chunks)
     return {
@@ -400,8 +443,35 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
     }
 
 
+def to_glb(meshes: list[Mesh], name: str = "watch") -> bytes:
+    """Binary glTF 2.0 (GLB) with the same nodes and materials as ``to_gltf``.
+
+    The JSON chunk is padded with spaces and the BIN chunk with zeroes to the
+    4-byte boundaries required by the GLB container.  The output is
+    deterministic for a given solved scene, so it can be checksummed alongside
+    the other build artefacts.
+    """
+    gltf = to_gltf(meshes, name)
+    uri = gltf["buffers"][0].pop("uri", "")
+    payload = base64.b64decode(uri.split(",", 1)[1]) if "," in uri else b""
+    json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    json_bytes += b" " * ((-len(json_bytes)) % 4)
+    payload += b"\0" * ((-len(payload)) % 4)
+    total = 12 + 8 + len(json_bytes) + 8 + len(payload)
+    header = struct.pack("<III", 0x46546C67, 2, total)
+    json_chunk = struct.pack("<II", len(json_bytes), 0x4E4F534A) + json_bytes
+    bin_chunk = struct.pack("<II", len(payload), 0x004E4942) + payload
+    return header + json_chunk + bin_chunk
+
+
 def _hex_rgb(color: str) -> list[float]:
+    """Convert an sRGB hex colour to the linear values glTF requires."""
     color = color.lstrip("#")
     if len(color) != 6:
         return [0.7, 0.7, 0.7]
-    return [int(color[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]
+    return [_srgb_to_linear(int(color[i:i + 2], 16) / 255.0)
+            for i in (0, 2, 4)]
+
+
+def _srgb_to_linear(value: float) -> float:
+    return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4

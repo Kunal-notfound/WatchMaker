@@ -22,7 +22,7 @@ from watchcad.build import build
 from watchcad.drawing import drawing_set, to_dxf, to_svg, write_pdf
 from watchcad.modules import compose
 from watchcad.nlp import ideas, parse
-from watchcad.parts import build_scene
+from watchcad.parts import build_scene, dial_color
 from watchcad.schema import Spec, new_spec
 from watchcad.solver import solve
 from watchcad.verify import check, summary, verify
@@ -142,6 +142,43 @@ class MeshTests(unittest.TestCase):
         gltf = M.to_gltf([part], "test")
         self.assertEqual(gltf["asset"]["version"], "2.0")
         self.assertGreater(len(gltf["meshes"]), 0)
+        attributes = gltf["meshes"][0]["primitives"][0]["attributes"]
+        self.assertIn("NORMAL", attributes)
+        self.assertEqual(len(M.vertex_normals(part)), len(part.verts))
+
+    def test_gltf_colours_are_linear(self):
+        part = M.disc(5, 0, 2, segments=8)
+        part.color = "#808080"
+        rgb = M.to_gltf([part], "test")["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"][:3]
+        for channel in rgb:
+            self.assertAlmostEqual(channel, 0.21586, places=4)
+
+    def test_glb_container_is_deterministic_and_has_normals(self):
+        import base64
+        import struct
+        part = M.disc(5, 0, 2, segments=24)
+        first = M.to_glb([part], "test")
+        second = M.to_glb([part], "test")
+        self.assertEqual(first, second)
+        magic, version, total = struct.unpack("<III", first[:12])
+        self.assertEqual(magic, 0x46546C67)
+        self.assertEqual(version, 2)
+        self.assertEqual(total, len(first))
+
+        json_len, json_type = struct.unpack("<II", first[12:20])
+        self.assertEqual(json_type, 0x4E4F534A)
+        document = json.loads(first[20:20 + json_len])
+        self.assertNotIn("uri", document["buffers"][0])
+        for mesh in document["meshes"]:
+            self.assertIn("NORMAL", mesh["primitives"][0]["attributes"])
+
+        offset = 20 + json_len
+        bin_len, bin_type = struct.unpack("<II", first[offset:offset + 8])
+        self.assertEqual(bin_type, 0x004E4942)
+        self.assertEqual(bin_len, document["buffers"][0]["byteLength"])
+        self.assertEqual(offset + 8 + bin_len, len(first))
+        self.assertGreater(len(base64.b64decode(
+            M.to_gltf([part], "test")["buffers"][0]["uri"].split(",", 1)[1])), 0)
 
 
 class SolverTests(unittest.TestCase):
@@ -208,6 +245,16 @@ class PartsTests(unittest.TestCase):
         self.assertGreater(len(centres), 4)
         self.assertIn("Movement", scene["tree"])
         self.assertIn("Dial", scene["tree"])
+
+    def test_custom_dial_hex_is_normalised(self):
+        self.assertEqual(dial_color("#A1b2C3"), "#a1b2c3")
+        self.assertEqual(dial_color("#abc"), "#aabbcc")
+        self.assertEqual(dial_color("sunburst blue"), "#1c3f6e")
+        spec = solved()
+        spec.set("dial.color", "#3366cc")
+        dial = [part for part in build_scene(spec)["parts"] if part.role == "dial"]
+        self.assertTrue(dial)
+        self.assertEqual(dial[0].color, "#3366cc")
 
 
 class VerifyTests(unittest.TestCase):
@@ -291,6 +338,7 @@ class BuildTests(unittest.TestCase):
             result = build(spec, out_dir=tmp, per_part=True)
             files = {os.path.relpath(path, tmp) for path in result.files}
             for required in ("spec.json", "model.stl", "model.obj", "model.gltf",
+                             "model.glb",
                              "drawings/front.svg", "drawings/section.svg",
                              "drawings/train.svg", "drawings/notes.svg",
                              "drawings/watch_sheet.dxf", "drawings/watch_drawings.pdf",

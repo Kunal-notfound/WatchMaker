@@ -37,6 +37,21 @@ const AGENT = {
   history: null,
   error: null,
 };
+const DESIGN = {
+  providers: [],
+  provider: null,
+  optimisation: null,
+  optimiseToken: 0,
+  optimiseBusy: false,
+  capabilities: {},
+  capabilityKey: "",
+  providerKey: false,
+};
+const DIAL_SWATCHES = [
+  ["black", "#14171c"], ["blue", "#1c3f6e"], ["green", "#204436"],
+  ["white", "#e9e6dd"], ["silver", "#c6c8cb"], ["salmon", "#c98d72"],
+  ["burgundy", "#5a1f2a"], ["champagne", "#d8c49a"],
+];
 const AGENT_MODES = ["suggest", "approval", "safe", "autonomous"];
 let activeTab = "spec";
 let checkFilter = "all";
@@ -229,6 +244,23 @@ async function boot() {
   $("#btnChats").addEventListener("click", toggleChatHistory);
   $("#btnNewChat").addEventListener("click", newChat);
   $("#btnSettings").addEventListener("click", toggleSettings);
+  $("#btnProviders").addEventListener("click", openProviders);
+  $("#btnProviderSettings").addEventListener("click", openProviders);
+  $("#btnProviderTest").addEventListener("click", testProvider);
+  $("#btnProviderSave").addEventListener("click", saveProvider);
+  $("#btnProviderRemove").addEventListener("click", removeProvider);
+  $("#providerModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeProviders();
+  });
+  $("#btnVariations").addEventListener("click", generateVariations);
+  $("#btnDesignPrompt").addEventListener("click", describeFromReference);
+  $("#btnDesignRef").addEventListener("click", () => $("#designReference").click());
+  $("#designReference").addEventListener("change", (event) => {
+    attachImages(event);
+    renderDesignReferences();
+  });
+  $("#designPanel").addEventListener("change", onDesignChange);
+  $("#btnOptimise").addEventListener("click", runOptimisation);
   $("#btnAttach").addEventListener("click", () => $("#chatImages").click());
   $("#chatImages").addEventListener("change", attachImages);
   $("#conversationSearch").addEventListener("input", (event) => {
@@ -255,6 +287,12 @@ async function boot() {
   document.addEventListener("click", onGlobalClick);
   setupViewer();
   restorePanels();
+  bindViewerBridge();
+  try {
+    setWorkspace(window.localStorage?.getItem("watchcad.workspace") || "design");
+  } catch {
+    setWorkspace("design");
+  }
   try {
     const savedMode = window.localStorage?.getItem("watchcad.autonomy");
     if (AGENT_MODES.includes(savedMode)) $("#autonomy").value = savedMode;
@@ -284,6 +322,8 @@ function renderAll() {
   renderPackage();
   renderChat();
   renderAgent();
+  renderDesignPanel();
+  renderOptimisation();
 }
 
 function applyState(state, options = {}) {
@@ -299,8 +339,497 @@ function applyState(state, options = {}) {
   renderPackage();
   if (options.spec === false) syncFormValues();
   else renderSpec();
+  renderDesignPanel();
+  renderOptimisation();
   if (options.scene !== false && checksum !== previous) scheduleScene();
   renderSessionChip();
+}
+
+/* ---------------------------------------------------------- workspaces */
+function setWorkspace(name) {
+  const next = ["design", "engineering", "optimise"].includes(name) ? name : "design";
+  if (document.body?.dataset) document.body.dataset.workspace = next;
+  $$("#workspaces button").forEach((button) =>
+    button.classList.toggle("active", button.dataset.workspace === next));
+  try { window.localStorage?.setItem("watchcad.workspace", next); } catch { /* ignore */ }
+  if (next === "design") renderDesignPanel();
+  if (next === "optimise") renderOptimisation();
+  ensureViewerSize();
+  requestRender();
+}
+
+/* --------------------------------------------------------- design studio */
+function designField(path) {
+  const [group, name] = String(path).split(".");
+  return (SCHEMA?.groups?.[group] || []).find((field) => field.name === name);
+}
+
+function fillDesignSelect(select, path, value) {
+  if (!select) return;
+  const field = designField(path);
+  const choices = field?.choices || [];
+  if (!choices.length) return;
+  const markup = choices.map((choice) =>
+    `<option value="${esc(choice)}">${esc(choice)}</option>`).join("");
+  if (select.innerHTML !== markup) select.innerHTML = markup;
+  const current = String(value ?? "");
+  if (choices.includes(current)) select.value = current;
+  else if (!select.value) select.value = choices[0];
+}
+
+function renderDesignPanel() {
+  if (!STATE || !SCHEMA) return;
+  const spec = STATE.spec.data;
+  for (const select of $$("#designPanel [data-design-path]")) {
+    fillDesignSelect(select, select.dataset.designPath, getPath(spec, select.dataset.designPath));
+  }
+  renderDesignSwatches();
+  renderDesignReferences();
+  renderDesignVariations();
+}
+
+function renderDesignSwatches() {
+  const holder = $("#designSwatches");
+  if (!holder) return;
+  const current = String(STATE?.spec?.data?.dial?.color || "").toLowerCase();
+  holder.innerHTML = DIAL_SWATCHES.map(([name, hex]) =>
+    `<button type="button" data-dial-color="${esc(name)}" title="${esc(name)}"
+      class="${current === name ? "active" : ""}" style="background:${esc(hex)}"></button>`).join("");
+  const input = $("#designDialColor");
+  if (!input) return;
+  const swatch = DIAL_SWATCHES.find(([name]) => name === current);
+  if (swatch) input.value = swatch[1];
+  else if (/^#[0-9a-f]{6}$/i.test(current)) input.value = current;
+}
+
+function renderDesignReferences() {
+  const strip = $("#designRefStrip");
+  if (!strip) return;
+  const images = CHAT.attachments || [];
+  strip.hidden = !images.length;
+  strip.innerHTML = images.map((url, index) => `<figure class="attachment">
+    <img src="${esc(url)}" alt="Reference image ${index + 1}">
+    <button data-remove-attachment="${index}" title="Remove reference">×</button>
+  </figure>`).join("");
+}
+
+function renderDesignVariations() {
+  const holder = $("#designVariations");
+  if (!holder) return;
+  const variants = AGENT.variants || [];
+  holder.innerHTML = variants.map((variant, index) => {
+    const after = variant.verification || {};
+    const palette = (variant.visual?.palette || []).map((hex) =>
+      `<i style="background:${esc(hex)}"></i>`).join("");
+    return `<div class="variant">
+      <div class="variant-head"><b>${esc(variant.label || `Alternative ${index + 1}`)}</b>
+        <button class="btn small" data-variant="${index}">Apply</button></div>
+      <p>${esc(variant.rationale || "")}</p>
+      ${palette ? `<div class="swatch-line">${palette}</div>` : ""}
+      <div class="variant-meta">${Number(after.fail || 0)} failing · checksum ${esc(String(variant.checksum || "").slice(0, 8))}</div>
+    </div>`;
+  }).join("");
+}
+
+function onDesignChange(event) {
+  const target = event.target;
+  if (!target) return;
+  if (target.id === "designDialColor") {
+    setField("dial.color", target.value);
+    return;
+  }
+  const select = target.closest?.("[data-design-path]");
+  if (select) setField(select.dataset.designPath, select.value);
+}
+
+function describeFromReference() {
+  if (!CHAT.attachments.length) {
+    toast("attach a reference image first", true);
+    $("#designReference").click();
+    return;
+  }
+  sendChat([
+    "Use the attached reference image as visual guidance for this design.",
+    "Keep every dimension and feasibility claim owned by the solver, and list",
+    "which visible details (case shape, dial layout, colours, indices, hands)",
+    "you actually used. If the configured model cannot see images, say so",
+    "instead of guessing.",
+  ].join(" "));
+}
+
+async function generateVariations() {
+  if (!STATE) return;
+  setLoading(true, "generating deterministic alternatives");
+  try {
+    const data = await api("/api/agent/variants");
+    AGENT.variants = data.variants || [];
+    renderDesignVariations();
+    renderAgentVariants();
+    toast(AGENT.variants.length
+      ? `${AGENT.variants.length} alternatives ready; review before applying`
+      : "no alternative changes were available for this design");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+/* ------------------------------------------------------ optimisation lab */
+function metric(value, digits = 2) {
+  if (value === null || value === undefined || value === "") return "—";
+  return typeof value === "number" ? fmt(value, digits) : String(value);
+}
+
+function renderOptimisation() {
+  const holder = $("#candidateList");
+  const status = $("#optimiseStatus");
+  if (!holder || !status) return;
+  const result = DESIGN.optimisation;
+  const current = STATE?.spec?.data?.derived?.checksum || "";
+  if (!result) {
+    holder.innerHTML = "";
+    if (!DESIGN.optimiseBusy) {
+      status.textContent = "Not run yet. The current design is the baseline.";
+    }
+    return;
+  }
+  const stale = Boolean(result.baseline_checksum && current
+    && result.baseline_checksum !== current);
+  const candidates = result.candidates || [];
+  const winner = candidates.find((item) => item.id === result.winner);
+  status.innerHTML = `${stale
+    ? "<b>Design changed since this run.</b> Rerun to compare against the current spec. "
+    : ""}${candidates.length} candidates · objective <b>${esc(result.objective)}</b> · winner <b>${esc(winner?.label || "none")}</b>`
+    + `<br><span class="provenance">calculated geometry · estimated cost · no physical verification</span>`;
+  holder.innerHTML = candidates.map((candidate) => {
+    const m = candidate.metrics || {};
+    const isWinner = candidate.id === result.winner;
+    const disabled = stale || !candidate.changes?.length || candidate.status !== "ok";
+    return `<article class="candidate ${isWinner ? "winner" : ""} ${candidate.status !== "ok" ? "failed" : ""}">
+      <div class="candidate-head">
+        <b>${esc(candidate.label || candidate.id)}</b>
+        <span class="candidate-rank">#${esc(candidate.rank ?? "—")}${isWinner ? " · best" : ""}</span>
+      </div>
+      <p>${esc(candidate.rationale || "")}</p>
+      <div class="candidate-metrics">
+        <span>mass <b>${metric(m.mass_g)} g</b></span>
+        <span>unit cost <b>$${metric(m.estimated_unit_cost_usd)}</b></span>
+        <span>material <b>$${metric(m.material_cost_usd)}</b></span>
+        <span>parts <b>${metric(m.part_count, 0)}</b></span>
+        <span>DFM fails <b>${metric(m.dfm_failures, 0)}</b></span>
+        <span>stack margin <b>${metric(m.stack_margin_mm)} mm</b></span>
+        <span>checks fail <b>${metric(m.failing_checks, 0)}</b></span>
+        <span>needs test <b>${metric(m.needs_test, 0)}</b></span>
+      </div>
+      <div class="candidate-foot">
+        <span class="provenance ${candidate.status !== "ok" ? "failed" : candidate.measurable ? "calculated" : "estimated"}">${candidate.status !== "ok"
+          ? "solver failed"
+          : candidate.measurable ? "change measured" : "visual change only"}</span>
+        <button class="btn small" data-apply-candidate="${esc(candidate.id)}"
+          ${disabled ? "disabled" : ""} title="${stale ? "Rerun after the design changed" : "Apply through solver + verifier"}">Apply</button>
+      </div>
+      ${candidate.error ? `<p class="provenance failed">${esc(candidate.error)}</p>` : ""}
+    </article>`;
+  }).join("");
+}
+
+async function runOptimisation() {
+  if (DESIGN.optimiseBusy) return;
+  const objective = $("#optimiseObjective")?.value || "weight";
+  const budget = Number($("#optimiseBudget")?.value || 9);
+  const token = ++DESIGN.optimiseToken;
+  DESIGN.optimiseBusy = true;
+  const status = $("#optimiseStatus");
+  if (status) status.textContent = `Solving and verifying ${budget} candidates…`;
+  setLoading(true, "solving optimisation candidates");
+  try {
+    const result = await api("/api/optimise", { objective, budget });
+    if (token !== DESIGN.optimiseToken) return;
+    DESIGN.optimisation = result;
+    renderOptimisation();
+    const winner = (result.candidates || []).find((item) => item.id === result.winner);
+    toast(winner ? `best candidate: ${winner.label}` : "optimisation returned no candidates");
+  } catch (error) {
+    if (status) status.textContent = `Optimisation failed: ${error.message}`;
+    toast(error.message, true);
+  } finally {
+    DESIGN.optimiseBusy = false;
+    setLoading(false);
+  }
+}
+
+async function applyCandidate(id) {
+  const result = DESIGN.optimisation;
+  const candidate = (result?.candidates || []).find((item) => item.id === id);
+  if (!candidate) { toast("that candidate is no longer available", true); return; }
+  const current = STATE?.spec?.data?.derived?.checksum || "";
+  if (result.baseline_checksum && current && result.baseline_checksum !== current) {
+    toast("the design changed; rerun optimisation before applying", true);
+    return;
+  }
+  const changes = (candidate.changes || []).map((change) => ({
+    path: change.path, to: change.value, from: change.from,
+  }));
+  if (!changes.length) { toast("this candidate has no changes", true); return; }
+  setLoading(true, `applying ${candidate.label}`);
+  try {
+    const payload = await api("/api/agent/variant", {
+      variant: { label: candidate.label, rationale: candidate.rationale, changes },
+      mode: "safe",
+    });
+    applyAgentResult(payload);
+    CHAT.messages.push(assistantFromAgent(payload));
+    renderChat();
+    const failed = Number(payload.verification?.fail ?? payload.summary?.fail ?? 0);
+    toast(failed
+      ? `applied with ${failed} failing check(s); inspect Engineering Studio`
+      : `applied ${candidate.label} through the validated pipeline`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+/* ------------------------------------------------------- AI providers */
+function providerById(id) {
+  return (DESIGN.providers || []).find((item) => item.id === id) || null;
+}
+
+function providerModal() {
+  return $("#providerModal");
+}
+
+async function openProviders() {
+  const modal = providerModal();
+  if (modal) modal.hidden = false;
+  const status = $("#providerStatus");
+  if (status) {
+    status.className = "provider-status";
+    status.textContent = "Loading provider catalogue…";
+  }
+  try {
+    const data = await api("/api/providers");
+    DESIGN.providers = data.providers || [];
+    const active = data.active || {};
+    DESIGN.providerKey = Boolean(active.session_key);
+    const provider = active.provider || data.settings?.provider || "openai-compatible";
+    selectProvider(provider, {
+      endpoint: data.settings?.url || active.url || "",
+      model: data.settings?.model || active.model || "",
+      vision: data.settings?.vision_model ?? active.vision_model ?? "",
+      keepStatus: false,
+    });
+    renderProviderSecurity(data.security);
+  } catch (error) {
+    if (status) {
+      status.className = "provider-status bad";
+      status.textContent = `Could not load providers: ${error.message}`;
+    }
+  }
+}
+
+function closeProviders() {
+  const modal = providerModal();
+  if (modal) modal.hidden = true;
+  const keyInput = $("#providerKey");
+  if (keyInput) keyInput.value = "";
+}
+
+function renderProviderSecurity(security) {
+  DESIGN.security = security || null;
+  const hint = $("#settingsHint");
+  if (!hint) return;
+  hint.textContent = security?.persisted === false
+    ? "Keys stay in server memory for this browser session and are never persisted."
+    : "Endpoints and models are non-secret. Use AI provider for session keys.";
+}
+
+function renderProviderChoices() {
+  const holder = $("#providerChoices");
+  if (!holder) return;
+  holder.innerHTML = (DESIGN.providers || []).map((provider) => {
+    const active = provider.id === DESIGN.provider;
+    const keyed = active && DESIGN.providerKey;
+    return `<button type="button" class="provider-choice ${active ? "active" : ""}"
+      data-provider="${esc(provider.id)}">
+      <b>${esc(provider.name || provider.id)}</b>
+      <span>${esc(provider.model || "")}</span>
+      ${keyed ? '<span class="keyed">key held for this session</span>' : ""}
+    </button>`;
+  }).join("");
+}
+
+function providerDatalist(provider) {
+  const list = $("#providerModels");
+  if (!list) return;
+  list.innerHTML = (provider?.models || []).map((model) =>
+    `<option value="${esc(model)}"></option>`).join("");
+}
+
+function selectProvider(id, options = {}) {
+  const provider = providerById(id) || providerById("openai-compatible") || {
+    id, name: id, url: "", model: "", vision_model: "", models: [], capabilities: {},
+  };
+  DESIGN.provider = provider.id;
+  DESIGN.capabilityKey = "";
+  renderProviderChoices();
+  providerDatalist(provider);
+  const endpoint = $("#providerEndpoint");
+  const model = $("#providerModel");
+  const vision = $("#providerVision");
+  if (endpoint) endpoint.value = options.endpoint || provider.url || "";
+  if (model) model.value = options.model || provider.model || "";
+  if (vision) vision.value = options.vision ?? provider.vision_model ?? "";
+  renderProviderCaps(provider.capabilities);
+  if (!options.keepStatus) {
+    const status = $("#providerStatus");
+    if (status) {
+      status.className = "provider-status";
+      status.textContent = provider.note || "Enter a key to test this provider.";
+    }
+  }
+}
+
+function renderProviderCaps(caps) {
+  const holder = $("#providerCaps");
+  if (!holder) return;
+  const names = ["streaming", "tools", "json", "images"];
+  holder.innerHTML = names.map((name) => {
+    const entry = (caps || {})[name];
+    const on = typeof entry === "object" && entry !== null
+      ? Boolean(entry.supported) : Boolean(entry);
+    const detail = typeof entry === "object" && entry !== null
+      ? (entry.source || "") : "";
+    return `<span class="cap ${on ? "on" : ""}" title="${esc(detail)}">${name}</span>`;
+  }).join("");
+}
+
+function providerPayload() {
+  const keyInput = $("#providerKey");
+  return {
+    provider: DESIGN.provider || "openai-compatible",
+    endpoint: $("#providerEndpoint")?.value?.trim() || "",
+    model: $("#providerModel")?.value?.trim() || "",
+    vision_model: $("#providerVision")?.value?.trim() || "",
+    key: keyInput?.value?.trim() || "",
+  };
+}
+
+function setProviderStatus(text, tone = "") {
+  const status = $("#providerStatus");
+  if (!status) return;
+  status.className = `provider-status ${tone}`.trim();
+  status.textContent = text;
+}
+
+function applyProviderPayload(data) {
+  if (data.providers) DESIGN.providers = data.providers;
+  const active = data.active || {};
+  DESIGN.providerKey = Boolean(active.session_key ?? data.session_key);
+  if (active.provider) DESIGN.provider = active.provider;
+  DESIGN.capabilities = data.capabilities || {};
+  renderProviderChoices();
+  renderProviderCaps(DESIGN.capabilities);
+  renderProviderSecurity(data.security);
+}
+
+function capabilityKey(payload) {
+  return `${payload.provider || ""}|${payload.endpoint || ""}|${payload.model || ""}`;
+}
+
+async function testProvider() {
+  const payload = providerPayload();
+  if (!payload.key && !DESIGN.providerKey) {
+    setProviderStatus("Enter an API key before testing.", "bad");
+    return;
+  }
+  setProviderStatus("Testing the endpoint with small live requests…");
+  const button = $("#btnProviderTest");
+  if (button) button.disabled = true;
+  try {
+    const result = await api("/api/providers/test", payload);
+    if (result.ok) {
+      // Remember measured capabilities so the preset flags returned by a later
+      // save do not overwrite what the probe actually observed.
+      DESIGN.capabilityKey = capabilityKey(payload);
+      DESIGN.capabilities = result.capabilities || {};
+    }
+    renderProviderCaps(result.capabilities || {});
+    if (result.ok) {
+      setProviderStatus(`Connection works. Endpoint ${result.endpoint} · model ${result.model}.`, "good");
+    } else {
+      setProviderStatus(`Connection failed: ${result.error || "no detail"}`, "bad");
+    }
+    return result;
+  } catch (error) {
+    setProviderStatus(`Connection failed: ${error.message}`, "bad");
+    return null;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function saveProvider() {
+  const payload = providerPayload();
+  if (!payload.endpoint) {
+    setProviderStatus("Enter an endpoint URL for this provider.", "bad");
+    return;
+  }
+  if (!payload.key && !DESIGN.providerKey) {
+    setProviderStatus("Enter an API key to hold for this session.", "bad");
+    return;
+  }
+  setProviderStatus("Saving the non-secret endpoint settings and the session key…");
+  try {
+    const data = await api("/api/providers/save", payload);
+    const measured = DESIGN.capabilities;
+    const measuredKey = DESIGN.capabilityKey;
+    applyProviderPayload(data);
+    if (measuredKey && measuredKey === capabilityKey(payload)) {
+      DESIGN.capabilities = measured;
+      renderProviderCaps(measured);
+    }
+    const keyInput = $("#providerKey");
+    if (keyInput) keyInput.value = "";
+    const useLlm = $("#useLlm");
+    const ready = Boolean(data.llm?.key_configured || data.session_key);
+    if (useLlm) useLlm.checked = ready;
+    if (ready) {
+      CHAT.engine = "llm ready";
+      renderChat();
+    }
+    setProviderStatus(
+      "Saved. The endpoint and model are persisted; the key lives only in server memory for this session.",
+      "good");
+    toast("AI provider saved for this session");
+  } catch (error) {
+    setProviderStatus(`Save failed: ${error.message}`, "bad");
+  }
+}
+
+async function removeProvider() {
+  setProviderStatus("Removing the session key…");
+  try {
+    const data = await api("/api/providers/remove", {});
+    applyProviderPayload(data);
+    const keyInput = $("#providerKey");
+    if (keyInput) keyInput.value = "";
+    const useLlm = $("#useLlm");
+    const ready = Boolean(data.llm?.key_configured);
+    if (useLlm) useLlm.checked = ready;
+    CHAT.engine = ready ? "llm ready" : "local rules";
+    renderChat();
+    setProviderStatus(
+      ready
+        ? "Session key removed. The endpoint stays saved; an environment key still provides the model."
+        : "Session key removed. The endpoint and model stay saved; chat falls back to the deterministic engine.",
+      "good");
+    toast("session key removed");
+  } catch (error) {
+    setProviderStatus(`Remove failed: ${error.message}`, "bad");
+  }
 }
 
 /* --------------------------------------------------------------- header */
@@ -602,8 +1131,14 @@ async function deleteConversation(conversationId) {
 async function initChat() {
   try {
     const settings = await api("/api/settings");
-    if (settings.llm?.configured && $("#useLlm")) $("#useLlm").checked = true;
-    if (settings.llm?.configured) CHAT.engine = "llm ready";
+    // A persisted endpoint without a usable credential is not a working model.
+    // Auto-enable the model only when the server actually holds a key for this
+    // session (or an environment key); otherwise the deterministic engine must
+    // stay in charge instead of failing every turn with an HTTP error.
+    const keyReady = Boolean(settings.llm?.key_configured || settings.session_key);
+    const usable = Boolean(settings.llm?.configured && keyReady);
+    if (usable && $("#useLlm")) $("#useLlm").checked = true;
+    CHAT.engine = usable ? "llm ready" : "local rules";
   } catch { /* settings are optional */ }
   let saved = "";
   try { saved = window.localStorage?.getItem("watchcad.conversation") || ""; } catch { saved = ""; }
@@ -939,6 +1474,7 @@ function renderAttachments() {
     <img src="${esc(url)}" alt="Attached reference">
     <button data-remove-attachment="${index}" title="Remove attachment">×</button>
   </figure>`).join("");
+  renderDesignReferences();
 }
 
 function attachImages(event) {
@@ -981,9 +1517,14 @@ async function toggleSettings() {
     if ($("#setSearchUrl")) $("#setSearchUrl").value = settings.search_url || "";
     const hint = $("#settingsHint");
     if (hint) {
-      hint.textContent = data.llm?.configured
-        ? `Model configured: ${data.llm.model}. Secrets stay in environment variables.`
-        : "No model configured — the local CAD engine is active. Secrets stay in environment variables.";
+      const keyReady = Boolean(data.llm?.key_configured || data.session_key);
+      if (!data.llm?.configured) {
+        hint.textContent = "No model configured — the local CAD engine is active. Use AI provider to add a session key.";
+      } else if (!keyReady) {
+        hint.textContent = `Endpoint saved (${data.llm.model}) but no key is held for this session. Add one in AI provider, or the local engine stays in charge.`;
+      } else {
+        hint.textContent = `Model ready: ${data.llm.model}. The key stays in server memory for this browser session.`;
+      }
     }
   } catch (error) {
     toast(error.message, true);
@@ -1002,9 +1543,12 @@ async function saveSettings() {
     const data = await api("/api/settings", { settings });
     const hint = $("#settingsHint");
     if (hint) {
-      hint.textContent = data.llm?.configured
-        ? `Saved. Model: ${data.llm.model}.`
-        : "Saved. No model endpoint is configured yet.";
+      const keyReady = Boolean(data.llm?.key_configured || data.session_key);
+      hint.textContent = !data.llm?.configured
+        ? "Saved. No model endpoint is configured yet."
+        : keyReady
+          ? `Saved. Model: ${data.llm.model}.`
+          : `Saved. Add a key in AI provider to use ${data.llm.model}.`;
     }
     toast("settings saved");
   } catch (error) {
@@ -1319,6 +1863,7 @@ function renderAgentDiff() {
 }
 
 function renderAgentVariants() {
+  renderDesignVariations();
   const box = $("#agentVariantsBox");
   const holder = $("#agentVariants");
   if (!box || !holder) return;
@@ -2085,6 +2630,15 @@ function restorePanels() {
 }
 
 function onGlobalClick(event) {
+  const workspace = event.target.closest("[data-workspace]");
+  if (workspace) { setWorkspace(workspace.dataset.workspace); return; }
+  const dialSwatch = event.target.closest("[data-dial-color]");
+  if (dialSwatch) { setField("dial.color", dialSwatch.dataset.dialColor); return; }
+  const candidate = event.target.closest("[data-apply-candidate]");
+  if (candidate) { applyCandidate(candidate.dataset.applyCandidate); return; }
+  const provider = event.target.closest("[data-provider]");
+  if (provider) { selectProvider(provider.dataset.provider); return; }
+  if (event.target.closest("[data-close-provider]")) { closeProviders(); return; }
   const clearPart = event.target.closest("[data-part-clear]");
   if (clearPart) { clearPartSelection(); return; }
   const closer = event.target.closest("[data-close]");
@@ -2166,6 +2720,10 @@ function onGlobalClick(event) {
     renderGroupToggles(V.tree);
     keepSelectionVisible();
     updateLayerInfo();
+    viewerEvent("watchcad:visibility", {
+      hidden: [...V.hidden],
+      isolate: V.isolate ? [...V.isolate] : null,
+    });
     requestRender();
   }
 }
@@ -2179,6 +2737,53 @@ function switchTab(name) {
 }
 
 /* --------------------------------------------------------------- viewer */
+/* The Three.js module is a separate ES module.  app.js talks to it only
+   through events, so the 2D renderer remains a complete fallback when WebGL
+   or module support is missing. */
+function viewerEvent(name, detail) {
+  try {
+    if (typeof CustomEvent === "function" && window?.dispatchEvent) {
+      window.dispatchEvent(new CustomEvent(name, { detail }));
+    }
+  } catch { /* non-browser harness */ }
+}
+
+function bindViewerBridge() {
+  if (typeof window?.addEventListener !== "function") return;
+  window.addEventListener("watchcad:select-part", (event) => {
+    const detail = event.detail;
+    if (!detail || !detail.name) { clearPartSelection(); return; }
+    const index = (V.mesh?.ranges || []).findIndex((range) => range.name === detail.name);
+    if (index >= 0) {
+      V.selected = index;
+      updatePartHud();
+      updateViewerCursor();
+      requestRender(false);
+      return;
+    }
+    const hud = $("#partHud");
+    const name = $("#partName");
+    const meta = $("#partMeta");
+    if (name) name.textContent = detail.name;
+    if (meta) meta.textContent = `${detail.role || "part"} · ${detail.group || "Parts"}`;
+    if (hud) hud.hidden = false;
+  });
+  window.addEventListener("watchcad:viewer-error", (event) => {
+    const message = event.detail?.message;
+    if (message) toast(`3D view unavailable: ${message}`, true);
+    requestRender();
+  });
+  window.addEventListener("watchcad:viewer-model", () => {
+    // A rebuilt GLB resets the module's local explode/visibility state, so
+    // replay the app's authoritative viewer state.
+    viewerEvent("watchcad:visibility", {
+      hidden: [...V.hidden],
+      isolate: V.isolate ? [...V.isolate] : null,
+    });
+    viewerEvent("watchcad:explode", { value: V.explode });
+  });
+}
+
 const V = {
   yaw: -1.10,
   pitch: 1.02,
@@ -2317,6 +2922,7 @@ function zoomAt(sx, sy, factor, rect) {
 }
 
 function zoomBy(factor) {
+  viewerEvent("watchcad:zoom", { factor });
   if (!V.canvas) return;
   const rect = V.canvas.getBoundingClientRect();
   zoomAt(rect.width / 2, rect.height / 2, factor, rect);
@@ -2366,6 +2972,7 @@ function setExplodeValue(percent, fit = true) {
   if (label) label.textContent = `${rounded}%`;
   if (fit) fitView();
   updateLayerInfo();
+  viewerEvent("watchcad:explode", { value: V.explode });
   requestRender();
 }
 
@@ -2402,6 +3009,7 @@ async function loadScene(initial = false) {
     lastSceneSig = sceneSignature(STATE);
     prepareMesh(payload);
     renderGroupToggles(payload.tree || {});
+    viewerEvent("watchcad:scene-changed", { checksum: sceneSignature(STATE) });
     requestRender();
   } catch (error) {
     toast(`mesh load failed: ${error.message}`, true);
@@ -2645,6 +3253,12 @@ function setView(name) {
   renderGroupToggles(V.tree);
   keepSelectionVisible();
   updateLayerInfo();
+  viewerEvent("watchcad:view", { name });
+  viewerEvent("watchcad:visibility", {
+    hidden: [...V.hidden],
+    isolate: V.isolate ? [...V.isolate] : null,
+  });
+  viewerEvent("watchcad:explode", { value: V.explode });
   requestRender();
 }
 
@@ -2653,6 +3267,9 @@ function render3d() {
   const canvas = V.canvas;
   const ctx = V.ctx;
   if (!mesh || !canvas || !ctx) return;
+  // The Three.js module owns the visible canvas when WebGL is active; skip the
+  // software raster pass so both renderers do not compete for the CPU.
+  if (document.body?.classList?.contains("webgl3d")) { V.ready = true; return; }
   ensureViewerSize();
   const dpr = canvas.width / Math.max(1, canvas.clientWidth);
   const width = canvas.width / dpr;
@@ -2846,6 +3463,7 @@ function clearPartSelection() {
   V.selected = null;
   updatePartHud();
   updateViewerCursor();
+  viewerEvent("watchcad:select-part", null);
   requestRender(false);
 }
 
@@ -2869,6 +3487,9 @@ function selectPartAt(clientX, clientY) {
   V.hover = hit.index;
   updatePartHud();
   updateViewerCursor();
+  viewerEvent("watchcad:select-part", {
+    name: hit.name, role: hit.role, group: hit.group,
+  });
   requestRender(false);
 }
 

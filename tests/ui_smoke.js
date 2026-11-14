@@ -133,7 +133,9 @@ const source = fs.readFileSync(appPath, "utf8")
     approveAgent, applyVariant, undoTurn, redoTurn, toggleAgentHistory,
     sendChat, newChat, loadConversations, toggleSettings, toggleChatHistory,
     deleteChatMessage, renderAttachments, attachImages,
-    get AGENT() { return AGENT; },
+    saveProvider, removeProvider, currentSession,
+    runOptimisation, applyCandidate,
+    get AGENT() { return AGENT; }, get DESIGN() { return DESIGN; },
     get selected() { return V.selected; },
   };\n`;
 vm.runInContext(source, context, { filename: "app.js" });
@@ -154,6 +156,9 @@ const waitFor = async (fn, label, timeout = 15000) => {
 
 (async () => {
   const t = context.__t;
+  // The smoke harness must be deterministic: never contact a real model, even
+  // if the developer's environment has one configured.
+  if (el("useLlm")) el("useLlm").checked = false;
   await waitFor(() => t.STATE && t.V.mesh, "boot + mesh");
   console.log("boot");
   check(t.STATE.spec.data.case.diameter_mm > 0, "state loaded");
@@ -366,6 +371,91 @@ const waitFor = async (fn, label, timeout = 15000) => {
   await t.approveAgent(true);
   check(t.STATE.spec.data.case.diameter_mm === 39, "chat approval applies after confirmation");
   check(!t.CHAT.pending, "chat approval clears after applying");
+
+  console.log("optimisation");
+  el("optimiseObjective").value = "weight";
+  el("optimiseBudget").value = "6";
+  await t.runOptimisation();
+  const opt = t.DESIGN.optimisation;
+  check(opt?.candidates?.length === 6, "optimisation returns the requested candidates");
+  check(el("optimiseStatus").innerHTML.includes("6 candidates"), "lab reports the candidate count");
+  check(el("candidateList").innerHTML.includes("data-apply-candidate"),
+    "candidate cards render an apply control");
+  const baselineCard = el("candidateList").innerHTML.split("</article>")
+    .find((chunk) => chunk.includes('data-apply-candidate="baseline"'));
+  check(Boolean(baselineCard) && baselineCard.includes("disabled"),
+    "baseline card cannot be applied");
+  const winner = (opt?.candidates || []).find((item) => item.id === opt.winner);
+  check(Boolean(winner) && winner.status === "ok", `winner is solvable (${winner?.label})`);
+  if (winner?.status === "ok" && winner.changes?.length) {
+    const beforeChecksum = t.STATE.spec.data.derived.checksum;
+    const applied = winner.applied || [];
+    await t.applyCandidate(winner.id);
+    const matches = applied.every((change) => {
+      const actual = change.path.split(".")
+        .reduce((node, key) => node?.[key], t.STATE.spec.data);
+      return actual === change.to;
+    });
+    check(matches, "candidate changes reached the validated variant pipeline");
+    check(t.STATE.spec.data.derived.checksum !== beforeChecksum,
+      "applying a candidate re-solves the design");
+    check(el("optimiseStatus").innerHTML.includes("Design changed"),
+      "stale lab results warn after applying");
+  }
+
+  console.log("providers");
+  const sid = t.currentSession();
+  const sessionHeaders = { "X-WatchCAD-Session": sid };
+  const settingsResponse = await realFetch(`${BASE}/api/settings`, { headers: sessionHeaders });
+  const settingsBefore = (await settingsResponse.json()).settings || {};
+  const secret = "sk-smoke-secret-do-not-leak";
+  el("providerEndpoint").value = "https://example.invalid/v1";
+  el("providerModel").value = "smoke-model";
+  el("providerKey").value = secret;
+  await t.saveProvider();
+  check(el("providerStatus").textContent.includes("Saved"), "provider save is acknowledged");
+  check(!el("providerStatus").textContent.includes(secret), "save status never echoes the key");
+  check(!el("providerSecurity").innerHTML.includes(secret), "security panel never echoes the key");
+  check(el("settingsHint").textContent.includes("never persisted"),
+    "security hint explains key storage");
+  check(el("providerKey").value === "", "key field clears after saving");
+  check(el("useLlm").checked === true, "saving a key enables the model toggle");
+  check(t.DESIGN.providerKey === true, "design state records a session key");
+  check(t.CHAT.engine === "llm ready", "engine switches to llm ready");
+  const settingsSaved = await (await realFetch(`${BASE}/api/settings`,
+    { headers: sessionHeaders })).json();
+  check(settingsSaved.settings.url === "https://example.invalid/v1",
+    "non-secret endpoint persists in settings");
+  check(!JSON.stringify(settingsSaved).includes(secret), "settings API never returns the key");
+
+  await t.removeProvider();
+  check(el("providerStatus").textContent.includes("removed"), "provider removal is acknowledged");
+  check(el("useLlm").checked === false, "removing a key disables the model toggle");
+  check(t.DESIGN.providerKey === false, "design state drops the session key");
+  check(t.CHAT.engine === "local rules", "engine falls back to local rules");
+  const settingsRemoved = await (await realFetch(`${BASE}/api/settings`,
+    { headers: sessionHeaders })).json();
+  check(!JSON.stringify(settingsRemoved).includes(secret), "removed key is not returned by the API");
+  check(settingsRemoved.settings.url === "https://example.invalid/v1",
+    "removal keeps the non-secret endpoint");
+
+  // Restore the developer's local settings file; the smoke run must not leave
+  // a fake endpoint behind for the next boot.
+  const restore = {};
+  for (const key of ["provider", "url", "model", "vision_model", "temperature",
+    "max_tokens", "timeout_s", "retries", "retry_delay_s", "search_url",
+    "search_provider"]) {
+    restore[key] = settingsBefore[key] ?? "";
+  }
+  await realFetch(`${BASE}/api/settings`, {
+    method: "POST",
+    headers: { ...sessionHeaders, "Content-Type": "application/json" },
+    body: JSON.stringify({ settings: restore }),
+  });
+  const settingsRestored = await (await realFetch(`${BASE}/api/settings`,
+    { headers: sessionHeaders })).json();
+  check(settingsRestored.settings.url !== "https://example.invalid/v1",
+    "smoke run restores the previous settings");
 
   console.log(failures.length ? `\n${failures.length} failure(s)` : "\nall checks passed");
   process.exit(failures.length ? 1 : 0);

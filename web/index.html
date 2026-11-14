@@ -3,20 +3,26 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>watchcad — parametric watch studio</title>
+  <title>watchcad — AI watch design studio</title>
   <link rel="stylesheet" href="/style.css">
 </head>
-<body>
+<body data-workspace="design">
   <header class="topbar">
     <div class="brand">
       <div class="mark">W</div>
       <div>
         <h1>WATCHCAD</h1>
-        <p>parametric watch studio</p>
+        <p>AI watch design studio</p>
       </div>
     </div>
+    <nav class="workspaces" id="workspaces" aria-label="Workspaces">
+      <button data-workspace="design" class="active">Design Studio</button>
+      <button data-workspace="engineering">Engineering Studio</button>
+      <button data-workspace="optimise">Optimisation Lab</button>
+    </nav>
     <div id="summaryBar" class="summary"></div>
     <div class="top-actions">
+      <button id="btnProviders" class="btn ghost" title="Bring your own AI provider key">AI provider</button>
       <button id="btnSave" class="btn ghost" title="download the spec JSON">Save spec</button>
       <button id="btnLoad" class="btn ghost" title="load a spec JSON">Load</button>
       <input id="fileLoad" type="file" accept="application/json,.json" hidden>
@@ -27,6 +33,76 @@
 
   <main class="layout" id="layout">
     <aside class="left" id="leftPanel">
+      <section class="panel design-panel" id="designPanel">
+        <div class="design-head">
+          <h2>Design Studio</h2>
+          <span class="design-verified" title="Every change goes through the solver and verifier">solver-backed</span>
+        </div>
+        <p class="design-intro">Shape the watch visually. Every control writes the shared specification, then the deterministic solver rebuilds the mesh.</p>
+        <div class="design-grid">
+          <label>Case material <select id="designCaseMaterial" data-design-path="case.material"></select></label>
+          <label>Case finish <select id="designCaseFinish" data-design-path="case.finish"></select></label>
+          <label>Dial finish <select id="designDialFinish" data-design-path="dial.finish"></select></label>
+          <label>Crystal <select id="designCrystal" data-design-path="case.crystal"></select></label>
+          <label>Hands <select id="designHands" data-design-path="hands.material"></select></label>
+          <label>Indices <select id="designIndices" data-design-path="dial.index_style"></select></label>
+        </div>
+        <div class="design-color">
+          <span>Dial colour</span>
+          <div id="designSwatches" class="swatches"></div>
+          <label class="custom-color" title="Pick any dial colour">
+            <input id="designDialColor" type="color" value="#101418">
+            <span>custom</span>
+          </label>
+        </div>
+        <div class="design-section-head">
+          <span>Reference images</span>
+          <button id="btnDesignRef" class="btn small ghost">Add</button>
+          <input id="designReference" type="file" accept="image/*" multiple hidden>
+        </div>
+        <div id="designRefStrip" class="design-ref-strip" hidden></div>
+        <div class="design-actions">
+          <button id="btnDesignPrompt" class="btn small" title="Write a prompt that uses the attached reference images">Describe a match</button>
+          <button id="btnVariations" class="btn small primary">Generate alternatives</button>
+          <button class="btn small ghost" data-workspace="engineering">Open CAD tools</button>
+        </div>
+        <div id="designVariations" class="design-variations"></div>
+        <p class="design-note">Rendered from <code>/api/model.glb</code> · mass, checks and tolerances are calculated, not generated.</p>
+      </section>
+
+      <section class="panel optimise-panel" id="optimisePanel">
+        <div class="design-head">
+          <h2>Optimisation Lab</h2>
+          <span class="design-verified" title="Candidates are solved and verified, not predicted by a model">deterministic</span>
+        </div>
+        <p class="design-intro">Search real specification changes for one objective. Each candidate is solved, meshed and verified; failed candidates stay visible.</p>
+        <div class="design-grid">
+          <label>Objective
+            <select id="optimiseObjective">
+              <option value="weight">Minimum weight</option>
+              <option value="cost">Minimum material cost</option>
+              <option value="manufacturability">Manufacturability</option>
+              <option value="tolerance">Tolerance risk</option>
+              <option value="assembly">Assembly simplicity</option>
+            </select>
+          </label>
+          <label>Candidate budget
+            <select id="optimiseBudget">
+              <option value="6">6 candidates</option>
+              <option value="9" selected>9 candidates</option>
+              <option value="12">12 candidates</option>
+            </select>
+          </label>
+        </div>
+        <div class="design-actions">
+          <button id="btnOptimise" class="btn small primary">Run optimisation</button>
+        </div>
+        <div id="optimiseStatus" class="optimise-status">Not run yet. The current design is the baseline.</div>
+        <div id="candidateList" class="candidate-list"></div>
+        <p class="design-note">Labels: <b>calculated</b> from geometry and the BOM; <b>estimated</b> where a cost or process assumption is involved. Nothing here is physically measured.</p>
+      </section>
+
+      <div id="engineeringPanel" class="workspace-panel">
       <section class="panel">
         <h2>Model</h2>
         <dl id="facts" class="facts"></dl>
@@ -61,6 +137,7 @@
       <div id="tab-package" class="tab-panel">
         <div id="packageBody"></div>
       </div>
+      </div>
     </aside>
 
     <section class="viewport">
@@ -74,6 +151,7 @@
         <button class="part-clear" data-part-clear title="Clear part selection" aria-label="Clear part selection">×</button>
       </div>
       <canvas id="viewer"></canvas>
+      <canvas id="viewer3d" aria-label="Interactive 3D watch preview"></canvas>
       <div id="groupToggles" class="group-toggles"></div>
       <div class="viewer-tools">
         <label class="explode-control" title="Separate every part along the vertical axis so its layer is visible">
@@ -139,7 +217,8 @@
             <label>Search endpoint <input id="setSearchUrl" placeholder="optional JSON search URL"></label>
           </div>
           <div class="settings-foot">
-            <span id="settingsHint">Secrets stay in environment variables.</span>
+            <span id="settingsHint">Endpoints and models are non-secret. Use AI provider for session keys.</span>
+            <button class="btn small" id="btnProviderSettings">AI provider</button>
             <button class="btn small primary" data-settings-save="1">Save settings</button>
           </div>
         </div>
@@ -188,7 +267,44 @@
   <button class="panel-rail rail-right" id="railCopilot" data-open="right" hidden
     title="Open the copilot sidebar" aria-label="Open copilot sidebar">Copilot</button>
 
+  <div id="providerModal" class="modal" hidden>
+    <div class="modal-card provider-card" role="dialog" aria-modal="true" aria-labelledby="providerTitle">
+      <header class="modal-head">
+        <div>
+          <h2 id="providerTitle">AI provider · bring your own key</h2>
+          <p>Keys are held in server process memory for this browser session only. They are never written to settings, localStorage, logs or API responses.</p>
+        </div>
+        <button class="modal-close" data-close-provider aria-label="Close provider settings">×</button>
+      </header>
+      <div id="providerChoices" class="provider-choices"></div>
+      <div class="provider-form">
+        <label>API key
+          <input id="providerKey" type="password" autocomplete="off" spellcheck="false" placeholder="paste the key for this session">
+        </label>
+        <label>Model
+          <input id="providerModel" list="providerModels" autocomplete="off" spellcheck="false">
+          <datalist id="providerModels"></datalist>
+        </label>
+        <label>Endpoint
+          <input id="providerEndpoint" autocomplete="off" spellcheck="false">
+        </label>
+        <label>Vision model <span class="field-hint">optional</span>
+          <input id="providerVision" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+      <div id="providerCaps" class="provider-caps"></div>
+      <div id="providerStatus" class="provider-status">Choose a provider to begin.</div>
+      <div class="modal-actions">
+        <button id="btnProviderTest" class="btn small">Test connection</button>
+        <button id="btnProviderSave" class="btn small primary">Save for session</button>
+        <button id="btnProviderRemove" class="btn small danger">Remove key</button>
+        <button class="btn small ghost" data-close-provider>Close</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast"></div>
   <script src="/app.js"></script>
+  <script type="module" src="/viewer3d.js"></script>
 </body>
 </html>
