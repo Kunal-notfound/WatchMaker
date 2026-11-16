@@ -14,6 +14,9 @@ import re
 from typing import Any
 
 from ..nlp import parse
+from ..components import (
+    allows_path, component_for_path, resolve_component, UnknownComponent,
+)
 from ..schema import FIELDS, Spec
 from ..solver import solve
 from ..verify import summary as verify_summary
@@ -100,10 +103,19 @@ def detect_intent(request: str) -> Intent:
 # ---------------------------------------------------------------------------
 
 def patches_from_request(request: str, studio, *, use_llm: bool = False,
-                         name: str | None = None) -> dict:
-    """Run the deterministic parser (or its optional LLM assist) on a spec."""
+                         name: str | None = None, focus=None) -> dict:
+    """Run the deterministic parser (or its optional LLM assist) on a spec.
+
+    When ``focus`` names a component, only patches owned by that component
+    survive.  Out-of-scope patches are reported, never silently applied.
+    """
     result = parse(request, base=studio.spec, use_llm=use_llm, name=name)
+    component = resolve_component(focus) if focus else None
     ops = []
+    notes = list(result.notes)
+    questions = list(result.questions)
+    skipped = list(result.skipped)
+    scope_skipped: list[dict] = []
     locks = set(studio.spec.locks)
     for patch in result.patches:
         path = patch.get("path")
@@ -111,11 +123,28 @@ def patches_from_request(request: str, studio, *, use_llm: bool = False,
             continue
         if path.startswith("derived."):
             continue
+        if component is not None and not allows_path(component, path):
+            owner = component_for_path(path)
+            scope_skipped.append({
+                "path": path,
+                "component": owner.id if owner else None,
+                "label": owner.label if owner else "another component",
+            })
+            continue
         ops.append({"op": "replace", "path": path, "value": patch.get("value"),
                     "note": patch.get("note", "request interpretation")})
-    return {"ops": ops, "patches": result.patches, "questions": result.questions,
-            "notes": result.notes, "engine": result.engine,
-            "skipped": result.skipped}
+    if scope_skipped:
+        paths = ", ".join(sorted({row["path"] for row in scope_skipped}))
+        labels = ", ".join(sorted({row["label"] for row in scope_skipped}))
+        notes.append(
+            f"focus is {component.label}; refused out-of-scope field(s) {paths} "
+            f"owned by {labels}")
+        questions.append(
+            f"The request also changes {paths}, which belong to {labels}. Clear "
+            f"the component selection or select that component to make those edits.")
+    return {"ops": ops, "patches": result.patches, "questions": questions,
+            "notes": notes, "engine": result.engine, "skipped": skipped,
+            "scope_skipped": scope_skipped}
 
 
 def _step(title: str, tool: str = "", arguments: dict | None = None,
@@ -125,11 +154,12 @@ def _step(title: str, tool: str = "", arguments: dict | None = None,
 
 
 def plan_local(request: str, studio, session=None, *, mode: str = "autonomous",
-               use_llm: bool = False) -> LocalPlan:
+               use_llm: bool = False, focus=None) -> LocalPlan:
     """A complete local plan for the current request."""
     intent = detect_intent(request)
     plan = LocalPlan(intent=intent, notes=list(intent.notes))
     locks = sorted(studio.spec.locks)
+    component = resolve_component(focus) if focus else None
 
     if intent.name == "undo":
         plan.steps.append(_step("Restore the previous design version", "undo",
@@ -167,10 +197,19 @@ def plan_local(request: str, studio, session=None, *, mode: str = "autonomous",
     if intent.name in ("explain", "critic", "inspect"):
         plan.steps.append(_step("Read the current specification", "get_current_spec",
                                 {"full": False}, "understand the current design"))
+        if component is not None:
+            plan.steps.append(_step(
+                f"Read the {component.label} component context",
+                "get_component_context", {"component": component.id},
+                "the user focused this component in the viewer"))
         plan.steps.append(_step("Read the verification report",
                                 "get_verification_report", {},
                                 "separate calculated results from estimates and tests"))
         if intent.name in ("critic", "inspect"):
+            plan.steps.append(_step(
+                "Run the deterministic five-axis critic", "critique_design",
+                {"component": component.id} if component else {},
+                "scores and fixes must come from the rubric, not the model"))
             plan.steps.append(_step("Inspect the generated geometry",
                                     "inspect_geometry", {"include_bounds": False},
                                     "judge proportions, mass and train layout"))
@@ -188,7 +227,7 @@ def plan_local(request: str, studio, session=None, *, mode: str = "autonomous",
         return plan
 
     # modify or reference
-    parsed = patches_from_request(request, studio, use_llm=use_llm)
+    parsed = patches_from_request(request, studio, use_llm=use_llm, focus=focus)
     plan.engine = parsed["engine"]
     plan.notes.extend(parsed["notes"])
     plan.patches = parsed["patches"]

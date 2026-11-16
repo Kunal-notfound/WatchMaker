@@ -121,6 +121,7 @@
       <nav class="tabs">
         <button data-tab="spec" class="active">Spec</button>
         <button data-tab="checks">Checks <span id="checkCount"></span></button>
+        <button data-tab="critic">Critic</button>
         <button data-tab="package">Package</button>
         <button class="tab-close" data-close="left" title="Close the specs sidebar" aria-label="Close specs sidebar">×</button>
       </nav>
@@ -133,6 +134,13 @@
         <div id="checkSummary" class="check-summary"></div>
         <div id="checkFilters" class="filters"></div>
         <div id="checkList"></div>
+      </div>
+
+      <div id="tab-critic" class="tab-panel">
+        <div id="criticSummary" class="critic-summary"></div>
+        <div id="criticFocus" class="component-card"></div>
+        <div id="criticAxes" class="critic-axes"></div>
+        <div id="criticNotes" class="critic-notes"></div>
       </div>
 
       <div id="tab-package" class="tab-panel">
@@ -151,6 +159,12 @@
           <span id="partMeta"></span>
         </div>
         <button class="part-clear" data-part-clear title="Clear part selection" aria-label="Clear part selection">×</button>
+      </div>
+      <div id="focusChip" class="focus-chip" hidden>
+        <span class="focus-dot"></span>
+        <span>Editing focus</span>
+        <b id="focusName">—</b>
+        <button data-focus-clear title="Clear the component focus" aria-label="Clear the component focus">clear</button>
       </div>
       <canvas id="viewer"></canvas>
       <canvas id="viewer3d" aria-label="Interactive 3D watch preview"></canvas>

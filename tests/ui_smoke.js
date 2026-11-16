@@ -135,6 +135,8 @@ const source = fs.readFileSync(appPath, "utf8")
     deleteChatMessage, renderAttachments, attachImages,
     saveProvider, removeProvider, currentSession,
     runOptimisation, applyCandidate, onGlobalClick,
+    refreshCritic, setComponentFocus, renderCritic, applyCriticFix,
+    get CRITIC() { return CRITIC; },
     get AGENT() { return AGENT; }, get DESIGN() { return DESIGN; },
     get selected() { return V.selected; },
   };\n`;
@@ -412,6 +414,21 @@ const waitFor = async (fn, label, timeout = 15000) => {
   await t.approveAgent(true);
   check(t.STATE.spec.data.case.diameter_mm === 39, "chat approval applies after confirmation");
   check(!t.CHAT.pending, "chat approval clears after applying");
+
+  console.log("critic");
+  await t.setComponentFocus({ name: "crown", role: "case", group: "Case" });
+  check(t.CRITIC.report?.axes?.length === 5, "critic returns five axes");
+  check(t.CRITIC.report?.focus?.id === "crown", "critic is scoped to the selected component");
+  check((t.CRITIC.context?.fields || []).some((field) => field.path === "case.crown"),
+    "component context lists the crown fields");
+  check(el("criticSummary").innerHTML.includes("critic-number"), "critic overall score renders");
+  check(el("criticAxes").innerHTML.includes("Proportions"), "critic axes render");
+  check(el("criticFocus").innerHTML.includes("Crown"), "component card renders the focus");
+  check(!el("focusChip").hidden && el("focusName").textContent === "crown",
+    "focus chip names the selected component");
+  await t.setComponentFocus(null);
+  check(t.CRITIC.report === null && el("focusChip").hidden,
+    "clearing the selection clears the critic focus");
 
   console.log("optimisation");
   el("optimiseObjective").value = "weight";

@@ -15,6 +15,11 @@ import os
 from typing import Any, Callable
 
 from ..build import build, slugify
+from ..components import (
+    UnknownComponent, allows_path, component_context, component_for_path,
+    resolve_component,
+)
+from ..critic import critique
 from ..modules import MODULES
 from ..nlp import describe
 from ..schema import FIELDS, Spec
@@ -84,6 +89,23 @@ TOOL_SPECS: dict[str, ToolSpec] = {
         "Inspect one component or train arbor: dimensions, bounds, mass, material, "
         "role, tooth counts and related stages. Name matching is case-insensitive.",
         _obj({"name": _STRING}, ["name"]),
+    ),
+    "get_component_context": ToolSpec(
+        "get_component_context",
+        "Read the component focus: the fields it owns, values, locks, related "
+        "verification checks, scene parts and bounds. Accepts a component id, "
+        "alias, scene part name, role, viewer group or dotted field path. When a "
+        "component is selected in the 3-D viewer, omitting the argument uses that "
+        "focus.",
+        _obj({"component": _STRING, "name": _STRING}),
+    ),
+    "critique_design": ToolSpec(
+        "critique_design",
+        "Run the deterministic five-axis design critic: proportions, dial "
+        "legibility, aesthetic coherence, ergonomics and component consistency. "
+        "Returns scores, calculated/estimated metrics, findings and safe fixes. "
+        "No language model produces any number in this report.",
+        _obj({"component": _STRING}),
     ),
     "get_field_dependencies": ToolSpec(
         "get_field_dependencies",
@@ -193,10 +215,23 @@ class ToolContext:
     emit: Callable[[dict], None] | None = None
     control: Any = None
     max_calls: int = 80
+    # Optional component focus from the 3-D viewer.  When set, mutating tools
+    # may only write fields owned by that component; reads still see everything
+    # so the model can reason about cross-component consequences.
+    focus: Any = None
 
     def check(self) -> None:
         if self.control is not None:
             self.control.check()
+
+    @property
+    def focused(self):
+        if self.focus is None or self.focus == "":
+            return None
+        try:
+            return resolve_component(self.focus)
+        except UnknownComponent as exc:
+            raise ToolError(str(exc)) from exc
 
 
 def openai_tools() -> list[dict]:
@@ -226,6 +261,23 @@ def _allowed_path(path: str) -> bool:
 def _check_lock(studio, path: str) -> None:
     if path in studio.spec.locks:
         raise ToolDenied(f"{path} is locked by the user and cannot be changed")
+
+
+def _check_focus(ctx: ToolContext, path: str) -> None:
+    """Refuse a write that leaves the selected component, with a clear reason."""
+    component = ctx.focused
+    if component is None:
+        return
+    if allows_path(component, path):
+        return
+    owner = component_for_path(path)
+    if owner is None:
+        raise ToolDenied(
+            f"{path} is outside the {component.label} focus; clear the component "
+            "selection to edit the whole design")
+    raise ToolDenied(
+        f"{path} belongs to {owner.label}, but the focus is {component.label}; "
+        f"select the {owner.label} component or clear the selection first")
 
 
 def _validate_value(studio, path: str, value) -> None:
@@ -384,6 +436,27 @@ def inspect_component(ctx: ToolContext, name: str, **_) -> dict:
         result["mass_g"] = round(parts[0]["volume_mm3"]
                                  * _density(parts[0].get("material")), 3)
     return _clean_json(result)
+
+
+def get_component_context(ctx: ToolContext, component: str = "", name: str = "",
+                         **_) -> dict:
+    ctx.check()
+    selection = component or name or ctx.focus
+    if not selection:
+        raise ToolError("component is required when nothing is selected in the viewer")
+    try:
+        return _clean_json(component_context(ctx.studio, selection))
+    except UnknownComponent as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def critique_design(ctx: ToolContext, component: str = "", **_) -> dict:
+    ctx.check()
+    selection = component or ctx.focus
+    try:
+        return _clean_json(critique(ctx.studio, selection))
+    except UnknownComponent as exc:
+        raise ToolError(str(exc)) from exc
 
 
 def _density(material: str | None) -> float:
@@ -591,6 +664,7 @@ def update_spec(ctx: ToolContext, path: str, value, note: str = "", **_) -> dict
     if not path:
         raise ToolError("path is required")
     _check_lock(ctx.studio, path)
+    _check_focus(ctx, path)
     _validate_value(ctx.studio, path, value)
     before = ctx.studio.spec.copy()
     if not ctx.studio.set(path, value, force=False):
@@ -620,6 +694,7 @@ def apply_patch(ctx: ToolContext, ops: list[dict], note: str = "", **_) -> dict:
         path = str(op.get("path", ""))
         if not path:
             raise ToolError("every operation needs a path")
+        _check_focus(ctx, path)
         if kind in ("lock", "unlock"):
             lock_ops.append({"op": kind, "path": path})
             continue
@@ -774,6 +849,8 @@ HANDLERS: dict[str, Callable[..., dict]] = {
     "get_current_spec": get_current_spec,
     "get_verification_report": get_verification_report,
     "inspect_component": inspect_component,
+    "get_component_context": get_component_context,
+    "critique_design": critique_design,
     "get_field_dependencies": get_field_dependencies,
     "compare_specs": compare_specs,
     "get_design_history": get_design_history,

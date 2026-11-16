@@ -70,6 +70,8 @@ from .agent.orchestrator import AgentOrchestrator, apply_variant, normalize_mode
 from .agent.planner import detect_intent, build_variants
 from .agent.tools import tool_catalog
 from .build import BuildResult, build, slugify
+from .components import UnknownComponent, component_context
+from .critic import critique
 from .llm import LLMConfig
 from .modules import MODULES, QUARTZ_MODULES
 from .nlp import describe, ideas, parse, preset_prompt
@@ -474,6 +476,20 @@ class Handler(BaseHTTPRequestHandler):
             payload = studio.snapshot({"session": session.conversation_payload(),
                                        "agent": session.last_agent})
             self._json(200, payload)
+        elif route == "/api/component/context":
+            selection = (query.get("component") or query.get("part")
+                         or query.get("name") or [""])[0]
+            try:
+                self._json(200, component_context(studio, selection))
+            except UnknownComponent as exc:
+                self._error(400, str(exc))
+        elif route == "/api/critic":
+            selection = (query.get("component") or query.get("part")
+                         or query.get("name") or [""])[0]
+            try:
+                self._json(200, critique(studio, selection or None))
+            except UnknownComponent as exc:
+                self._error(400, str(exc))
         elif route == "/api/schema":
             self._json(200, _schema_payload(studio))
         elif route == "/api/scene":
@@ -761,7 +777,8 @@ class Handler(BaseHTTPRequestHandler):
                 max_tool_rounds=int(body.get("max_tool_rounds") or 8),
                 emit=(lambda event: write({"type": "timeline", "event": event}))
                 if write else None,
-                control=control)
+                control=control,
+                focus=body.get("component") or body.get("part") or "")
             payload = result.to_dict()
             payload["snapshot"] = session.studio.snapshot()
             payload["session"] = session.conversation_payload()
@@ -958,7 +975,8 @@ class Handler(BaseHTTPRequestHandler):
                 max_tool_rounds=int(body.get("max_tool_rounds") or 12),
                 emit=write, control=control,
                 regenerate=bool(body.get("regenerate", False)),
-                edit_message_id=str(body.get("edit_message_id") or ""))
+                edit_message_id=str(body.get("edit_message_id") or ""),
+                focus=body.get("component") or body.get("part") or "")
             conversation = get_store().get_conversation(conversation_id) or conversation
             payload = result.to_dict()
             payload["conversation"] = conversation

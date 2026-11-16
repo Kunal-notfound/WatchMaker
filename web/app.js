@@ -47,6 +47,13 @@ const DESIGN = {
   capabilityKey: "",
   providerKey: false,
 };
+const CRITIC = {
+  report: null,
+  context: null,
+  focus: null,
+  loading: false,
+  error: "",
+};
 const DIAL_SWATCHES = [
   ["black", "#14171c"], ["blue", "#1c3f6e"], ["green", "#204436"],
   ["white", "#e9e6dd"], ["silver", "#c6c8cb"], ["salmon", "#c98d72"],
@@ -324,6 +331,7 @@ function renderAll() {
   renderAgent();
   renderDesignPanel();
   renderOptimisation();
+  renderCritic();
 }
 
 function applyState(state, options = {}) {
@@ -341,6 +349,7 @@ function applyState(state, options = {}) {
   else renderSpec();
   renderDesignPanel();
   renderOptimisation();
+  renderCritic();
   if (options.scene !== false && checksum !== previous) scheduleScene();
   renderSessionChip();
 }
@@ -1359,6 +1368,7 @@ async function sendChat(textOverride, options = {}) {
       stream: true,
       regenerate,
       edit_message_id: regenerate ? "" : (editId || ""),
+      component: CRITIC.focus,
     }, handleChatEvent);
     if (!payload) throw new Error(AGENT.error || "the assistant returned no result");
     applyChatResult(payload, before);
@@ -1581,6 +1591,7 @@ async function runPrompt(textOverride) {
       mode: currentMode(),
       use_llm: Boolean($("#useLlm") && $("#useLlm").checked),
       stream: true,
+      component: CRITIC.focus,
     }, handleAgentEvent);
     if (!payload) throw new Error(AGENT.error || "the agent returned no result");
     AGENT.result = payload;
@@ -2472,6 +2483,216 @@ async function applyFix(index) {
   await setField(check.fix.path, check.fix.value);
 }
 
+/* --------------------------------------------------------------- critic */
+function componentLabel(value) {
+  if (!value) return "Whole design";
+  if (typeof value === "string") return value;
+  return value.label || value.component || value.name || value.id || "Selected component";
+}
+
+function componentSelection(value) {
+  if (!value) return null;
+  if (typeof value === "string") return { name: value };
+  const selection = {};
+  for (const key of ["name", "role", "group", "component", "id"]) {
+    if (value[key]) selection[key] = value[key];
+  }
+  return Object.keys(selection).length ? selection : null;
+}
+
+function componentQuery(detail) {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  return detail.name || detail.component || detail.id || "";
+}
+
+async function setComponentFocus(detail) {
+  CRITIC.focus = componentSelection(detail);
+  renderFocusChip();
+  if (!CRITIC.focus) {
+    CRITIC.context = null;
+    CRITIC.report = null;
+    CRITIC.error = "";
+    renderCritic();
+    return;
+  }
+  await refreshCritic();
+}
+
+async function refreshCritic() {
+  const query = componentQuery(CRITIC.focus);
+  const suffix = query ? `?component=${encodeURIComponent(query)}` : "";
+  CRITIC.loading = true;
+  CRITIC.error = "";
+  renderCritic();
+  try {
+    const [context, report] = await Promise.all([
+      query ? api(`/api/component/context${suffix}`) : Promise.resolve(null),
+      api(`/api/critic${suffix}`),
+    ]);
+    CRITIC.context = context;
+    CRITIC.report = report;
+  } catch (error) {
+    CRITIC.error = error.message;
+  } finally {
+    CRITIC.loading = false;
+    renderCritic();
+  }
+}
+
+function renderFocusChip() {
+  const chip = $("#focusChip");
+  if (!chip) return;
+  const focus = CRITIC.focus;
+  if (!focus) { chip.hidden = true; return; }
+  const name = $("#focusName");
+  if (name) name.textContent = componentLabel(focus);
+  chip.hidden = false;
+}
+
+function renderCritic() {
+  const summary = $("#criticSummary");
+  const focusBox = $("#criticFocus");
+  const axesBox = $("#criticAxes");
+  const notesBox = $("#criticNotes");
+  if (!summary || !focusBox || !axesBox || !notesBox) return;
+
+  if (CRITIC.loading && !CRITIC.report) {
+    summary.innerHTML = `<div class="empty-note">Running the deterministic critic…</div>`;
+    focusBox.innerHTML = "";
+    axesBox.innerHTML = "";
+    notesBox.innerHTML = "";
+    return;
+  }
+  if (CRITIC.error) {
+    summary.innerHTML = `<div class="critic-error">Critic unavailable: ${esc(CRITIC.error)}</div>`;
+    focusBox.innerHTML = "";
+    axesBox.innerHTML = "";
+    notesBox.innerHTML = "";
+    return;
+  }
+  const report = CRITIC.report;
+  if (!report) {
+    summary.innerHTML = `<div class="empty-note">Select a part in the 3-D viewer or open the
+      Critic tab to run the deterministic five-axis report.</div>`;
+    focusBox.innerHTML = "";
+    axesBox.innerHTML = "";
+    notesBox.innerHTML = "";
+    return;
+  }
+
+  const overall = report.overall || {};
+  summary.innerHTML = `<div class="critic-score">
+      <div class="critic-number ${esc(overall.band || "")}">${esc(overall.score ?? "—")}</div>
+      <div class="critic-score-copy">
+        <b>${esc(overall.band || "unrated")}</b>
+        <span>${esc(overall.summary || "")}</span>
+        <small>${esc(overall.note || "")}</small>
+      </div>
+    </div>`;
+
+  const context = CRITIC.context;
+  if (context) {
+    const fields = (context.fields || []).map((field) => {
+      const unit = field.unit ? ` ${esc(field.unit)}` : "";
+      const lock = field.locked ? `<span class="critic-lock">locked</span>` : "";
+      return `<div class="component-field">
+        <span class="cf-path">${esc(field.path)}</span>
+        <b>${esc(field.value ?? "—")}${unit}</b>${lock}
+      </div>`;
+    }).join("") || `<div class="empty-note">This component has no independent writable field.</div>`;
+    const checks = (context.checks || []).map((check) => {
+      const verdict = check.passed === false ? "fail" : (check.verdict || "calculated");
+      return `<div class="component-check ${esc(verdict)}">
+        <span>${esc(check.title || check.id)}</span>
+        <b>${esc(verdict)}</b>
+      </div>`;
+    }).join("");
+    const parts = (context.parts || []).map((part) =>
+      `<span class="chip">${esc(part.name)}${part.count > 1 ? ` ×${part.count}` : ""}</span>`).join("");
+    const notes = (context.notes || []).map((note) =>
+      `<div class="component-note">${esc(note)}</div>`).join("");
+    focusBox.innerHTML = `<div class="component-head">
+        <div>
+          <span class="eyebrow">Selected component</span>
+          <h3>${esc(context.component?.label || componentLabel(CRITIC.focus))}</h3>
+        </div>
+        <span class="prov">${context.writable ? "editable focus" : "read-only"}</span>
+      </div>
+      <p class="component-desc">${esc(context.component?.description || "")}</p>
+      <div class="component-fields">${fields}</div>
+      ${checks ? `<div class="component-checks">${checks}</div>` : ""}
+      ${parts ? `<div class="component-parts">${parts}</div>` : ""}
+      ${notes}`;
+  } else {
+    focusBox.innerHTML = `<div class="component-head">
+        <div><span class="eyebrow">Selected component</span><h3>Whole design</h3></div>
+      </div>
+      <p class="component-desc">No component is selected, so conversational edits are
+      allowed across the whole writable specification. Select a part in the 3-D viewer
+      to scope the next edit to that component.</p>`;
+  }
+
+  axesBox.innerHTML = (report.axes || []).map((axis, axisIndex) => {
+    const score = Number(axis.score || 0);
+    const metrics = (axis.metrics || []).map((metric) => {
+      const unit = metric.unit ? ` ${esc(metric.unit)}` : "";
+      return `<div class="metric ${esc(metric.provenance || "calculated")}">
+        <span>${esc(metric.label)}</span>
+        <b>${esc(metric.value ?? "—")}${unit}</b>
+        <em>${esc(metric.provenance || "calculated")}</em>
+      </div>`;
+    }).join("");
+    const findings = (axis.findings || []).map((finding) => {
+      const focus = finding.in_focus ? " in-focus" : "";
+      const owner = finding.component ? `<span class="finding-owner">${esc(finding.component)}</span>` : "";
+      return `<li class="finding ${esc(finding.kind || "note")}${focus}">
+        <span>${esc(finding.text || "")}</span>
+        <span class="finding-meta">${owner}<em>${esc(finding.confidence || "calculated")}</em></span>
+      </li>`;
+    }).join("");
+    const fixes = (axis.fixes || []).map((fix, fixIndex) => {
+      const current = fix.current === null || fix.current === undefined
+        ? "" : ` <small>(now ${esc(fix.current)})</small>`;
+      return `<button class="btn small critic-fix${fix.in_focus ? " in-focus" : ""}"
+        data-critic-fix="${axisIndex}:${fixIndex}"
+        title="${esc(fix.reason || "")}">
+        ${esc(fix.label || `Set ${fix.path}`)}${current}
+      </button>`;
+    }).join("");
+    return `<section class="critic-axis">
+      <div class="axis-head">
+        <div>
+          <h4>${esc(axis.label || axis.id)}</h4>
+          <span class="prov">${esc(axis.confidence || "calculated")}</span>
+        </div>
+        <div class="axis-score ${esc(axis.band || "")}"><b>${esc(axis.score)}</b><span>${esc(axis.band || "")}</span></div>
+      </div>
+      <div class="score-bar"><i style="width:${Math.max(0, Math.min(100, score))}%"></i></div>
+      <p class="axis-summary">${esc(axis.summary || "")}</p>
+      ${findings ? `<ul class="findings">${findings}</ul>` : ""}
+      ${metrics ? `<details class="axis-metrics"><summary>Metrics (${(axis.metrics || []).length})</summary>${metrics}</details>` : ""}
+      ${fixes ? `<div class="axis-fixes">${fixes}</div>` : ""}
+    </section>`;
+  }).join("");
+
+  const notes = (report.notes || []).map((note) => `<li>${esc(note)}</li>`).join("");
+  notesBox.innerHTML = `<h4>How to read this report</h4><ul>${notes}</ul>`;
+}
+
+async function applyCriticFix(axisIndex, fixIndex) {
+  const axis = CRITIC.report?.axes?.[Number(axisIndex)];
+  const fix = axis?.fixes?.[Number(fixIndex)];
+  if (!fix) return;
+  if (fix.confidence === "estimated") {
+    toast(`applying estimated fix: ${fix.path} = ${fix.value}`);
+  } else {
+    toast(`applying calculated fix: ${fix.path} = ${fix.value}`);
+  }
+  await setField(fix.path, fix.value);
+  await refreshCritic();
+}
+
 /* -------------------------------------------------------------- package */
 function renderPackage() {
   const holder = $("#packageBody");
@@ -2654,6 +2875,14 @@ function onGlobalClick(event) {
   if (event.target.closest("[data-close-provider]")) { closeProviders(); return; }
   const clearPart = event.target.closest("[data-part-clear]");
   if (clearPart) { clearPartSelection(); return; }
+  const focusClear = event.target.closest("[data-focus-clear]");
+  if (focusClear) { clearPartSelection(); return; }
+  const criticFix = event.target.closest("[data-critic-fix]");
+  if (criticFix) {
+    const [axisIndex, fixIndex] = String(criticFix.dataset.criticFix || "").split(":");
+    applyCriticFix(axisIndex, fixIndex);
+    return;
+  }
   const panelToggle = event.target.closest("[data-panel-toggle]");
   if (panelToggle) {
     const side = panelToggle.dataset.panelToggle;
@@ -2754,6 +2983,7 @@ function switchTab(name) {
     button.classList.toggle("active", button.dataset.tab === name));
   $$(".tab-panel").forEach((panel) =>
     panel.classList.toggle("active", panel.id === `tab-${name}`));
+  if (name === "critic" && !CRITIC.report && !CRITIC.loading) refreshCritic();
 }
 
 /* --------------------------------------------------------------- viewer */
@@ -2772,7 +3002,12 @@ function bindViewerBridge() {
   if (typeof window?.addEventListener !== "function") return;
   window.addEventListener("watchcad:select-part", (event) => {
     const detail = event.detail;
-    if (!detail || !detail.name) { clearPartSelection(); return; }
+    if (!detail || !detail.name) {
+      setComponentFocus(null);
+      if (V.selected !== null) clearPartSelection();
+      return;
+    }
+    setComponentFocus(detail);
     const index = (V.mesh?.ranges || []).findIndex((range) => range.name === detail.name);
     if (index >= 0) {
       V.selected = index;
@@ -3479,7 +3714,10 @@ function updateViewerCursor() {
 }
 
 function clearPartSelection() {
-  if (V.selected === null) return;
+  if (V.selected === null) {
+    setComponentFocus(null);
+    return;
+  }
   V.selected = null;
   updatePartHud();
   updateViewerCursor();

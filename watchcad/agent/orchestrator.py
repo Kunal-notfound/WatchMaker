@@ -17,6 +17,7 @@ import json
 import threading
 
 from .. import llm as llm_module
+from ..components import resolve_component
 from ..llm import LLMConfig, LLMError, LLMReply
 from ..schema import Spec
 from .context import AgentCancelled, AgentTimeout, RunControl
@@ -56,6 +57,7 @@ class RunOptions:
     max_tool_rounds: int = 8
     name: str | None = None
     build_root: str | None = None
+    focus: str = ""
 
 
 class AgentOrchestrator:
@@ -76,11 +78,13 @@ class AgentOrchestrator:
     def run(self, request: str, *, mode: str = "autonomous",
             use_llm: bool | None = None, max_iterations: int = 3,
             max_tool_rounds: int = 8, name: str | None = None,
-            emit=None, control: RunControl | None = None) -> AgentRunResult:
+            emit=None, control: RunControl | None = None,
+            focus: str = "") -> AgentRunResult:
         options = RunOptions(mode=normalize_mode(mode), use_llm=use_llm,
                              max_iterations=max(0, min(8, int(max_iterations))),
                              max_tool_rounds=max(1, min(16, int(max_tool_rounds))),
-                             name=name, build_root=self.build_root)
+                             name=name, build_root=self.build_root,
+                             focus=focus or "")
         return self._run(request, options, emit=emit, control=control)
 
     # -- setup ------------------------------------------------------------
@@ -116,7 +120,8 @@ class AgentOrchestrator:
 
             # Local plan always exists: it is the fallback and the budget bound.
             plan = plan_local(request, self.studio, self.session,
-                              mode=options.mode, use_llm=False)
+                              mode=options.mode, use_llm=False,
+                              focus=options.focus or None)
             state.plan = [step.to_dict() for step in plan.steps]
             if plan.notes:
                 state.notes.extend(plan.notes)
@@ -127,7 +132,8 @@ class AgentOrchestrator:
             self._executor = ToolExecutor(
                 studio=self.studio, session=self.session, emit=self._emit,
                 control=control, build_root=options.build_root or self.build_root,
-                approval_mode=options.mode, max_calls=90)
+                approval_mode=options.mode, max_calls=90,
+                focus=options.focus or None)
             executor = self._executor
 
             final_text = ""
@@ -251,14 +257,23 @@ class AgentOrchestrator:
     def _llm_loop(self, request: str, state: AgentState, executor: ToolExecutor,
                   intent: Intent, options: RunOptions, control: RunControl) -> str:
         memory = self.session.memory
+        context = context_message(
+            self.studio.solved.summary(),
+            mode=options.mode, engine="rules+llm",
+            history=json.dumps(memory.to_dict(), default=str)[:1800],
+            constraints=memory.constraints,
+            locks=sorted(self.studio.spec.locks))
+        focused = resolve_component(options.focus) if options.focus else None
+        if focused is not None:
+            context += (
+                f"\nACTIVE COMPONENT FOCUS: {focused.label} ({focused.id}). "
+                f"Mutating tools may only write: "
+                f"{', '.join(focused.fields) or 'no fields'}. Out-of-scope writes "
+                f"are refused; report the refusal and ask the user to clear the "
+                f"selection or pick the owning component.")
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "system", "content": context_message(
-                self.studio.solved.summary(),
-                mode=options.mode, engine="rules+llm",
-                history=json.dumps(memory.to_dict(), default=str)[:1800],
-                constraints=memory.constraints,
-                locks=sorted(self.studio.spec.locks))},
+            {"role": "system", "content": context},
         ]
         messages.extend(self.session.conversation.as_llm_messages(10))
         messages.append({"role": "user", "content": request})
@@ -621,13 +636,14 @@ def run_agent(session, request: str, *, mode: str = "autonomous",
               use_llm: bool | None = None, max_iterations: int = 3,
               emit=None, control: RunControl | None = None,
               llm_client=None, llm_config: LLMConfig | None = None,
-              build_root: str | None = None) -> AgentRunResult:
+              build_root: str | None = None,
+              focus: str = "") -> AgentRunResult:
     orchestrator = AgentOrchestrator(session, llm_client=llm_client,
                                      llm_config=llm_config,
                                      build_root=build_root)
     return orchestrator.run(request, mode=mode, use_llm=use_llm,
                             max_iterations=max_iterations, emit=emit,
-                            control=control)
+                            control=control, focus=focus)
 
 
 def apply_variant(session, variant: dict, *, mode: str = "autonomous",

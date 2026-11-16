@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 from .. import llm as llm_module
 from ..llm import LLMConfig, LLMError, LLMNotConfigured, LLMReply, user_content
+from ..components import component_context, resolve_component
 from ..nlp import describe
 from ..schema import FIELDS, Spec
 from ..store import ConversationStore, transcript_text
@@ -168,13 +169,15 @@ class ConversationRuntime:
         self._emit_callback: Callable[[dict], None] | None = None
         self._timeline: list[dict] = []
         self._state: AgentState | None = None
+        self._focus: str = ""
 
     # -- public -----------------------------------------------------------
     def run(self, message: str, *, images: list[str] | None = None,
             mode: str = "safe", use_llm: bool | None = None,
             max_tool_rounds: int = 12, emit=None,
             control: RunControl | None = None, regenerate: bool = False,
-            edit_message_id: str = "") -> ChatTurnResult:
+            edit_message_id: str = "", focus: str = "") -> ChatTurnResult:
+        self._focus = focus or ""
         conversation = self.store.get_conversation(self.conversation_id)
         if conversation is None:
             conversation = self.store.ensure_conversation(
@@ -300,7 +303,7 @@ class ConversationRuntime:
         executor = ToolExecutor(studio=self.studio, session=self.session,
                                 emit=self._tool_event, control=control,
                                 build_root=self.build_root, approval_mode=mode,
-                                max_calls=120)
+                                max_calls=120, focus=self._focus)
         messages = self._messages(message, images)
         tools = openai_tools()
         usage: dict = {}
@@ -478,7 +481,8 @@ class ConversationRuntime:
                 build_root=self.build_root)
             run = orchestrator.run(message, mode=mode, use_llm=False,
                                    max_iterations=3, max_tool_rounds=8,
-                                   emit=self._orchestrator_event, control=control)
+                                   emit=self._orchestrator_event, control=control,
+                                   focus=self._focus)
             state = run.state
             result.intent = state.intent or intent.name
             result.text = run.response
@@ -701,6 +705,24 @@ class ConversationRuntime:
         context += ("\nWritable field groups: " + ", ".join(
             sorted({path.split(".")[0] for path in FIELDS}))
             + ". Use get_current_spec for exact paths and current values.")
+        focused = resolve_component(self._focus) if self._focus else None
+        if focused is not None:
+            owned = ", ".join(focused.fields) or "none"
+            try:
+                detail = component_context(self.studio, focused.id)
+                values = ", ".join(
+                    f"{row['path']}={row['value']!r}" for row in detail["fields"])
+            except Exception:  # noqa: BLE001 - context is advisory
+                values = ""
+            context += (
+                f"\nACTIVE COMPONENT FOCUS: {focused.label} ({focused.id}). "
+                f"The user selected this component in the 3-D viewer. Mutating "
+                f"tools may only write these fields: {owned}. A write outside "
+                f"this scope is refused; explain the refusal and ask the user to "
+                f"clear the selection or pick the owning component instead. "
+                f"Do not claim a change was made when the tool refused it."
+                + (f" Current values: {values}." if values else "")
+            )
         messages = [
             {"role": "system", "content": CONVERSATION_SYSTEM_PROMPT},
             {"role": "system", "content": context},

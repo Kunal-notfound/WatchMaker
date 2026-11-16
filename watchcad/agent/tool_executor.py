@@ -163,6 +163,7 @@ class ToolExecutor:
     approval_mode: str = "autonomous"
     max_calls: int = 80
     iteration: int = 0
+    focus: object = None
 
     working: ShadowStudio | None = field(default=None, init=False)
     calls: list[ToolResult] = field(default_factory=list, init=False)
@@ -253,7 +254,8 @@ class ToolExecutor:
                                             "call_id": call.call_id})
         ctx = ToolContext(studio=target, session=self.session,
                           build_root=self.build_root, emit=self.emit,
-                          control=self.control, max_calls=self.max_calls)
+                          control=self.control, max_calls=self.max_calls,
+                          focus=self.focus)
         try:
             data = HANDLERS[name](ctx, **arguments)
             result = ToolResult(name=name, ok=True, call_id=call.call_id,

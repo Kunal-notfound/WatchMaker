@@ -41,7 +41,7 @@ python3 -m watchcad export dress.json --format pdf -o out/dress.pdf
 Run the test suite:
 
 ```bash
-python3 -m unittest discover -s tests -v     # 98 tests, ~30 s
+python3 -m unittest discover -s tests -v     # 119 tests, ~33 s
 
 # browser smoke test (Node 18+, no npm packages)
 python3 -m watchcad serve --port 8766 &
@@ -354,7 +354,7 @@ are still stored with the message, and the reply explains the limitation.
 
 | method | path | body / query |
 |---|---|---|
-| POST | `/api/chat` | `{conversation_id?, message, images?, mode?, use_llm?, stream?, regenerate?, edit_message_id?}` |
+| POST | `/api/chat` | `{conversation_id?, message, images?, mode?, use_llm?, stream?, regenerate?, edit_message_id?, component?}` |
 | POST | `/api/chat/stop` | `{conversation_id?, run_id?}` → cancel active runs |
 | POST | `/api/chat/approve` | `{conversation_id, token}` → apply a staged chat change |
 | POST | `/api/chat/reject` | `{conversation_id, token}` → discard a staged chat change |
@@ -387,7 +387,7 @@ or executable code. Each step is a validated tool call:
 
 | kind | tools |
 |---|---|
-| read | `get_current_spec`, `get_verification_report`, `inspect_component`, `get_field_dependencies`, `compare_specs`, `get_design_history`, `inspect_geometry` |
+| read | `get_current_spec`, `get_verification_report`, `inspect_component`, `get_component_context`, `critique_design`, `get_field_dependencies`, `compare_specs`, `get_design_history`, `inspect_geometry` |
 | act | `update_spec`, `apply_patch`, `run_solver`, `run_verification`, `build_package` |
 
 Acting tools run on a shadow copy of the spec. The live design is replaced only
@@ -395,6 +395,35 @@ after the solver and verifier have run, and a failed attempt is rolled back.
 Locked fields are refused by the tool executor itself, not merely by the prompt.
 The loop is bounded (three repair iterations by default, configurable) and every
 run reports the verification summary before and after the change.
+
+### Component focus and the design critic
+
+Selecting a part in the 3-D viewer (or its row in the HUD) sets a **component
+focus**. The focus resolves scene part names, roles, viewer groups, aliases and
+dotted fields through one registry (`watchcad/components.py`), for example
+`crown`, `hour_hand`, `crystal_gasket`, `movement.complications.date` or the
+`Crown` label. While a focus is active:
+
+- chat and agent requests carry that selection, and mutating tools refuse any
+  field the component does not own. The refusal names both components instead of
+  silently editing the whole watch;
+- the Critic tab shows the component's writable fields, values, locks, related
+  verification checks and scene parts;
+- clearing the selection returns edits to the whole design.
+
+The **Critic** tab renders `watchcad/critic.py`: five deterministic axes —
+proportions, dial legibility, aesthetic coherence, ergonomics and component
+consistency. Every score and metric is computed from the solved spec, scene and
+verification checks. Dial legibility and aesthetic coherence are explicitly
+`estimated` heuristics, not AI taste claims; the other axes are `calculated`.
+The report offers only schema-valid, unlocked safe fixes and never mutates the
+design by itself. A language model may explain the report, but it does not
+produce its numbers.
+
+Known limits: the critic is a rubric, not a physical test or a production gate;
+contrast is a WCAG calculation on modelled colours, not a lighting measurement;
+mass is an envelope estimate; and `small_seconds` still renders as a central
+second hand in the mesh builder.
 
 ### Autonomy modes
 
@@ -439,6 +468,8 @@ uses only these endpoints, so scripts can drive the same session:
 | GET | `/api/state` | spec, checks, summary, scene stats, derivation report |
 | GET | `/api/schema` | field registry, groups, complications, presets, ideas |
 | GET | `/api/scene` | per-part vertices/faces for the software renderer |
+| GET | `/api/component/context` | `?component=<id, alias, part, role, group or field>` → fields, locks, checks, parts and bounds |
+| GET | `/api/critic` | `?component=<optional selection>` → deterministic five-axis report and safe fixes |
 | GET | `/api/model.glb` | binary glTF assembly for the Three.js preview |
 | GET | `/api/builds` | last build manifest |
 | POST | `/api/prompt` | `{prompt, use_llm}` → applied patches, questions, state |
@@ -472,7 +503,7 @@ Agent and session endpoints:
 
 | method | path | body / query |
 |---|---|---|
-| POST | `/api/agent/run` | `{prompt, mode?, use_llm?, max_iterations?, stream?}`; streaming returns SSE frames |
+| POST | `/api/agent/run` | `{prompt, mode?, use_llm?, max_iterations?, stream?, component?}`; streaming returns SSE frames |
 | POST | `/api/agent/approve` | `{token}` → apply a staged change |
 | POST | `/api/agent/reject` | `{token?}` → discard a staged change |
 | POST | `/api/agent/cancel` | `{run_id?}` → stop a running loop |
@@ -579,6 +610,8 @@ watchcad/
   mesh.py        dependency-free mesh kernel + STL/OBJ/glTF/GLB writers
   parts.py       every component builder; build_scene()
   verify.py      layered checks, same-plane collision, fixes
+  components.py  component registry, selection resolver, field/check/part scope
+  critic.py      deterministic five-axis design critic and safe fixes
   optimise.py    deterministic candidate field, metrics, ranking, provenance
   providers.py   BYOK presets, session key vault, capability probes
   drawing.py     SVG, ASCII DXF and hand-written PDF from one canvas
@@ -612,6 +645,7 @@ tests/
   test_chat.py                   conversational runtime/API tests
   test_optimise.py               optimisation determinism, provenance, schema safety
   test_providers.py              key isolation, redaction, probe and provider API
+  test_increment_a.py            component focus, scoped edits, critic determinism/API
   ui_smoke.js                    dependency-free browser/API smoke harness
 examples/                         seven verified specs
 ```
@@ -705,10 +739,10 @@ The suite covers the parts that must not silently break:
 The UI was exercised headlessly with Node against the real API (boot, chat SSE
 stream, attachments, history sidebar, settings, message edit/regenerate/delete,
 chat approval, copilot brief, undo, number steppers, explode 0–250%, deep zoom,
-per-part picking, opaque materials, gear/layer views, zoom, projection sanity)
-and in real Firefox through Marionette (rendered screenshots, stepper click,
-copilot brief, hover + part selection, sidebar close/reopen with persistence,
-zero runtime errors).
+per-part picking, component focus chip, the five-axis critic panel, critic fixes,
+opaque materials, gear/layer views, zoom, projection sanity) and in real Firefox
+through Marionette (rendered screenshots, stepper click, copilot brief, hover +
+part selection, sidebar close/reopen with persistence, zero runtime errors).
 
 ---
 
