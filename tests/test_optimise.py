@@ -84,6 +84,70 @@ class OptimiseTests(unittest.TestCase):
                 self.assertIn(change["path"], optimise.FIELDS)
                 self.assertNotIn(change["path"], self.spec.locks)
 
+    def test_mixed_direction_objective_vector(self):
+        item = {"metrics": {"mass_g": 100.0, "stack_margin_mm": 0.4}}
+        vector = optimise.objective_vector(item, ["weight", "tolerance"])
+        self.assertEqual(vector, (100.0, -0.4))
+        self.assertEqual(optimise.OBJECTIVE_META["tolerance"]["direction"], "max")
+        self.assertEqual(optimise.OBJECTIVE_META["weight"]["direction"], "min")
+
+    def test_pareto_dominance_fronts_and_crowding(self):
+        items = [
+            {"id": "a", "metrics": {"mass_g": 10.0}},
+            {"id": "b", "metrics": {"mass_g": 12.0}},
+            {"id": "c", "metrics": {"mass_g": 8.0}},
+        ]
+        axes = ["weight"]
+        self.assertTrue(optimise.dominates(items[2], items[0], axes))
+        self.assertFalse(optimise.dominates(items[0], items[2], axes))
+        fronts = optimise.non_dominated_sort(items, axes)
+        self.assertEqual([item["id"] for item in fronts[0]], ["c"])
+        self.assertEqual([item["id"] for item in fronts[1]], ["a"])
+        self.assertEqual([item["id"] for item in fronts[2]], ["b"])
+        crowd = optimise.crowding_distance(items, axes)
+        self.assertGreater(crowd["c"], 0)
+        self.assertGreater(crowd["a"], 0)
+
+    def test_hard_constraints_are_reported_separately(self):
+        result = optimise.run(self.spec, "weight", 6, axes=["weight", "cost"])
+        baseline = next(item for item in result["candidates"] if item["id"] == "baseline")
+        ids = [row["id"] for row in baseline["constraints"]]
+        self.assertIn("schema", ids)
+        self.assertIn("verification", ids)
+        self.assertIn("locks", ids)
+        self.assertTrue(baseline["feasible"])
+        for item in result["candidates"]:
+            self.assertIsInstance(item["feasible"], bool)
+            self.assertTrue(item["pareto_rank"] is None
+                            or isinstance(item["pareto_rank"], int))
+            self.assertIsInstance(item["dominates"], list)
+
+    def test_invalid_candidate_is_rejected_without_mutating_baseline(self):
+        before = self.spec.get("derived.checksum")
+        evaluated = optimise.evaluate(
+            self.spec,
+            {"id": "bad", "label": "Bad", "changes": [
+                {"path": "case.diameter_mm", "value": 999},
+            ]},
+            "weight")
+        self.assertFalse(evaluated["feasible"])
+        self.assertTrue(any(row["status"] == "FAIL"
+                            for row in evaluated["constraints"]))
+        self.assertEqual(self.spec.get("derived.checksum"), before)
+
+    def test_reproducibility_report_is_stable_and_axis_aware(self):
+        first = optimise.run(self.spec, "cost", 6, axes=["weight", "cost"])
+        second = optimise.run(self.spec, "cost", 6, axes=["weight", "cost"])
+        other = optimise.run(self.spec, "cost", 6, axes=["weight", "tolerance"])
+        self.assertEqual(first["reproducibility"]["seed"],
+                         second["reproducibility"]["seed"])
+        self.assertNotEqual(first["reproducibility"]["seed"],
+                            other["reproducibility"]["seed"])
+        self.assertTrue(first["reproducibility"]["deterministic"])
+        self.assertIn("no global", first["provenance"]["claim"].lower())
+        self.assertEqual(first["axes"], ["weight", "cost"])
+        self.assertEqual(first["frontier"], first["frontiers"][0]["ids"])
+
 
 if __name__ == "__main__":
     unittest.main()

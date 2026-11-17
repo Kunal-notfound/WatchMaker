@@ -230,8 +230,11 @@ class SolverTests(unittest.TestCase):
 class PartsTests(unittest.TestCase):
     def test_hands_sit_above_the_dial(self):
         scene = build_scene(solved())
+        # The rehaut (inner flange) rises to the crystal at the dial edge, so it
+        # is not the dial surface the hands sweep over.  Every other dial part —
+        # plate, indices, minute track, date frame — must stay below the hands.
         dial_top = max(part.bounds()["max"][2] for part in scene["parts"]
-                       if part.role == "dial")
+                       if part.role == "dial" and part.name != "rehaut")
         hands = [part for part in scene["parts"] if part.role == "hand"]
         self.assertTrue(hands)
         lowest_hand = min(part.bounds()["min"][2] for part in hands)

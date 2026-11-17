@@ -253,6 +253,39 @@ class ProviderApiTests(unittest.TestCase):
         self.assertFalse(first["provenance"]["model_used"])
         self.assertEqual(first["objective"], "weight")
 
+    def test_optimise_endpoint_reports_pareto_and_constraints(self):
+        result = self.request("/api/optimise", {
+            "objective": "tolerance", "budget": 6,
+            "axes": ["weight", "tolerance"],
+        })
+        self.assertEqual(result["axes"], ["weight", "tolerance"])
+        self.assertEqual(result["objectives"]["tolerance"]["direction"], "max")
+        self.assertTrue(result["frontier"])
+        self.assertTrue(result["reproducibility"]["seed"])
+        for item in result["candidates"]:
+            self.assertTrue(item["constraints"])
+            self.assertIn("feasible", item)
+
+    def test_optimise_preview_does_not_mutate_live_design(self):
+        import urllib.request
+
+        before = api.STUDIO.solved.get("derived.checksum")
+        result = self.request("/api/optimise", {"objective": "weight", "budget": 6})
+        candidate = next(item for item in result["candidates"]
+                         if item["changes"])
+        preview = self.request("/api/optimise/preview", {
+            "changes": candidate["changes"],
+            "baseline_checksum": result["baseline_checksum"],
+            "label": candidate["label"],
+        })
+        self.assertTrue(preview["preview"])
+        self.assertEqual(api.STUDIO.solved.get("derived.checksum"), before)
+        url = f"http://127.0.0.1:{self.port}/api/model.glb?preview={preview['preview']}"
+        with urllib.request.urlopen(url, timeout=30) as response:
+            self.assertEqual(response.headers.get_content_type(), "model/gltf-binary")
+            self.assertEqual(response.read()[:4], b"glTF")
+        self.assertEqual(api.STUDIO.solved.get("derived.checksum"), before)
+
 
 if __name__ == "__main__":
     unittest.main()

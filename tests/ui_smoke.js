@@ -45,6 +45,10 @@ class El {
     this.listeners = {};
     this.lastElementChild = { innerHTML: "" };
   }
+  get options() {
+    return [...this.innerHTML.matchAll(/<option value="([^"]+)"/g)]
+      .map((match) => ({ value: match[1] }));
+  }
   addEventListener(type, fn) { (this.listeners[type] ||= []).push(fn); }
   removeEventListener() {}
   setPointerCapture() {}
@@ -134,7 +138,8 @@ const source = fs.readFileSync(appPath, "utf8")
     sendChat, newChat, loadConversations, toggleSettings, toggleChatHistory,
     deleteChatMessage, renderAttachments, attachImages,
     saveProvider, removeProvider, currentSession,
-    runOptimisation, applyCandidate, onGlobalClick,
+    runOptimisation, applyCandidate, onGlobalClick, renderOptimisation,
+    previewCandidate, armCandidateApply, clearCandidatePreview,
     refreshCritic, setComponentFocus, renderCritic, applyCriticFix,
     get CRITIC() { return CRITIC; },
     get AGENT() { return AGENT; }, get DESIGN() { return DESIGN; },
@@ -445,7 +450,28 @@ const waitFor = async (fn, label, timeout = 15000) => {
     "baseline card cannot be applied");
   const winner = (opt?.candidates || []).find((item) => item.id === opt.winner);
   check(Boolean(winner) && winner.status === "ok", `winner is solvable (${winner?.label})`);
+  check(el("optimiseAxisX").options.length >= 5 && el("optimiseAxisY").options.length >= 5,
+    "scatter axis selectors expose every objective");
+  check(el("optimiseScatter").innerHTML.includes("opt-point"),
+    "scatter renders candidate points");
+  check(el("optimiseScatter").innerHTML.includes("frontier"),
+    "scatter separates the Pareto frontier from dominated points");
+  t.onGlobalClick(fakeClick({
+    "[data-inspect-candidate]": { dataset: { inspectCandidate: winner.id } },
+  }));
+  check(el("candidateDetail").innerHTML.includes("Hard constraints"),
+    "inspection shows hard constraints separately from objectives");
+  check(el("candidateDetail").innerHTML.includes(winner.label),
+    "inspection names the selected candidate");
   if (winner?.status === "ok" && winner.changes?.length) {
+    t.armCandidateApply(winner.id);
+    check(el("candidateDetail").innerHTML.includes("Confirm apply"),
+      "applying requires an explicit confirmation step");
+    await t.previewCandidate(winner.id);
+    check(Boolean(t.DESIGN.previewId) && el("btnClearPreview").hidden === false,
+      "candidate preview loads a non-mutating 3D scene");
+    t.clearCandidatePreview();
+    check(!t.DESIGN.previewId, "clearing preview restores the live design view");
     const beforeChecksum = t.STATE.spec.data.derived.checksum;
     const applied = winner.applied || [];
     await t.applyCandidate(winner.id);

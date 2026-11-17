@@ -66,6 +66,7 @@ COMPONENTS: dict[str, Component] = {
             "case.diameter_mm", "case.lug_to_lug_mm", "case.thickness_mm",
             "case.lug_width_mm", "case.lug_count", "case.material",
             "case.finish", "case.water_resistance_m",
+            "case.movement_mounting",
         ),
         checks=(
             "geometry.movement_fit", "geometry.dial_fit", "geometry.stack",
@@ -93,7 +94,7 @@ COMPONENTS: dict[str, Component] = {
         "The crown, tube and pushers. Screw-down construction is required by the "
         "manufacturability check at high water resistance; crown diameter is an "
         "ergonomic variable.",
-        fields=("case.crown", "case.crown_diameter_mm"),
+        fields=("case.crown", "case.crown_diameter_mm", "case.crown_height_mm"),
         checks=("dfm.water_resistance",),
         parts=("crown", "crown_tube", "pusher"),
         aliases=("crown", "crown_tube", "tube", "pusher", "pushers",
@@ -169,7 +170,8 @@ COMPONENTS: dict[str, Component] = {
         "train, escapement, bridges and (for quartz) the electronic module. "
         "Complications are a separate component.",
         fields=(
-            "movement.kind", "movement.base_calibre", "movement.width_mm",
+            "movement.kind", "movement.manufacturer", "movement.base_calibre",
+            "movement.calibre_id", "movement.width_mm",
             "movement.height_mm", "movement.beat_rate_bph",
             "movement.power_reserve_h", "movement.jewels", "movement.winding",
             "movement.escape_wheel_teeth", "movement.usable_barrel_turns",

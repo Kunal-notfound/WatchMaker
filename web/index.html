@@ -76,14 +76,14 @@
           <h2>Optimisation Lab</h2>
           <span class="design-verified" title="Candidates are solved and verified, not predicted by a model">deterministic</span>
         </div>
-        <p class="design-intro">Search real specification changes for one objective. Each candidate is solved, meshed and verified; failed candidates stay visible.</p>
+        <p class="design-intro">Compare real, deterministic specification changes on a Pareto frontier. Each candidate is solved, meshed and verified. Hard constraints are reported separately from objectives; the finite probe field makes no global-optimality claim.</p>
         <div class="design-grid">
           <label>Objective
             <select id="optimiseObjective">
               <option value="weight">Minimum weight</option>
-              <option value="cost">Minimum material cost</option>
+              <option value="cost">Minimum estimated unit cost</option>
               <option value="manufacturability">Manufacturability</option>
-              <option value="tolerance">Tolerance risk</option>
+              <option value="tolerance">Maximum stack margin</option>
               <option value="assembly">Assembly simplicity</option>
             </select>
           </label>
@@ -94,13 +94,26 @@
               <option value="12">12 candidates</option>
             </select>
           </label>
+          <label>Scatter X axis
+            <select id="optimiseAxisX"></select>
+          </label>
+          <label>Scatter Y axis
+            <select id="optimiseAxisY"></select>
+          </label>
         </div>
         <div class="design-actions">
           <button id="btnOptimise" class="btn small primary">Run optimisation</button>
+          <button id="btnClearPreview" class="btn small" hidden>Return to current design</button>
         </div>
         <div id="optimiseStatus" class="optimise-status">Not run yet. The current design is the baseline.</div>
+        <div class="optimise-viz">
+          <svg id="optimiseScatter" viewBox="0 0 360 250" role="img"
+               aria-label="Pareto frontier scatter plot"></svg>
+          <div id="optimiseLegend" class="optimise-legend"></div>
+        </div>
         <div id="candidateList" class="candidate-list"></div>
-        <p class="design-note">Labels: <b>calculated</b> from geometry and the BOM; <b>estimated</b> where a cost or process assumption is involved. Nothing here is physically measured.</p>
+        <div id="candidateDetail" class="candidate-detail"></div>
+        <p class="design-note">Labels: <b>calculated</b> from geometry and the BOM; <b>estimated</b> where a cost or process assumption is involved. Nothing here is physically measured. The winner is a recommendation from a finite probe set, not a proven optimum.</p>
       </section>
 
       <div id="engineeringPanel" class="workspace-panel">
@@ -116,12 +129,30 @@
           <button class="btn small" data-view="layers">Layers</button>
           <button class="btn small" data-view="reset">Fit</button>
         </div>
+        <div class="view-actions render-presets">
+          <label>Render
+            <select id="renderQuality" title="Geometry detail and texture budget">
+              <option value="low">Low · integrated GPU</option>
+              <option value="medium">Medium · interactive</option>
+              <option value="high">High · presentation</option>
+            </select>
+          </label>
+          <label>Backdrop
+            <select id="renderBackground" title="Camera background preset">
+              <option value="studio">Studio</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+              <option value="blueprint">Blueprint</option>
+            </select>
+          </label>
+        </div>
       </section>
 
       <nav class="tabs">
         <button data-tab="spec" class="active">Spec</button>
         <button data-tab="checks">Checks <span id="checkCount"></span></button>
         <button data-tab="critic">Critic</button>
+        <button data-tab="movement">Movement</button>
         <button data-tab="package">Package</button>
         <button class="tab-close" data-close="left" title="Close the specs sidebar" aria-label="Close specs sidebar">×</button>
       </nav>
@@ -145,6 +176,33 @@
 
       <div id="tab-package" class="tab-panel">
         <div id="packageBody"></div>
+      </div>
+
+      <div id="tab-movement" class="tab-panel">
+        <p class="movement-intro">Manufacturer-published calibres only. A blank value means the retained source does not publish it, not zero. Fit results are deterministic checks, not a manufacturing release.</p>
+        <div class="movement-filters">
+          <input id="movementSearch" type="search" placeholder="maker or calibre" aria-label="Search movements">
+          <div class="movement-filter-row">
+            <select id="movementMaker" aria-label="Filter by manufacturer"><option value="">All makers</option></select>
+            <select id="movementType" aria-label="Filter by movement type">
+              <option value="">All types</option>
+              <option value="automatic">Automatic</option>
+              <option value="manual">Manual</option>
+              <option value="quartz">Quartz</option>
+            </select>
+          </div>
+          <div class="movement-filter-row">
+            <label>Ø min <input id="movementMinDiameter" type="number" step="0.1" min="0" placeholder="mm"></label>
+            <label>Ø max <input id="movementMaxDiameter" type="number" step="0.1" min="0" placeholder="mm"></label>
+            <label>H max <input id="movementMaxThickness" type="number" step="0.1" min="0" placeholder="mm"></label>
+          </div>
+          <div class="movement-filter-row">
+            <button id="btnMovementSearch" class="btn small">Search</button>
+            <label class="movement-check"><input id="movementUnknown" type="checkbox"> include unknown dimensions</label>
+          </div>
+        </div>
+        <div id="movementList" class="movement-list"></div>
+        <div id="movementDetail" class="movement-detail"></div>
       </div>
       </div>
       </div>

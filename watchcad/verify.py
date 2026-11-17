@@ -35,6 +35,8 @@ def verify(spec: Spec, scene: dict | None = None) -> list[dict]:
 
     checks += _spec_checks(spec)
     checks += _geometry_checks(spec, scene, train, stack)
+    if scene:
+        checks += _scene_checks(spec, scene, stack)
     if spec.get("movement.kind") == "mechanical":
         checks += _kinematics_checks(spec, train)
         checks += _energy_checks(spec, train, barrel, torque)
@@ -187,6 +189,179 @@ def _geometry_checks(spec, scene, train, stack) -> list[dict]:
                          tooth_ok, "calculated",
                          ", ".join(f"{s['wheel_teeth']}/{s['pinion_teeth']}"
                                    for s in train.get("stages", []))))
+    return out
+
+
+def _scene_checks(spec: Spec, scene: dict, stack: dict) -> list[dict]:
+    """Integrity checks over the *generated* mesh scene.
+
+    These catches the failure modes a pure formula check cannot see: a part
+    builder forgot a component, a mesh is empty or non-finite, a part ends up
+    outside the case envelope, or the layer order is wrong.  The collision test
+    is an axis-aligned envelope test on known-adjacent parts, not a solid-kernel
+    boolean; it can miss sub-millimetre interferences and cannot certify a
+    manufacturing fit.
+    """
+    parts = [p for p in (scene.get("parts") or []) if getattr(p, "name", "")]
+    out: list[dict] = []
+    if not parts:
+        out.append(check("geometry.scene_present", "geometry", "Mesh scene was generated",
+                         False, "calculated", "build_scene returned no parts"))
+        return out
+    names = {p.name for p in parts}
+    by_name = {p.name: p for p in parts}
+    mechanical = spec.get("movement.kind") == "mechanical"
+
+    required = ["case_mid", "bezel", "caseback", "crystal", "dial",
+                "hour_hand", "minute_hand", "second_hand",
+                "mainplate" if mechanical else "quartz_module"]
+    if str(spec.get("strap.material") or "none") != "none":
+        required.append("strap_link" if spec.get("strap.material") == "steel bracelet" else "strap")
+    missing = [name for name in required if name not in names]
+    out.append(check("geometry.components_present", "geometry",
+                     "Every required component was built", not missing, "calculated",
+                     "all components present" if not missing else
+                     "missing: " + ", ".join(missing),
+                     fix=None if not missing else
+                     {"message": "a part builder did not emit every required component"}))
+
+    broken = []
+    for part in parts:
+        verts = getattr(part, "verts", [])
+        faces = getattr(part, "faces", [])
+        if not verts or not faces:
+            broken.append(f"{part.name} (empty)")
+            continue
+        if any(not math.isfinite(v) for xyz in verts for v in xyz):
+            broken.append(f"{part.name} (non-finite vertex)")
+            continue
+        box = part.bounds()
+        if any(not math.isfinite(v) for axis in ("min", "max") for v in box[axis]):
+            broken.append(f"{part.name} (non-finite bounds)")
+    out.append(check("geometry.mesh_integrity", "geometry",
+                     "Every mesh has finite geometry", not broken, "calculated",
+                     f"{len(parts)} meshes checked" if not broken else
+                     "; ".join(broken[:6]),
+                     fix=None if not broken else
+                     {"message": "a mesh builder produced empty or non-finite geometry"}))
+
+    # Envelope: internal parts must stay inside the case's design envelope.
+    # Crown, pushers, lugs, spring bars and strap legitimately protrude.
+    internal = [p for p in parts
+                if p.role in ("case", "dial", "hand", "movement", "complication",
+                              "crystal", "gasket")
+                and not p.name.startswith(("crown", "pusher", "lug", "spring_bar",
+                                           "strap", "buckle"))]
+    d = float(spec.get("case.diameter_mm") or 40)
+    t = float(spec.get("case.thickness_mm") or 11)
+    limit_r = max(d / 2, float(spec.get("case.lug_to_lug_mm") or d) / 2) + 1.0
+    outside = []
+    for part in internal:
+        box = part.bounds()
+        r = max(abs(box["min"][0]), abs(box["max"][0]),
+                abs(box["min"][1]), abs(box["max"][1]))
+        if r > limit_r or box["min"][2] < -0.25 or box["max"][2] > t + 0.75:
+            outside.append(f"{part.name} r={r:.1f} z={box['min'][2]:.1f}..{box['max'][2]:.1f}")
+    out.append(check("geometry.part_envelope", "geometry",
+                     "Internal parts stay inside the design envelope",
+                     not outside, "calculated",
+                     f"{len(internal)} internal meshes inside" if not outside else
+                     "; ".join(outside[:6]),
+                     fix=None if not outside else
+                     {"message": "check case diameter/thickness against the protruding part"}))
+
+    # Positioning: the crown belongs on +X and the lugs straddle both sides.
+    position_errors = []
+    crown = by_name.get("crown")
+    if crown is not None:
+        box = crown.bounds()
+        if box["min"][0] < d / 2 - 0.4 or abs((box["min"][1] + box["max"][1]) / 2) > 4.0:
+            position_errors.append("crown is not on the 3 o'clock side")
+    if int(spec.get("case.lug_count") or 4) >= 4:
+        lug_boxes = [part.bounds() for part in parts
+                     if part.name in ("lug", "lug_root")]
+        if not lug_boxes:
+            position_errors.append("lug geometry missing")
+        else:
+            if min(box["min"][1] for box in lug_boxes) > -d / 2:
+                position_errors.append("no lug on the 12 o'clock side")
+            if max(box["max"][1] for box in lug_boxes) < d / 2:
+                position_errors.append("no lug on the 6 o'clock side")
+    out.append(check("geometry.component_position", "geometry",
+                     "Crown and lugs are on the expected sides", not position_errors,
+                     "calculated", "crown at +X, lugs at ±Y" if not position_errors
+                     else "; ".join(position_errors),
+                     fix=None if not position_errors else
+                     {"message": "regenerate the crown/lug placement"}))
+
+    # Layer order and adjacency collisions, measured on the generated bounds.
+    dial = by_name.get("dial")
+    movement = by_name.get("mainplate") or by_name.get("quartz_module")
+    crystal = by_name.get("crystal")
+    hands = [by_name[name] for name in ("hour_hand", "minute_hand", "second_hand")
+             if name in by_name]
+    order_errors = []
+    if dial is not None and movement is not None:
+        if dial.bounds()["min"][2] < movement.bounds()["max"][2] - 0.05:
+            order_errors.append("dial overlaps the movement")
+    if dial is not None and hands:
+        if min(part.bounds()["min"][2] for part in hands) <= dial.bounds()["max"][2]:
+            order_errors.append("hands are not above the dial plate")
+    if crystal is not None and hands:
+        if crystal.bounds()["min"][2] < max(part.bounds()["max"][2] for part in hands) - 0.05:
+            order_errors.append("crystal intersects the hand stack")
+    caseback = by_name.get("caseback")
+    if caseback is not None and movement is not None:
+        if movement.bounds()["min"][2] < caseback.bounds()["max"][2] - 0.05:
+            order_errors.append("movement passes through the caseback")
+    out.append(check("geometry.layer_order", "geometry",
+                     "Caseback → movement → dial → hands → crystal order holds",
+                     not order_errors, "calculated",
+                     "layer order consistent" if not order_errors else
+                     "; ".join(order_errors),
+                     fix=None if not order_errors else
+                     {"path": "case.thickness_mm",
+                      "value": round(float(stack.get("required_case_thickness_mm") or t) + 0.5, 1)}))
+
+    hand_order = []
+    if len(hands) == 3:
+        hour, minute, second = hands
+        if minute.bounds()["min"][2] < hour.bounds()["max"][2] - 0.02:
+            hand_order.append("minute hand below the hour hand")
+        if second.bounds()["min"][2] < minute.bounds()["max"][2] - 0.02:
+            hand_order.append("second hand below the minute hand")
+    out.append(check("geometry.hand_stack_order", "geometry",
+                     "Hour, minute and second hands are stacked in order",
+                     not hand_order, "calculated",
+                     "hour < minute < second" if not hand_order else "; ".join(hand_order),
+                     fix=None if not hand_order else
+                     {"path": "hands.stack_height_mm",
+                      "value": round(float(spec.get("hands.stack_height_mm") or 0.9) + 0.2, 2)}))
+
+    # Inconsistent references that a single field's range cannot catch.
+    ref_errors = []
+    dome = float(spec.get("case.crystal_dome_height_mm") or 0)
+    crystal_h = float(spec.get("case.crystal_thickness_mm") or 0)
+    if spec.get("case.crystal_type") == "domed" and dome > crystal_h + 0.01:
+        ref_errors.append(f"dome {dome:.2f} mm exceeds crystal thickness {crystal_h:.2f} mm")
+    dial_d = float(spec.get("dial.diameter_mm") or 0)
+    if dial_d >= d - 0.4:
+        ref_errors.append(f"dial {dial_d:.1f} mm leaves no case wall")
+    mv_w = float(spec.get("movement.width_mm") or 0)
+    if mv_w >= d - 0.4:
+        ref_errors.append(f"movement {mv_w:.1f} mm leaves no case wall")
+    fix = None
+    if ref_errors:
+        if dome > crystal_h + 0.01:
+            fix = {"path": "case.crystal_dome_height_mm", "value": round(crystal_h, 2)}
+        elif dial_d >= d - 0.4:
+            fix = {"path": "case.diameter_mm", "value": round(dial_d + 4.2, 1)}
+        else:
+            fix = {"path": "case.diameter_mm", "value": round(mv_w + 6.0, 1)}
+    out.append(check("geometry.cross_references", "geometry",
+                     "Dial, crystal and movement references agree", not ref_errors,
+                     "calculated", "references consistent" if not ref_errors
+                     else "; ".join(ref_errors), fix=fix))
     return out
 
 

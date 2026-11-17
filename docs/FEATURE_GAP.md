@@ -1,13 +1,23 @@
 # WatchMaker 2.0 — feature-gap report
 
-**Snapshot:** `05326fe` (local `main`, one commit ahead of `origin/main`; nothing
-pushed), plus **Increment A** in the working tree (uncommitted). 119 Python tests
-and the Node UI smoke suite pass on this tree.
+**Snapshot:** `4f53861` (local `main`, three commits ahead of `origin/main`;
+nothing pushed), plus **Increment A and Phases 1–4** in the working tree
+(uncommitted). 161 Python tests and the Node UI smoke suite pass on this tree.
 
-**Implementation log:** Increment A (component-aware editing + deterministic
-five-axis critic) is implemented in the working tree. The scorecard rows for
-"AI design critic" and "Conversational component editing" are updated to ✅;
-the original gap analysis below is kept for context.
+**Implementation log:** Increments A and Phases 1–4 are implemented in the
+working tree. The scorecard rows for the affected areas are updated to ✅ or ◐
+where an important limitation remains. The original gap analysis below is kept
+for context; sections marked **Delivered** describe what is now present.
+
+**Delivered in this working tree**
+
+| Phase | What is now end-to-end |
+| --- | --- |
+| A | Component-aware editing and a deterministic five-axis critic (`components.py`, `critic.py`, `/api/component/context`, `/api/critic`, Critic tab) |
+| 1 | Parametric geometry and rendering: central material/finish library, lens/chamfer/arc/knurl primitives, detailed case/dial/hand furniture, scene validation, low/medium/high quality presets, GLB UVs and PBR extras (`materials.py`, `mesh.py`, `parts.py`, `verify.py`) |
+| 2 | Source-backed movement database: four manufacturer-published calibres, per-field provenance, append-only corrections, migration, search/catalog/detail/propose/compatibility API and Movement tab (`movements.py`, `schema.py`, `api.py`, `web/app.js`) |
+| 3 | Real multi-objective optimisation engine: deterministic candidate field, hard constraints, mixed min/max objectives, Pareto dominance, NSGA-II non-dominated sorting, crowding distance and reproducibility metadata (`optimise.py`) |
+| 4 | Optimisation Lab: selectable scatter axes, frontier/dominated/infeasible split, candidate inspection, baseline diff, constraints, 3D preview, explicit confirm-apply, new-version apply and undo/rollback (`api.py`, `web/app.js`, `web/index.html`, `web/viewer3d.js`) |
 
 **Method:** read the schema, solver, mesh/parts, verifier, optimiser, exporters,
 store, agent tools/planner/chat/knowledge/research, HTTP API, and the web client
@@ -37,26 +47,29 @@ behaviour. Nothing was inferred from the product brief alone.
 | Section-plane inspection | ✗ | Only 2D section drawings, no live clipping plane |
 | Distance / angle / clearance measurement | ✗ | No on-model measurement tools |
 | Exploded views / highlighting | ✅ | Explode 0–250 %, per-part tint, gear and layer presets |
-| Version history / snapshots / undo / redo | ◐ | Server-side history and undo/redo exist; no side-by-side visual comparison UI |
-| Render/engineering consistency | ◐ | One scene feeds glTF and the software renderer; no automated pixel/geometry equivalence test |
-| Knowledge base: movements/calibres | ◐ | Three generic movement envelopes, no calibre database |
-| Knowledge base: materials/processes/components | ◐ | 20 curated entries; thin coverage, most lack source URLs |
+| Parametric geometry detail | ◐ | Case/bezel/lug/crown/crystal/caseback and dial/hand furniture are spec-driven mesh approximations; no B-rep booleans or true threads |
+| PBR rendering and quality presets | ✅ | UV/PBR GLB, IBL/shadows, low/medium/high tiers, texture reuse and lazy on-demand render; no dynamic LOD |
+| Geometry/scene validation | ✅ | Missing/disconnected parts, positions, collisions, invalid dimensions, references and generation failures; not a manufacturing release |
+| Version history / snapshots / undo / redo | ✅ | Checkpoints, labelled versions, candidate apply as a new version, undo/rollback; no full side-by-side visual comparison UI |
+| Render/engineering consistency | ◐ | One scene feeds glTF, the Three.js viewer and the canvas fallback; GLB UV/PBR and scene-verification tests exist, but no pixel-equivalence test |
+| Knowledge base: movements/calibres | ✅ | Four manufacturer-published calibres with per-field provenance; deliberately small source-gated set (`movements.py`, Movement tab) |
+| Knowledge base: materials/processes/components | ◐ | Central PBR/density library plus 20 curated entries; process data and real material certificates remain thin |
 | RAG / source-grounded retrieval | ◐ | Curated lookup plus optional live search with URL/timestamp; no chunked corpus or embeddings |
-| Multi-objective optimisation | ✅ | Five deterministic objectives, real solver+mesh+verifier per candidate |
-| Pareto frontier | ✗ | Candidates are ranked by one scalar score; no non-dominated set |
-| Tolerance stack / DFM / interference | ◐ | Worst-case stack, DFM and tooth-outline interference exist; no assembly-wide interference or supplier constraints |
+| Multi-objective optimisation | ✅ | Five deterministic objectives, hard constraints, reproducible seed/signature and real solver+mesh+verifier per candidate |
+| Pareto frontier | ✅ | Pareto dominance, NSGA-II non-dominated sorting, crowding distance, selectable scatter axes and frontier/dominated split |
+| Tolerance stack / DFM / interference | ◐ | Worst-case stack, DFM, tooth outlines and scene-level missing/orphan/envelope checks; no assembly-wide mesh intersection or supplier constraints |
 | Structural constraints | ✗ | No FEA, stress, deflection or fatigue model |
-| Movement compatibility | ◐ | Width/height fit and beat-rate checks; no calibre-specific mounting or hand-height database |
+| Movement compatibility | ✅ | Structured PASS/WARNING/FAIL/UNKNOWN checks for diameter, height, mounting, stem/crown, dial, hands, date and caseback; UNKNOWN never silently passes |
 | True STEP export | ✗ | Status explicitly reports STEP unavailable without an OCC-style kernel |
-| Solid booleans / fillets / chamfers / threads | ✗ | Mesh builders only; dial openings are surface features |
+| Solid booleans / fillets / chamfers / threads | ◐ | Deterministic mesh chamfers, lens edges and knurls are generated; no B-rep booleans, drafts or real screw threads |
 | True involute gears | ✗ | Exact ratios, presentation-grade cycloidal profiles |
 | BOM / manufacturing docs | ✅ | BOM, process notes, test plan, drawings, manifest hashes |
-| Versioned spec / migration | ◐ | `meta.version` and exported `schema_version: 1`; no migration chain |
-| Background jobs | ◐ | Threaded HTTP server, cooperative cancel/timeout; optimisation runs synchronously in-request |
+| Versioned spec / migration | ✅ | `SCHEMA_VERSION = 3` with a pure additive migration chain and history entry |
+| Background jobs | ◐ | Threaded HTTP server, agent cancel/timeout and token-guarded UI runs; optimisation is still synchronous in-request with no durable job record |
 | Provider usage / cost | ◐ | Token usage is reported when the provider returns it; no price table, aggregation or persistence |
-| Mesh LOD / simplification | ✗ | Fixed tessellation, no distance-based LOD or decimation |
+| Mesh LOD / simplification | ◐ | Low/medium/high geometry presets, capped texture sizes with reuse and per-quality scene cache; no distance-based decimation |
 | Session / project isolation | ✅ | Per-session studio, conversation-scoped design sessions, session-scoped BYOK keys |
-| Cross-layer regression tests | ◐ | Strong server/spec/geometry tests and UI smoke; no automated spec↔render↔CAD equivalence assertions |
+| Cross-layer regression tests | ◐ | 161 Python tests plus UI smoke covering spec→scene→GLB→API→UI; no solid-CAD equivalence assertion |
 
 ---
 
@@ -84,6 +97,13 @@ behaviour. Nothing was inferred from the product brief alone.
   scene tree and mass; `get_field_dependencies` explains knock-on effects.
 - **Selected-part context** — clicking a mesh selects it, shows a HUD with name,
   group and bounding-box size, and emits `watchcad:select-part`.
+- **Delivered — structured critic** (`watchcad/critic.py`, `/api/critic`, Critic
+  tab): five deterministic axes with scores, evidence, findings, schema-valid
+  safe fixes and provenance. LLM output never supplies the numbers.
+- **Delivered — selection-scoped editing** (`watchcad/components.py`): the
+  selected part resolves to writable fields, locks, checks and scene parts;
+  chat and agent mutation refuse out-of-scope fields and name the owning
+  component in the refusal.
 
 ### 1.2 What is missing
 
@@ -94,29 +114,31 @@ behaviour. Nothing was inferred from the product brief alone.
 - **No sketch/photo decomposition.** Case shape, bezel, lugs, dial layout,
   indices, hands, colours and finish are not turned into candidate field values
   with uncertainty.
-- **No structured design critic.** `planner.critique()` produces a prose
-  strengths/risks/direction summary from checks and derived metrics. There are
-  no explicit axes, no per-axis score, weight, evidence or issue list for
-  proportions, dial legibility, aesthetics, ergonomics and component
-  consistency.
-- **Component editing is name/path based, not selection-based.** The selected
-  part is not injected into the agent context as the edit target, and there is
-  no per-component override model (for example a dial-specific colour that
-  differs from the global field).
 - **No image-derived design lineage.** Uploaded references are not stored as
   design sources with retrieval dates and confidence.
+- **No per-component overrides.** Selection scopes *which global fields may be
+  edited*, but a dial-specific colour that differs from the global dial colour
+  is not modelled.
+- **Delivered (was missing): structured critic.** Five explicit axes now return
+  scores, evidence, issues, fixes and provenance from the solved spec, scene and
+  verifier.
+- **Delivered (was missing): selection-scoped editing.** The selected component
+  is injected into chat/agent requests and mutating tools refuse out-of-scope
+  fields.
 
-### 1.3 Genuinely new
+### 1.3 Genuinely new / delivered here
 
-- A deterministic **image-brief extractor**: vision model returns a bounded JSON
-  observation (no invented dimensions), the server validates it against the
-  field registry, converts only defensible observations into patches, attaches
-  confidence and `source: image`, and asks the user to confirm essentials.
-- A **structured critic** with named axes and deterministic evidence collectors,
-  returning scores, issues, fixes and provenance. The LLM may explain the
-  report; it must not invent the numbers.
-- **Selection-scoped editing**: selected component → allowed fields, current
-  values, relevant checks, and a validated conversational edit path.
+- A deterministic **image-brief extractor** *(not implemented here)*: vision
+  model returns a bounded JSON observation (no invented dimensions), the server
+  validates it against the field registry, converts only defensible observations
+  into patches, attaches confidence and `source: image`, and asks the user to
+  confirm essentials.
+- A **structured critic** *(delivered)* with named axes and deterministic
+  evidence collectors, returning scores, issues, fixes and provenance. The LLM
+  may explain the report; it must not invent the numbers.
+- **Selection-scoped editing** *(delivered)*: selected component → allowed
+  fields, current values, relevant checks, and a validated conversational edit
+  path.
 
 ---
 
@@ -132,8 +154,17 @@ behaviour. Nothing was inferred from the product brief alone.
 - Component highlighting on hover and selection; picking ignores hidden parts.
 - Server-side history: checkpoints, labelled versions, undo/redo, version
   lookup, `compare_specs`, design references, persisted design snapshots.
-- The same scene payload drives the glTF export and the no-WebGL canvas
-  fallback, so parts, colours, bounds and mass come from one source.
+- The same scene payload drives the glTF export, the Three.js viewer and the
+  no-WebGL canvas fallback, so parts, colours, bounds and mass come from one
+  source.
+- **Delivered — render presets.** Low/medium/high tiers change tessellation,
+  shadow-map size, device pixel ratio and procedural texture size. The server
+  caches scenes per quality; the viewer caps pixel ratio, reuses generated
+  textures and renders on demand. Dimensions and verification are identical
+  across presets.
+- **Delivered — candidate preview.** Session-scoped, short-lived preview tokens
+  let `/api/model.glb` and `/api/scene` render a candidate without mutating the
+  live studio.
 
 ### 2.2 What is missing
 
@@ -151,11 +182,13 @@ behaviour. Nothing was inferred from the product brief alone.
 - **Reliable undo/redo across UI and agent.** Undo/redo exists in the server
   session, but there is no unified client-side gesture history for camera,
   visibility, explode, selection and spec edits.
-- **Automated render/geometry consistency test.** The shared payload is a good
-  design, but no test asserts that exported glTF bounds/parts match the solved
-  scene.
+- **Automated render/geometry consistency test is still partial.** New tests
+  assert quality-independent dimensions/verification, part presence, layer order,
+  GLB UVs and PBR extras; no pixel-level or solid-CAD equivalence test exists.
+- **No live section plane, measurement tools, side-by-side history comparison or
+  per-part visibility.** These remain the largest 3D-workspace gaps.
 
-### 2.3 Genuinely new
+### 2.3 Genuinely new (not implemented here)
 
 - Section plane (X/Y/Z, offset, flip) implemented in Three.js with an optional
   cap plane, plus a software-renderer fallback (clip triangles by plane).
@@ -180,13 +213,17 @@ behaviour. Nothing was inferred from the product brief alone.
 - Spec provenance supports `sourced`, `source_url`, timestamps and `not_found`.
 - Prompt guidance forbids inventing specifications and requires labelling
   estimates.
+- **Delivered — source-backed movement database** (`watchcad/movements.py`):
+  ETA 2824-2, Miyota 9015, Sellita SW200-1 and Seiko NH35A. Each field carries
+  `verified`, `secondary`, `estimated` or `unknown` provenance; unpublished
+  values stay `null`/UNKNOWN. Records are append-only corrected, migrated and
+  validated, and live only on the server (`/api/movements*`, Movement tab).
 
 ### 3.2 What is missing
 
-- **No movement/calibre database.** Only three generic envelopes. There is no
-  table of real calibres with dimensions, mounting, stem height, hand sizes,
-  jewels, beat rate or source. This is the largest knowledge gap and the easiest
-  place to accidentally invent data, so it must be source-gated.
+- **Movement coverage is deliberately small.** Four manufacturer-published
+  records are enough to exercise sourcing, provenance and compatibility, not to
+  serve as a general calibre catalogue. New records must cite a source.
 - **Thin material properties.** Density and hardness only; no elastic modulus,
   yield strength, thermal expansion, machinability or supplier form data.
 - **Thin process data.** No feeds/speeds, tolerances by process, minimum feature
@@ -194,26 +231,28 @@ behaviour. Nothing was inferred from the product brief alone.
 - **No standard fasteners/components catalogue.** No screw standards, spring
   bars, gaskets, O-ring sizes, crystals by diameter/thickness, crowns/tubes,
   caseback threads or sealing systems.
-- **No assembly/engineering constraint model** beyond the verifier's stack and
-  fit checks.
+- **No complete assembly/engineering constraint model.** Movement compatibility
+  now adds structured mounting, stem/crown, hand, date and caseback checks, but
+  this is still not a general constraint solver or a physical release gate.
 - **No RAG.** Lookup is keyword matching over a hand-written list. There is no
   document corpus, chunking, embedding/index, hybrid retrieval, reranking or
   citation-anchored answer construction.
-- **Provenance is structural but not populated.** Most curated entries have no
-  `source_url` or `retrieved_at`; the default note honestly says no datasheet
-  was fetched.
+- **General curated-entry provenance is still thin.** Most `knowledge.py`
+  entries have no `source_url` or `retrieved_at`; the default note honestly says
+  no datasheet was fetched. The movement database does not inherit that gap.
 
-### 3.3 Genuinely new
+### 3.3 Genuinely new / delivered here
 
-- A source-gated calibre dataset with explicit `verified | manufacturer |
-  community | estimate` status, URL, retrieval date, and "unknown" fields that
-  are never filled by guesswork.
-- Expanded material/process/component tables with units and test methods.
+- A source-gated calibre dataset *(delivered, small set)* with explicit
+  `verified | secondary | estimated | unknown` status, source URLs, retrieval
+  date, and "unknown" fields that are never filled by guesswork.
+- Expanded material/process/component tables with units and test methods
+  *(not implemented here)*.
 - A local, dependency-free retrieval layer (token index + BM25-style scoring)
   over curated documents and user-imported datasheets, returning passages with
-  source spans. No third-party packages, no network in tests.
+  source spans *(not implemented here)*.
 - A knowledge answer builder that refuses to answer when no source supports the
-  claim.
+  claim *(not implemented here)*.
 
 ---
 
@@ -227,8 +266,15 @@ behaviour. Nothing was inferred from the product brief alone.
 - Metrics include mass, material/process cost, part and complication counts, DFM
   failures, tolerance failures, stack margin and failing checks, each with a
   provenance label (`calculated` / `estimated` / `needs_test`).
-- Candidate ranking puts passing candidates first, then score; baseline and
-  changed metrics are reported.
+- Hard constraints (schema validity, locks, solver success, verification and a
+  usable material density) are reported separately from objectives. The engine
+  uses mixed min/max objective vectors, Pareto dominance, NSGA-II
+  non-dominated sorting and crowding distance. The single-objective `winner`
+  is a recommendation from the finite probe set, reported separately from the
+  Pareto front; no global-optimality claim is made.
+- A deterministic seed/signature records baseline checksum, objective, axes,
+  budget and generator version. Every candidate reports baseline deltas,
+  constraints, verification and provenance.
 - Verifier already covers: movement/dial fit, stack and hand clearance, gear
   centre distances and outline interference, tooth conflicts, kinematics, power
   budget/reserve, worst-case tolerance stack, DFM (water resistance, lug width,
@@ -237,10 +283,9 @@ behaviour. Nothing was inferred from the product brief alone.
 
 ### 4.2 What is missing
 
-- **Pareto frontier.** Ranking collapses multiple objectives into one scalar.
-  There is no non-dominated set, no trade-off table, no knee-point selection and
-  no multi-objective search (for example NSGA-II style) — only single-objective
-  blueprint ordering.
+- **Global or continuous search.** The field is a finite, deterministic probe
+  set; there is no adaptive sampling, knee-point selection or guarantee that a
+  better design lies outside the probes.
 - **Structural constraints.** No stress, deflection, fatigue, impact or FEA.
   "Structural" is currently limited to geometric fit and interference.
 - **Assembly-wide interference.** Tooth outlines are checked, but no general
@@ -250,22 +295,26 @@ behaviour. Nothing was inferred from the product brief alone.
   capability, minimum order, tolerance capability, lead time or process routing.
 - **Tolerance stack sophistication.** Worst-case arithmetic only; no RSS/statistical
   stack, no sensitivity ranking, no Monte-Carlo, no measured distributions.
-- **Movement compatibility beyond envelope.** No calibre-specific mounting,
-  stem/crown alignment, hand tube diameters, date-window position or rotor
-  clearance.
+- **Movement rotor clearance and some hand-tube details.** The delivered
+  compatibility report covers mounted, stem/crown, dial, hand-height, date and
+  caseback checks where the source publishes the value, but not every calibre
+  detail or swept rotor envelope.
 - **Batch/background optimisation.** The endpoint runs synchronously and holds
-  the studio lock; there is no job queue, progress stream or resumable run.
+  the studio lock; the UI guards against stale results with a request token, but
+  there is no job queue, progress stream or resumable run.
 
-### 4.3 Genuinely new
+### 4.3 Genuinely new / delivered here
 
-- Pareto analysis over the existing candidate metrics: non-dominated sorting,
-  frontier table, per-objective deltas and explicit dominated-by links.
+- Pareto analysis *(delivered)* over the existing candidate metrics:
+  non-dominated sorting, crowding distance, frontier/dominated split,
+  per-objective deltas, explicit dominance links and selectable scatter axes.
+- A constraint model *(delivered)* with blocking hard constraints and
+  non-blocking caveats; unknown data stays UNKNOWN rather than passing.
 - Assembly interference using deterministic mesh/AABB + triangle tests, reported
-  as `calculated` with tolerance assumptions stated.
-- A constraint model with hard/soft constraints, supplier capability records and
-  pass/fail evidence. Unknown supplier data stays unknown.
+  as `calculated` with tolerance assumptions stated *(not implemented here)*.
+- Supplier capability records and pass/fail evidence *(not implemented here)*.
 - Optional Monte-Carlo tolerance study with a fixed seed and documented
-  distributions (clearly `simulated`, never `physically verified`).
+  distributions *(not implemented here)*.
 
 ---
 
@@ -274,7 +323,8 @@ behaviour. Nothing was inferred from the product brief alone.
 ### 5.1 What already exists
 
 - Mesh kernel: revolve, tube, frustum, dome, torus, extrude, rounded slab, sweep,
-  merge, outward winding and signed volume.
+  merge, outward winding and signed volume, plus delivered lens, chamfered disc,
+  arc ring and knurled-disc primitives with UVs.
 - Real STL (binary/ASCII), OBJ and glTF/GLB export; DXF/SVG/PDF drawing set;
   BOM, process notes, test plan, manifest hashes and build cache.
 - Exact gear ratios and bounded meshing outlines; gear geometry feeds the scene
@@ -292,8 +342,9 @@ behaviour. Nothing was inferred from the product brief alone.
   code in this repository.
 - **Booleans.** No union/subtract/intersect. Date windows, subdials and
   moonphase apertures are surface features, not cuts.
-- **Fillets, chamfers, drafts, threads.** No edge blending or thread forms;
-  screw-down crown/caseback are represented by simplified geometry.
+- **True fillets, drafts and screw threads.** Deterministic mesh chamfers,
+  lens edges and knurls are now generated, but they are mesh approximations;
+  there is no edge-blending kernel or helical thread form.
 - **True involute gears.** Ratios are exact, but profiles are presentation-grade
   cycloidal approximations; no conjugate action, backlash, contact ratio or
   stress.
@@ -302,16 +353,16 @@ behaviour. Nothing was inferred from the product brief alone.
 - **Validation evidence.** No material certificates, no first-article
   inspection, no bench data ingestion.
 
-### 5.3 Genuinely new
+### 5.3 Genuinely new / delivered here
 
 - A kernel adapter interface with a dependency-free mesh backend and an optional
-  OCC backend. STEP export only when a real kernel is installed; otherwise the
-  existing honest "unavailable" status remains.
-- Mesh boolean/fillet/chamfer improvements where they can be done deterministically
-  without a B-rep, each labelled as an approximation.
+  OCC backend *(not implemented here)*. STEP export only when a real kernel is
+  installed; otherwise the existing honest "unavailable" status remains.
+- Mesh chamfer/lens/arc/knurl improvements *(delivered)* where they can be done
+  deterministically without a B-rep, labelled as mesh approximations.
 - A gear module that can switch between the existing presentation profile and a
   true involute profile, with a test that verifies conjugate contact at the pitch
-  point and documents remaining limits.
+  point and documents remaining limits *(not implemented here)*.
 
 ---
 
@@ -319,67 +370,79 @@ behaviour. Nothing was inferred from the product brief alone.
 
 ### 6.1 What already exists
 
-- `meta.version` increments on writes; exports carry `schema_version: 1`.
+- `meta.version` increments on writes; exports carry `SCHEMA_VERSION = 3`.
+  `migrate_spec_dict()` is a pure additive migration that fills new fields from
+  current defaults and records a history entry without guessing existing values.
 - SQLite store: conversations, messages, tool events, summaries, latest design
-  per session, conversation→design references.
+  per session, conversation→design references. DB access stays in the server,
+  not the frontend.
 - Per-session studio and conversation-scoped design sessions; new conversations
   clone then diverge; session-scoped BYOK keys live only in process memory.
 - Agent run control: cooperative cancellation, wall-clock budget, bounded
   repair iterations, streaming timeline events.
 - Token usage is captured from provider responses and surfaced in run results.
-- Spec, solver, geometry, exports, API and agent paths have 98 Python tests;
-  the UI has a headless smoke suite.
+- Spec, solver, geometry, movements, exports, API, optimisation and agent paths
+  have **161 Python tests**; the UI has a headless smoke suite.
+- **Delivered — quality tiers.** Low/medium/high geometry presets, per-quality
+  scene cache, capped/reused procedural textures and on-demand rendering. These
+  are performance hints, not engineering-accuracy settings.
 
 ### 6.2 What is missing
 
-- **Spec migration.** `schema_version` is written but never read; there is no
-  `migrate(old) -> new` chain, no compatibility tests across versions.
+- **Historical fixtures for every old schema version.** The additive migration
+  chain is implemented and tested for legacy/current documents, but only the
+  paths needed by this repository are covered.
 - **Decision log.** Design references record checksums and labels, but not the
   rationale, alternatives considered, or who/what decided. Agent memory is
   conversation-scoped.
-- **True background execution.** Long optimisation/build work is synchronous
-  in the HTTP request; cancellation exists but there is no durable job record,
-  progress, retry or resume.
+- **Background execution for optimisation/build.** Long work is synchronous in
+  the HTTP request. The UI uses a request token to ignore stale results and the
+  agent has cancellation/streaming, but there is no durable job record, progress,
+  retry or resume for the optimisation lab.
 - **Provider cost tracking.** No per-provider price table, per-run cost,
   monthly aggregation, budget guard, or persisted usage ledger.
-- **LOD.** No mesh decimation or distance-based switching; large assemblies rely
-  on modest tessellation.
-- **Cross-layer regression tests.** No test asserts that a spec change produces
-  matching agent description, scene bounds, glTF part names and drawing labels.
+- **Distance-based LOD.** Deterministic quality tiers exist, but there is no
+  runtime decimation or camera-distance switching.
+- **Full cross-layer regression tests.** Tests cover spec→solver→scene→GLB→API→UI
+  behaviour, including quality invariance and movement provenance; no single
+  test asserts agent prose, drawing labels and glTF node names all agree.
 - **User isolation/authentication.** Session isolation is not security; the
   server is localhost-only and unauthenticated by design.
 
-### 6.3 Genuinely new
+### 6.3 Genuinely new / delivered here
 
-- Versioned spec migrations with fixtures for every historical version.
+- Versioned spec migrations with additive behaviour and a recorded migration
+  history *(delivered; exhaustive historical fixtures not added)*.
 - A job runner (in-process, dependency-free) with status, progress, cancel and
-  result retrieval, used by optimisation and package builds.
+  result retrieval, used by optimisation and package builds *(not implemented
+  here)*.
 - A provider usage ledger: tokens, model, endpoint, estimated cost, timestamp;
-  keys never persisted. Cost tables are explicit and editable.
-- Mesh LOD tiers generated deterministically from the same geometry, with a UI
-  quality control and triangle-count readout.
+  keys never persisted. Cost tables are explicit and editable *(not implemented
+  here)*.
+- Mesh quality tiers generated deterministically from the same geometry, with a
+  UI quality control and triangle-count readout *(delivered; no dynamic LOD)*.
 - A "consistency contract" test: one solved spec → agent summary fields, scene
-  parts/bounds, glTF node names and drawing labels must agree.
+  parts/bounds, glTF node names and drawing labels must agree *(partial)*.
 
 ---
 
 ## 7. Genuinely new work, ranked by the requested priority
 
-| Rank | Feature | Why it is new | Dependency |
-| --- | --- | --- | --- |
-| 1 | Selection-scoped component editing | Selected part is not an edit target; no per-component overrides | Existing picking + tools |
-| 2 | Structured design critic | Only prose today; no axes, scores or evidence model | Solver/verifier metrics |
-| 3 | Image → structured spec extraction | No extraction schema or confirmation flow | Vision provider (optional) + field registry |
-| 4 | Source-gated calibre/material/component database | 20 thin entries, no calibre records | Curated data + provenance schema |
-| 5 | Local RAG over curated/imported documents | Keyword lookup only | Knowledge base |
-| 6 | Pareto frontier + multi-objective search | Single scalar ranking only | Optimiser |
-| 7 | Assembly-wide interference + tolerance study | Tooth outlines only; worst-case only | Mesh kernel |
-| 8 | Section plane + measurement tools | No 3D clipping or measurement | Viewer |
-| 9 | Version comparison view + decision log | Text/spec history only | Store + viewer |
-| 10 | Spec migration + background jobs + usage ledger | No migration chain, durable jobs or cost model | Store/API |
-| 11 | Real STEP / solid kernel | Not present; explicitly unavailable | Optional OCC install |
-| 12 | True involute gears | Presentation profiles only | Gear module + tests |
-| 13 | Mesh LOD | Fixed tessellation | Viewer/mesh |
+| Rank | Feature | Why it is new | Status here | Dependency |
+| --- | --- | --- | --- | --- |
+| 1 | Selection-scoped component editing | Selected part is not an edit target; no per-component overrides | Delivered (global fields only) | Existing picking + tools |
+| 2 | Structured design critic | Only prose today; no axes, scores or evidence model | Delivered | Solver/verifier metrics |
+| 3 | Image → structured spec extraction | No extraction schema or confirmation flow | Not implemented | Vision provider (optional) + field registry |
+| 4 | Source-gated calibre database | 20 thin entries, no calibre records | Delivered (four calibres) | Curated data + provenance schema |
+| 5 | Local RAG over curated/imported documents | Keyword lookup only | Not implemented | Knowledge base |
+| 6 | Pareto frontier + multi-objective search | Single scalar ranking only | Delivered (finite probe field) | Optimiser |
+| 7 | Assembly-wide interference + tolerance study | Tooth outlines only; worst-case only | Partial (scene envelope/layer checks) | Mesh kernel |
+| 8 | Section plane + measurement tools | No 3D clipping or measurement | Not implemented | Viewer |
+| 9 | Version comparison view + decision log | Text/spec history only | Partial (candidate diff/undo) | Store + viewer |
+| 10 | Spec migration + background jobs + usage ledger | No migration chain, durable jobs or cost model | Migration delivered; jobs/ledger not | Store/API |
+| 11 | Real STEP / solid kernel | Not present; explicitly unavailable | Not implemented | Optional OCC install |
+| 12 | True involute gears | Presentation profiles only | Not implemented | Gear module + tests |
+| 13 | Mesh quality tiers / LOD | Fixed tessellation | Delivered (quality tiers); no dynamic LOD | Viewer/mesh |
 
 ---
 
@@ -417,7 +480,7 @@ no changes to geometry or export.
 | Five-axis deterministic critic | `watchcad/critic.py` (proportions, dial legibility, aesthetics, ergonomics, component consistency) | `CriticTests` (ordering, determinism, no mutation, fixes, locks, focus) |
 | Per-axis score, evidence, issues, fixes, provenance | `critique()` report schema | `test_five_axes_are_ordered_and_labelled`, `test_inconsistencies_produce_findings_and_schema_valid_fixes` |
 | `/api/critic` + Critic tab | `watchcad/api.py`, `web/index.html`, `web/app.js`, `web/style.css` | `CriticApiTests`, UI smoke `critic` section |
-| Tests | `tests/test_increment_a.py` (21 tests), `tests/ui_smoke.js` | `python3 -m unittest discover -s tests` → 119 OK; `node tests/ui_smoke.js` → all checks passed |
+| Tests | `tests/test_increment_a.py` (21 tests), `tests/ui_smoke.js` | `python3 -m unittest discover -s tests` → 161 OK across the whole suite; `node tests/ui_smoke.js` → all checks passed |
 
 **Implementation limitations (must stay documented):**
 
@@ -442,6 +505,9 @@ no changes to geometry or export.
 
 ### Increment B — Image-to-design workflow (priority 2)
 
+**Status — not implemented here.** Images are still conversational/vision context,
+not validated spec patches. Keep the plan below as the remaining scope.
+
 1. Define an `ImageObservation` JSON contract: palette, case shape family, bezel,
    lug style, dial layout, index style, hand style, finish, complications
    visible, confidence per item, and explicit "not determinable".
@@ -457,6 +523,9 @@ no changes to geometry or export.
 
 ### Increment C — Knowledge base and local RAG (priority 3)
 
+**Status — partial.** The source-gated calibre database is delivered;
+BM25-style local retrieval, `/api/knowledge/search` and a citation UI are not.
+
 1. Expand the curated dataset with source URLs, retrieval dates and explicit
    unknown fields. Calibre records are only added where a source is supplied.
 2. Add a dependency-free BM25-style index over curated documents and imported
@@ -466,6 +535,11 @@ no changes to geometry or export.
    and no network access.
 
 ### Increment D — Pareto optimisation + constraints (priority 4)
+
+**Status — partly implemented (uncommitted).** Pareto sorting, hard constraints,
+candidate inspection/diff/preview/apply/undo, determinism tests and the finite
+objective grid are delivered. Assembly-wide interference, supplier capability
+records and Monte-Carlo tolerance studies are not.
 
 1. Evaluate a candidate grid spanning weight, cost, DFM and tolerance changes.
 2. Non-dominated sorting with a frontier table, dominated-by links and
@@ -479,6 +553,9 @@ no changes to geometry or export.
 
 ### Increment E — Inspection and measurement (priority 5)
 
+**Status — not implemented here.** Candidate inspection is delivered in the
+optimisation lab, but 3-D sectioning and measurement tools are not.
+
 1. Section plane with axis/offset/flip and a software-renderer clip fallback.
 2. Measurement mode with snapping, distance, angle and clearance; labels and a
    measurement list.
@@ -488,6 +565,9 @@ no changes to geometry or export.
 
 ### Increment F — CAD kernel and manufacturing (priority 6)
 
+**Status — partial.** Deterministic mesh chamfer/lens/arc/knurl improvements are
+delivered. The optional solid kernel, STEP/IGES and involute gears are not.
+
 1. Kernel adapter interface; keep the mesh backend as the default.
 2. Optional OCC backend for STEP/IGES and booleans, only when installed.
 3. Deterministic mesh fillet/chamfer approximations where safe; document limits.
@@ -495,6 +575,10 @@ no changes to geometry or export.
 5. BOM/manufacturing docs gain operation, inspection and validation sections.
 
 ### Increment G — Reliability (cross-cutting)
+
+**Status — partial.** Schema v3 additive migration and deterministic quality tiers
+are delivered; durable jobs, provider usage ledger and an exhaustive consistency
+contract are not.
 
 - Spec migrations with version fixtures.
 - Durable in-process job runner for optimisation/build.
@@ -506,17 +590,29 @@ no changes to geometry or export.
 
 ## 9. Limitations that will remain after this work
 
-- No claim of production readiness. Calculated geometry is not a validated
-  design; bench properties remain `needs_test`.
+- No claim of production readiness. Mesh geometry, scene validation and quality
+  tiers do not constitute a validated solid design; bench properties remain
+  `needs_test`.
+- Visual approximation, parametric geometry and validated solid geometry are
+  distinct. Chamfers/lenses/knurls are deterministic mesh approximations, not
+  B-rep features; there is no STEP/IGES kernel, booleans, draft or true thread.
+- The optimisation field is finite and deterministic. Pareto ranking and the
+  recommendation are correct for the probed candidates only; no global
+  optimality, continuous search or physical validation is claimed.
+- Movement coverage is four source-backed calibres with per-field provenance.
+  Missing calibre data stays UNKNOWN, and compatibility results are geometric
+  checks with stated assumptions, not a manufacturing release.
+- No assembly-wide mesh interference, dynamic distance-based LOD, durable
+  background job queue/cancellation, FEA/Monte-Carlo/general tolerance study,
+  supplier capability data or local RAG corpus is present.
 - A vision model's observations are advisory. Without calibration, photographs
-  cannot yield trustworthy dimensions.
-- Curated knowledge is only as good as its sources. Missing calibre data stays
-  missing rather than guessed.
-- STEP requires a real solid kernel; the default install remains mesh-only.
-- Structural/FEA, fatigue, escapement dynamics, lubrication, CAM toolpaths and
+  cannot yield trustworthy dimensions; image-to-spec extraction is not
+  implemented.
+- Material densities/finishes are presentation/estimate data, not certificates;
+  structural/FEA, fatigue, escapement dynamics, lubrication, CAM toolpaths and
   material certification remain out of scope unless separately validated.
 - The server is a local, unauthenticated studio; session isolation is not
-  multi-user security.
+  multi-user security. BYOK keys stay in process memory and never enter logs.
 
 ---
 
@@ -526,9 +622,9 @@ no changes to geometry or export.
    critic) as proposed?~~ **Decided: yes. Increment A is implemented and awaiting
    user testing in the working tree.** Remaining questions apply to later
    increments.
-2. **Knowledge sources:** do you have manufacturer datasheets or a preferred
-   calibre list, or should the calibre database start empty and only accept
-   user-supplied sources?
+2. **Knowledge sources:** four manufacturer-sourced calibres are now included.
+   Should expansion keep the same source-gated rule (recommended), and which
+   additional calibres or datasheets should be prioritised?
 3. **Vision behaviour:** should image extraction require a configured vision
    provider, or also offer a deterministic "palette/proportion only" fallback?
 4. **OCC:** is installing OpenCASCADE acceptable as an optional extra, or must

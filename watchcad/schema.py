@@ -37,17 +37,30 @@ CASE = {
     "thickness_mm": F("num", 11.0, "mm", min=7, max=18, essential=True),
     "lug_width_mm": F("num", 20.0, "mm", min=16, max=24),
     "material": F("enum", "316L stainless steel",
-                  choices=["316L stainless steel", "titanium", "bronze", "ceramic", "carbon"]),
-    "finish": F("enum", "brushed", choices=["brushed", "polished", "bead-blasted", "PVD black", "two-tone"]),
+                  choices=["316L stainless steel", "titanium", "bronze", "ceramic",
+                           "carbon", "18k yellow gold", "18k rose gold"]),
+    "finish": F("enum", "brushed", choices=["brushed", "polished", "satin",
+                                           "bead-blasted", "PVD black", "two-tone"]),
     "water_resistance_m": F("int", 100, "m", min=0, max=1200),
     "crystal": F("enum", "sapphire", choices=["sapphire", "mineral", "acrylic"]),
     "crystal_type": F("enum", "domed", choices=["flat", "domed"]),
     "crystal_thickness_mm": F("num", 1.2, "mm", min=0.6, max=3.0),
+    "crystal_dome_height_mm": F("num", 1.1, "mm", min=0.2, max=2.5),
     "caseback": F("enum", "screw-down", choices=["screw-down", "snap", "screw-down exhibition"]),
     "crown": F("enum", "push", choices=["push", "screw-down"]),
+    "crown_guards": F("bool", False),
+    # Optional axial crown position measured from the outside of the caseback.
+    # Null means "not set by the user"; the solver then derives a placement from
+    # the case thickness.  A sourced movement stem height can override it.
+    "crown_height_mm": F("num", None, "mm", min=0.0, max=18.0),
+    # How the movement is held in the case.  "unknown" is an explicit state, not
+    # a synonym for a spacer; it makes the movement compatibility report UNKNOWN.
+    "movement_mounting": F("enum", "unknown",
+                           choices=["unknown", "spacer", "case clamps", "tabs"]),
     "bezel": F("enum", "plain", choices=["plain", "dive", "coin-edge", "fluted"]),
     "crown_diameter_mm": F("num", 5.5, "mm", min=3.5, max=9),
     "lug_count": F("int", 4, "", min=2, max=4),
+    "lug_style": F("enum", "curved", choices=["straight", "curved", "drilled"]),
 }
 
 DIAL = {
@@ -55,10 +68,14 @@ DIAL = {
     "thickness_mm": F("num", 0.4, "mm", min=0.2, max=1.2),
     "color": F("str", "black", essential=True),
     "index_style": F("enum", "applied batons",
-                     choices=["printed", "applied batons", "applied numerals", "roman numerals", "no indices"]),
+                     choices=["printed", "applied batons", "applied numerals",
+                              "arabic numerals", "roman numerals", "no indices"]),
     "lume": F("bool", True),
+    "lume_color": F("enum", "green", choices=["green", "blue", "cream"]),
     "date_window": F("bool", False),
+    "date_window_position": F("enum", "3", choices=["3", "4.5", "6"]),
     "small_seconds": F("bool", False),
+    "minute_track": F("bool", True),
     "logo_text": F("str", ""),
     "finish": F("enum", "sunburst", choices=["matte", "sunburst", "guilloche", "lacquered", "sandblasted"]),
     "index_material": F("enum", "polished steel", choices=["polished steel", "gold", "white gold", "printed"]),
@@ -71,12 +88,15 @@ HANDS = {
     "second_length_mm": F("num", 27.5, "mm", min=12, max=32),
     "thickness_mm": F("num", 0.25, "mm", min=0.1, max=0.6),
     "material": F("enum", "polished steel", choices=["polished steel", "gold", "blued steel", "lume-filled"]),
+    "lume": F("bool", True),
     "stack_height_mm": F("num", 0.9, "mm", min=0.4, max=2.0),
 }
 
 MOVEMENT = {
     "kind": F("enum", "mechanical", choices=["mechanical", "quartz"], essential=True),
+    "manufacturer": F("str", ""),
     "base_calibre": F("str", ""),
+    "calibre_id": F("str", ""),
     "width_mm": F("num", 28.0, "mm", min=15, max=38),
     "height_mm": F("num", 4.6, "mm", min=1.5, max=9),
     "beat_rate_bph": F("int", 28800, "bph", min=14400, max=36000, essential=True),
@@ -87,6 +107,14 @@ MOVEMENT = {
     "usable_barrel_turns": F("num", 6.5, "turns", min=3, max=12),
     "hand_height_mm": F("num", 1.2, "mm", min=0.4, max=3.0),
     "complications": F("dict", {}),
+}
+
+STRAP = {
+    "material": F("enum", "none",
+                  choices=["none", "leather", "rubber", "steel bracelet", "nato"]),
+    "color": F("str", "black"),
+    "width_mm": F("num", 20.0, "mm", min=10, max=26),
+    "taper_mm": F("num", 2.0, "mm", min=0, max=8),
 }
 
 QUARTZ = {
@@ -117,8 +145,10 @@ META = {
 }
 
 SCHEMA = {"case": CASE, "dial": DIAL, "hands": HANDS,
-          "movement": MOVEMENT, "quartz": QUARTZ,
+          "movement": MOVEMENT, "quartz": QUARTZ, "strap": STRAP,
           "derived": DERIVED, "meta": META}
+
+SCHEMA_VERSION = 3
 
 DEFAULTS: dict[str, Any] = {
     group: {name: f["default"] for name, f in fields.items()}
@@ -276,16 +306,27 @@ class Spec:
 
     def to_dict(self) -> dict:
         return {"data": self.data, "provenance": self.provenance,
-                "locks": sorted(self.locks), "schema_version": 1}
+                "locks": sorted(self.locks), "schema_version": SCHEMA_VERSION}
 
     @classmethod
     def from_dict(cls, obj: dict) -> "Spec":
+        obj = migrate_spec_dict(obj)
         data = copy.deepcopy(DEFAULTS)
         deep_update(data, obj.get("data", obj))
         prov = obj.get("provenance", {})
         for path in flatten(obj.get("data", {})):
             prov.setdefault(path, {"tag": "user"})
-        return cls(data, prov, set(obj.get("locks", [])), obj.get("history", []))
+        # New fields introduced by a migration keep an explicit default tag so
+        # the report can distinguish them from a user's value.
+        for path in flatten(data):
+            prov.setdefault(path, {"tag": "default"})
+        history = list(obj.get("history", []))
+        return cls(data, prov, set(obj.get("locks", [])), history)
+
+    @classmethod
+    def migrate(cls, obj: dict) -> "Spec":
+        """Load a saved document through the current schema migration."""
+        return cls.from_dict(obj)
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=False)
@@ -345,6 +386,39 @@ def deep_update(base: dict, other: dict) -> None:
             deep_update(base[key], value)
         else:
             base[key] = value
+
+
+def migrate_spec_dict(obj: dict) -> dict:
+    """Return a copy of a saved spec document upgraded to the current schema.
+
+    The watch specification is additive: a saved document keeps every value it
+    already has, and fields that did not exist in that revision are filled from
+    the current defaults.  Nothing is guessed for a value the user or solver
+    supplied.  This is intentionally a pure function so it can be tested and
+    used by the store/export path without touching a database.
+    """
+    if not isinstance(obj, dict):
+        raise TypeError("spec document must be a dictionary")
+    out = copy.deepcopy(obj)
+    version = int(out.get("schema_version") or 1)
+    data = out.get("data")
+    if not isinstance(data, dict):
+        # Legacy documents sometimes stored the data fields at the top level.
+        data = {k: v for k, v in out.items()
+                if k not in ("provenance", "locks", "history", "schema_version")}
+    merged = copy.deepcopy(DEFAULTS)
+    deep_update(merged, data)
+    out["data"] = merged
+    out["schema_version"] = SCHEMA_VERSION
+    if version < SCHEMA_VERSION:
+        history = out.get("history")
+        if not isinstance(history, list):
+            history = []
+        history.append({"event": "schema_migration", "from": version,
+                        "to": SCHEMA_VERSION,
+                        "note": "additive fields filled from schema defaults"})
+        out["history"] = history
+    return out
 
 
 def new_spec(name: str = "Untitled", **values) -> Spec:

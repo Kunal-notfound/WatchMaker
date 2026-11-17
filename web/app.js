@@ -43,6 +43,10 @@ const DESIGN = {
   optimisation: null,
   optimiseToken: 0,
   optimiseBusy: false,
+  optimiseAxes: ["weight", "cost"],
+  selectedCandidate: null,
+  pendingApply: null,
+  previewId: "",
   capabilities: {},
   capabilityKey: "",
   providerKey: false,
@@ -51,6 +55,14 @@ const CRITIC = {
   report: null,
   context: null,
   focus: null,
+  loading: false,
+  error: "",
+};
+const MOVEMENT = {
+  catalog: null,
+  list: [],
+  detail: null,
+  proposal: null,
   loading: false,
   error: "",
 };
@@ -268,6 +280,23 @@ async function boot() {
   });
   $("#designPanel").addEventListener("change", onDesignChange);
   $("#btnOptimise").addEventListener("click", runOptimisation);
+  ["optimiseAxisX", "optimiseAxisY"].forEach((id) => {
+    $(`#${id}`)?.addEventListener("change", () => {
+      const x = $("#optimiseAxisX")?.value;
+      const y = $("#optimiseAxisY")?.value;
+      if (!x || !y || x === y) return;
+      DESIGN.optimiseAxes = [x, y];
+      if (DESIGN.optimisation) runOptimisation();
+    });
+  });
+  $("#btnClearPreview")?.addEventListener("click", clearCandidatePreview);
+  $("#btnMovementSearch").addEventListener("click", loadMovementList);
+  $("#movementSearch").addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); loadMovementList(); }
+  });
+  $("#movementMaker").addEventListener("change", loadMovementList);
+  $("#movementType").addEventListener("change", loadMovementList);
+  $("#movementUnknown").addEventListener("change", loadMovementList);
   $("#btnAttach").addEventListener("click", () => $("#chatImages").click());
   $("#chatImages").addEventListener("change", attachImages);
   $("#conversationSearch").addEventListener("input", (event) => {
@@ -291,6 +320,27 @@ async function boot() {
   $("#explode").addEventListener("input", (event) => {
     setExplodeValue(Number(event.target.value), true);
   });
+  const quality = $("#renderQuality");
+  if (quality) {
+    try { quality.value = window.localStorage?.getItem("watchcad.renderQuality") || "high"; }
+    catch { quality.value = "high"; }
+    quality.addEventListener("change", (event) => {
+      viewerEvent("watchcad:quality", { name: event.target.value });
+      if (!window.WatchCAD3D?.available) {
+        renderGroupToggles(V.tree);
+        requestRender();
+      }
+      toast(`render: ${event.target.value}`);
+    });
+  }
+  const background = $("#renderBackground");
+  if (background) {
+    try { background.value = window.localStorage?.getItem("watchcad.background") || "studio"; }
+    catch { background.value = "studio"; }
+    background.addEventListener("change", (event) => {
+      viewerEvent("watchcad:background", { name: event.target.value });
+    });
+  }
   document.addEventListener("click", onGlobalClick);
   setupViewer();
   restorePanels();
@@ -332,6 +382,7 @@ function renderAll() {
   renderDesignPanel();
   renderOptimisation();
   renderCritic();
+  renderMovement();
 }
 
 function applyState(state, options = {}) {
@@ -350,6 +401,7 @@ function applyState(state, options = {}) {
   renderDesignPanel();
   renderOptimisation();
   renderCritic();
+  renderMovement();
   if (options.scene !== false && checksum !== previous) scheduleScene();
   renderSessionChip();
 }
@@ -490,6 +542,162 @@ function metric(value, digits = 2) {
   return typeof value === "number" ? fmt(value, digits) : String(value);
 }
 
+function optMeta(name, result) {
+  return (result?.objectives || {})[name] || {
+    label: name, unit: "", direction: "min", provenance: "calculated",
+  };
+}
+
+function optimisationStale(result) {
+  const current = STATE?.spec?.data?.derived?.checksum || "";
+  return Boolean(result?.baseline_checksum && current
+    && result.baseline_checksum !== current);
+}
+
+function populateAxes(result) {
+  const axes = result?.axes || DESIGN.optimiseAxes || ["weight", "cost"];
+  for (const id of ["optimiseAxisX", "optimiseAxisY"]) {
+    const select = $(`#${id}`);
+    if (!select) continue;
+    const names = Object.keys(result?.objectives || {}).length
+      ? Object.keys(result.objectives) : ["weight", "cost"];
+    const markup = names.map((name) => {
+      const meta = optMeta(name, result);
+      return `<option value="${esc(name)}">${esc(meta.label || name)}</option>`;
+    }).join("");
+    if (select.innerHTML !== markup) select.innerHTML = markup;
+    const desired = axes[id === "optimiseAxisX" ? 0 : 1]
+      || (id === "optimiseAxisX" ? "weight" : "cost");
+    select.value = desired === select.value ? desired : (names.includes(desired) ? desired : names[0]);
+  }
+}
+
+function renderScatter(result, candidates) {
+  const svg = $("#optimiseScatter");
+  const legend = $("#optimiseLegend");
+  if (!svg || !result) return;
+  const [xName, yName] = result.axes || DESIGN.optimiseAxes || [];
+  if (!xName || !yName) { svg.innerHTML = ""; return; }
+  const xMeta = optMeta(xName, result);
+  const yMeta = optMeta(yName, result);
+  const usable = candidates.filter((item) => Number.isFinite(
+    Number(item.objective_values?.[xName])) && Number.isFinite(
+    Number(item.objective_values?.[yName])));
+  const xValues = usable.map((item) => Number(item.objective_values[xName]));
+  const yValues = usable.map((item) => Number(item.objective_values[yName]));
+  let xMin = Math.min(...xValues, 0);
+  let xMax = Math.max(...xValues, 1);
+  let yMin = Math.min(...yValues, 0);
+  let yMax = Math.max(...yValues, 1);
+  if (xMax - xMin < 1e-9) xMax += 1;
+  if (yMax - yMin < 1e-9) yMax += 1;
+  const px = (value) => 46 + (Number(value) - xMin) / (xMax - xMin) * 286;
+  const py = (value) => 204 - (Number(value) - yMin) / (yMax - yMin) * 156;
+  const front = new Set(result.frontier || []);
+
+  const grid = [0, 0.5, 1].map((part) => {
+    const gx = 46 + part * 286;
+    const gy = 204 - part * 156;
+    return `<line x1="${gx}" y1="48" x2="${gx}" y2="204" class="opt-grid"/>
+      <line x1="46" y1="${gy}" x2="332" y2="${gy}" class="opt-grid"/>
+      <text x="${gx}" y="222" text-anchor="middle" class="opt-tick">${metric(xMin + part * (xMax - xMin), 1)}</text>
+      <text x="38" y="${gy + 3}" text-anchor="end" class="opt-tick">${metric(yMin + part * (yMax - yMin), 1)}</text>`;
+  }).join("");
+
+  const points = usable.map((item) => {
+    const x = px(item.objective_values[xName]);
+    const y = py(item.objective_values[yName]);
+    const cls = [item.id === "baseline" ? "baseline" : "",
+      item.feasible ? (front.has(item.id) ? "frontier" : "dominated") : "infeasible",
+      DESIGN.selectedCandidate === item.id ? "selected" : ""].filter(Boolean).join(" ");
+    const title = `${item.label}: ${xName} ${metric(item.objective_values[xName])}, ${yName} ${metric(item.objective_values[yName])}`;
+    return `<g class="opt-point ${cls}" data-select-candidate="${esc(item.id)}" role="button" tabindex="0">
+      <title>${esc(title)}</title>
+      <circle cx="${x}" cy="${y}" r="${front.has(item.id) ? 7 : 5}"/>
+      ${DESIGN.selectedCandidate === item.id
+        ? `<circle class="opt-ring" cx="${x}" cy="${y}" r="11"/>` : ""}
+    </g>`;
+  }).join("");
+
+  svg.innerHTML = `${grid}
+    <line x1="46" y1="204" x2="332" y2="204" class="opt-axis"/>
+    <line x1="46" y1="48" x2="46" y2="204" class="opt-axis"/>
+    <text x="189" y="244" text-anchor="middle" class="opt-label">${esc(xMeta.label || xName)} (${esc(xMeta.direction === "max" ? "higher better" : "lower better")})</text>
+    <text x="12" y="126" text-anchor="middle" transform="rotate(-90 12 126)" class="opt-label">${esc(yMeta.label || yName)} (${esc(yMeta.direction === "max" ? "higher better" : "lower better")})</text>
+    ${points}`;
+  if (legend) {
+    legend.innerHTML = `<span class="opt-key frontier">Pareto frontier</span>
+      <span class="opt-key dominated">dominated</span>
+      <span class="opt-key baseline">baseline</span>
+      <span class="opt-key infeasible">constraint failure</span>`;
+  }
+}
+
+function renderCandidateDetail(candidate, result) {
+  const holder = $("#candidateDetail");
+  if (!holder) return;
+  if (!candidate) {
+    holder.innerHTML = `<div class="empty-note">Select a point or a candidate card to inspect its diff, constraints and verification report.</div>`;
+    return;
+  }
+  const stale = optimisationStale(result);
+  const base = result.baseline || {};
+  const objectives = (result.axes || []).map((name) => {
+    const meta = optMeta(name, result);
+    const value = candidate.objective_values?.[name];
+    const before = base.objective_values?.[name];
+    const delta = Number.isFinite(Number(value)) && Number.isFinite(Number(before))
+      ? Number(value) - Number(before) : null;
+    return `<tr><td>${esc(meta.label || name)}</td>
+      <td>${metric(before)}</td><td><b>${metric(value)}</b></td>
+      <td>${delta === null ? "—" : `${delta >= 0 ? "+" : ""}${metric(delta, 3)}`}</td>
+      <td>${esc(meta.provenance || "calculated")}</td></tr>`;
+  }).join("");
+  const diff = (candidate.applied || []).map((change) => `<tr>
+      <td><code>${esc(change.path)}</code></td>
+      <td>${esc(metric(change.from))}</td><td>${esc(metric(change.to))}</td></tr>`).join("")
+    || `<tr><td colspan="3">No field changes.</td></tr>`;
+  const constraints = (candidate.constraints || []).map((row) => `<tr>
+      <td><span class="fit-badge ${esc(row.status)}">${esc(row.status)}</span></td>
+      <td>${esc(row.id)}</td><td>${esc(row.detail)}</td>
+      <td>${esc(row.provenance || "")}</td></tr>`).join("");
+  const armed = DESIGN.pendingApply === candidate.id;
+  const canApply = !stale && candidate.feasible && candidate.status === "ok"
+    && Boolean(candidate.changes?.length);
+  holder.innerHTML = `<div class="candidate-detail-head">
+      <h3>${esc(candidate.label || candidate.id)}</h3>
+      <span class="provenance ${candidate.feasible ? "calculated" : "failed"}">
+        ${candidate.feasible ? "constraints pass" : "constraint failure"}</span>
+    </div>
+    <p>${esc(candidate.rationale || "")}</p>
+    <div class="candidate-detail-grid">
+      <div><h4>Objectives vs baseline</h4>
+        <table class="mini-table"><thead><tr><th>Axis</th><th>Baseline</th><th>Candidate</th><th>Δ</th><th>Source</th></tr></thead>
+        <tbody>${objectives || `<tr><td colspan="5">No axes selected.</td></tr>`}</tbody></table>
+      </div>
+      <div><h4>Proposed diff</h4>
+        <table class="mini-table"><thead><tr><th>Field</th><th>From</th><th>To</th></tr></thead>
+        <tbody>${diff}</tbody></table>
+      </div>
+    </div>
+    <h4>Hard constraints</h4>
+    <table class="mini-table"><thead><tr><th>Status</th><th>Constraint</th><th>Detail</th><th>Source</th></tr></thead>
+      <tbody>${constraints}</tbody></table>
+    <p class="provenance">verification: ${metric(candidate.verification?.fail, 0)} failing ·
+      ${metric(candidate.verification?.needs_test, 0)} need bench testing ·
+      ${metric(candidate.metrics?.stack_margin_mm)} mm stack margin</p>
+    <div class="candidate-foot">
+      <button class="btn small" data-preview-candidate="${esc(candidate.id)}"
+        ${candidate.status !== "ok" ? "disabled" : ""}>Preview in 3D</button>
+      <button class="btn small" data-apply-candidate="${esc(candidate.id)}"
+        ${canApply ? "" : "disabled"}>${armed ? "Change selection" : "Apply…"}</button>
+      ${armed ? `<button class="btn small primary" data-confirm-candidate="${esc(candidate.id)}">Confirm apply</button>
+        <button class="btn small" data-cancel-apply="1">Cancel</button>` : ""}
+      <button class="btn small" data-undo-candidate="1">Undo last apply</button>
+    </div>
+    <p class="design-note">Applying writes a new checked version through the validated variant pipeline. Undo restores the previous version; no candidate is applied without confirmation.</p>`;
+}
+
 function renderOptimisation() {
   const holder = $("#candidateList");
   const status = $("#optimiseStatus");
@@ -498,27 +706,37 @@ function renderOptimisation() {
   const current = STATE?.spec?.data?.derived?.checksum || "";
   if (!result) {
     holder.innerHTML = "";
+    renderScatter(null, []);
+    renderCandidateDetail(null, null);
     if (!DESIGN.optimiseBusy) {
       status.textContent = "Not run yet. The current design is the baseline.";
     }
     return;
   }
-  const stale = Boolean(result.baseline_checksum && current
-    && result.baseline_checksum !== current);
+  populateAxes(result);
+  const stale = optimisationStale(result);
   const candidates = result.candidates || [];
   const winner = candidates.find((item) => item.id === result.winner);
+  const frontier = new Set(result.frontier || []);
   status.innerHTML = `${stale
     ? "<b>Design changed since this run.</b> Rerun to compare against the current spec. "
-    : ""}${candidates.length} candidates · objective <b>${esc(result.objective)}</b> · winner <b>${esc(winner?.label || "none")}</b>`
-    + `<br><span class="provenance">calculated geometry · estimated cost · no physical verification</span>`;
+    : ""}${candidates.length} candidates · ${metric(result.feasible_count, 0)} feasible ·
+    objective <b>${esc(result.objective)}</b> · recommendation <b>${esc(winner?.label || "none")}</b>
+    · Pareto front <b>${metric(frontier.size, 0)}</b>
+    <br><span class="provenance">seed ${esc(result.reproducibility?.seed || "—")} ·
+    finite deterministic probe set · no global-optimality claim · no physical verification</span>`;
   holder.innerHTML = candidates.map((candidate) => {
     const m = candidate.metrics || {};
     const isWinner = candidate.id === result.winner;
-    const disabled = stale || !candidate.changes?.length || candidate.status !== "ok";
-    return `<article class="candidate ${isWinner ? "winner" : ""} ${candidate.status !== "ok" ? "failed" : ""}">
+    const isFront = frontier.has(candidate.id);
+    const disabled = stale || !candidate.feasible || !candidate.changes?.length
+      || candidate.status !== "ok";
+    return `<article class="candidate ${isWinner ? "winner" : ""} ${isFront ? "frontier" : ""}
+        ${candidate.feasible ? "" : "failed"} ${DESIGN.selectedCandidate === candidate.id ? "selected" : ""}"
+        data-inspect-candidate="${esc(candidate.id)}">
       <div class="candidate-head">
         <b>${esc(candidate.label || candidate.id)}</b>
-        <span class="candidate-rank">#${esc(candidate.rank ?? "—")}${isWinner ? " · best" : ""}</span>
+        <span class="candidate-rank">#${esc(candidate.rank ?? "—")}${isWinner ? " · best" : ""}${isFront ? " · frontier" : ""}</span>
       </div>
       <p>${esc(candidate.rationale || "")}</p>
       <div class="candidate-metrics">
@@ -532,33 +750,44 @@ function renderOptimisation() {
         <span>needs test <b>${metric(m.needs_test, 0)}</b></span>
       </div>
       <div class="candidate-foot">
-        <span class="provenance ${candidate.status !== "ok" ? "failed" : candidate.measurable ? "calculated" : "estimated"}">${candidate.status !== "ok"
-          ? "solver failed"
-          : candidate.measurable ? "change measured" : "visual change only"}</span>
+        <span class="provenance ${candidate.feasible ? (candidate.measurable ? "calculated" : "estimated") : "failed"}">${candidate.feasible
+          ? (candidate.measurable ? "change measured · constraints pass" : "visual change only")
+          : "constraint failure"}</span>
         <button class="btn small" data-apply-candidate="${esc(candidate.id)}"
-          ${disabled ? "disabled" : ""} title="${stale ? "Rerun after the design changed" : "Apply through solver + verifier"}">Apply</button>
+          ${disabled ? "disabled" : ""} title="${stale ? "Rerun after the design changed" : "Review and confirm before applying"}">Apply…</button>
       </div>
       ${candidate.error ? `<p class="provenance failed">${esc(candidate.error)}</p>` : ""}
     </article>`;
   }).join("");
+  renderScatter(result, candidates);
+  const selected = candidates.find((item) => item.id === DESIGN.selectedCandidate);
+  renderCandidateDetail(selected, result);
 }
 
 async function runOptimisation() {
   if (DESIGN.optimiseBusy) return;
   const objective = $("#optimiseObjective")?.value || "weight";
   const budget = Number($("#optimiseBudget")?.value || 9);
+  const x = $("#optimiseAxisX")?.value || DESIGN.optimiseAxes[0] || "weight";
+  const y = $("#optimiseAxisY")?.value || DESIGN.optimiseAxes[1] || "cost";
+  if (x === y) { toast("scatter axes must be different", true); return; }
+  DESIGN.optimiseAxes = [x, y];
   const token = ++DESIGN.optimiseToken;
   DESIGN.optimiseBusy = true;
+  DESIGN.pendingApply = null;
   const status = $("#optimiseStatus");
   if (status) status.textContent = `Solving and verifying ${budget} candidates…`;
   setLoading(true, "solving optimisation candidates");
   try {
-    const result = await api("/api/optimise", { objective, budget });
+    const result = await api("/api/optimise", { objective, budget, axes: [x, y] });
     if (token !== DESIGN.optimiseToken) return;
     DESIGN.optimisation = result;
+    if (!result.candidates?.some((item) => item.id === DESIGN.selectedCandidate)) {
+      DESIGN.selectedCandidate = null;
+    }
     renderOptimisation();
     const winner = (result.candidates || []).find((item) => item.id === result.winner);
-    toast(winner ? `best candidate: ${winner.label}` : "optimisation returned no candidates");
+    toast(winner ? `recommendation: ${winner.label}` : "optimisation returned no candidates");
   } catch (error) {
     if (status) status.textContent = `Optimisation failed: ${error.message}`;
     toast(error.message, true);
@@ -566,6 +795,49 @@ async function runOptimisation() {
     DESIGN.optimiseBusy = false;
     setLoading(false);
   }
+}
+
+async function previewCandidate(id) {
+  const result = DESIGN.optimisation;
+  const candidate = (result?.candidates || []).find((item) => item.id === id);
+  if (!candidate) { toast("that candidate is no longer available", true); return; }
+  if (optimisationStale(result)) {
+    toast("rerun optimisation after the design changed", true);
+    return;
+  }
+  setLoading(true, `building 3D preview of ${candidate.label}`);
+  try {
+    const payload = await api("/api/optimise/preview", {
+      changes: candidate.changes || [],
+      baseline_checksum: result.baseline_checksum,
+      label: candidate.label,
+    });
+    DESIGN.previewId = payload.preview;
+    const button = $("#btnClearPreview");
+    if (button) button.hidden = false;
+    viewerEvent("watchcad:model-url", {
+      url: `/api/model.glb?preview=${encodeURIComponent(payload.preview)}`,
+    });
+    toast(`previewing ${candidate.label}; the live design is unchanged`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+function clearCandidatePreview() {
+  DESIGN.previewId = "";
+  const button = $("#btnClearPreview");
+  if (button) button.hidden = true;
+  viewerEvent("watchcad:model-url", { url: "" });
+}
+
+function armCandidateApply(id) {
+  DESIGN.pendingApply = id;
+  DESIGN.selectedCandidate = id;
+  renderOptimisation();
+  toast("review the diff, then confirm the apply");
 }
 
 async function applyCandidate(id) {
@@ -577,6 +849,7 @@ async function applyCandidate(id) {
     toast("the design changed; rerun optimisation before applying", true);
     return;
   }
+  if (!candidate.feasible) { toast("candidate failed a hard constraint", true); return; }
   const changes = (candidate.changes || []).map((change) => ({
     path: change.path, to: change.value, from: change.from,
   }));
@@ -590,10 +863,331 @@ async function applyCandidate(id) {
     applyAgentResult(payload);
     CHAT.messages.push(assistantFromAgent(payload));
     renderChat();
+    DESIGN.pendingApply = null;
+    DESIGN.selectedCandidate = id;
+    clearCandidatePreview();
+    renderOptimisation();
     const failed = Number(payload.verification?.fail ?? payload.summary?.fail ?? 0);
     toast(failed
-      ? `applied with ${failed} failing check(s); inspect Engineering Studio`
-      : `applied ${candidate.label} through the validated pipeline`);
+      ? `applied with ${failed} failing check(s); use Undo to roll back`
+      : `applied ${candidate.label} as a new version; Undo is available`);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    setLoading(false);
+  }
+}
+
+/* ------------------------------------------------------ movement database */
+function movementParams() {
+  const params = new URLSearchParams();
+  const q = $("#movementSearch")?.value?.trim();
+  const maker = $("#movementMaker")?.value;
+  const type = $("#movementType")?.value;
+  if (q) params.set("q", q);
+  if (maker) params.set("maker", maker);
+  if (type) params.set("type", type);
+  for (const [id, key] of [["movementMinDiameter", "min_diameter"],
+    ["movementMaxDiameter", "max_diameter"],
+    ["movementMaxThickness", "max_thickness"]]) {
+    const value = $(`#${id}`)?.value;
+    if (value !== "" && value !== undefined) params.set(key, value);
+  }
+  if ($("#movementUnknown")?.checked) params.set("include_unknown", "1");
+  return params;
+}
+
+function populateMovementFilters() {
+  const maker = $("#movementMaker");
+  if (!maker || !MOVEMENT.catalog) return;
+  const current = maker.value;
+  const makers = MOVEMENT.catalog.makers || [];
+  maker.innerHTML = `<option value="">All makers</option>`
+    + makers.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+  if (makers.includes(current)) maker.value = current;
+}
+
+async function loadMovementCatalog() {
+  if (MOVEMENT.catalog) { populateMovementFilters(); renderMovement(); return; }
+  MOVEMENT.error = "";
+  try {
+    const data = await api(withSession("/api/movements"));
+    MOVEMENT.catalog = data;
+    MOVEMENT.list = data.movements || [];
+    populateMovementFilters();
+    renderMovement();
+  } catch (error) {
+    MOVEMENT.error = error.message;
+    renderMovement();
+  }
+}
+
+async function loadMovementList() {
+  MOVEMENT.error = "";
+  try {
+    const params = movementParams();
+    const data = await api(withSession(`/api/movements?${params.toString()}`));
+    MOVEMENT.catalog = data;
+    MOVEMENT.list = data.movements || [];
+    populateMovementFilters();
+    renderMovement();
+  } catch (error) {
+    MOVEMENT.error = error.message;
+    renderMovement();
+  }
+}
+
+async function loadMovementDetail(id) {
+  if (!id) return;
+  MOVEMENT.loading = true;
+  MOVEMENT.error = "";
+  MOVEMENT.proposal = null;
+  renderMovement();
+  try {
+    const data = await api(withSession(`/api/movements/detail?id=${encodeURIComponent(id)}`));
+    MOVEMENT.detail = data;
+  } catch (error) {
+    MOVEMENT.error = error.message;
+  } finally {
+    MOVEMENT.loading = false;
+    renderMovement();
+  }
+}
+
+function movementValue(value) {
+  if (value === null || value === undefined || value === "") return "not published";
+  if (typeof value === "boolean") return value ? "yes" : "no";
+  if (typeof value === "number") return `${fmt(value, 2)}`;
+  return String(value);
+}
+
+function fitStatus(status) {
+  const key = String(status || "UNKNOWN").toLowerCase();
+  return `<span class="fit-status ${esc(key)}">${esc(status)}</span>`;
+}
+
+function movementSpecRows(record, provenance) {
+  const groups = [
+    ["Identity", ["manufacturer", "calibre", "line", "type", "winding",
+      "manual_winding", "hacking"]],
+    ["Envelope", ["diameter_mm", "case_fitting_diameter_mm", "overall_diameter_mm",
+      "thickness_mm", "stack_height_mm"]],
+    ["Dial and hands", ["dial.max_diameter_mm", "dial.date_position",
+      "hand_fitting.hour_mm", "hand_fitting.minute_mm", "hand_fitting.second_mm"]],
+    ["Stem", ["stem.position_height_mm", "stem.diameter_mm",
+      "stem.distance_from_centre_mm"]],
+    ["Performance", ["frequency_bph", "power_reserve_h", "jewels",
+      "accuracy_s_per_day", "lift_angle_deg"]],
+    ["Mounting", ["mounting.method", "mounting.caseback"]],
+  ];
+  const label = (path) => path.split(".").pop().replaceAll("_", " ");
+  return groups.map(([title, paths]) => {
+    const rows = paths.map((path) => {
+      const prov = provenance[path] || { value: getPath(record, path), status: "unknown" };
+      const source = prov.source_url
+        ? ` <a href="${esc(prov.source_url)}" target="_blank" rel="noreferrer noopener">source</a>` : "";
+      return `<tr>
+        <th title="${esc(path)}">${esc(label(path))}</th>
+        <td>${esc(movementValue(prov.value))}</td>
+        <td><span class="prov ${esc(prov.status || "unknown")}">${esc(prov.status || "unknown")}</span>${source}
+          ${prov.note ? `<div class="movement-note">${esc(prov.note)}</div>` : ""}</td>
+      </tr>`;
+    }).join("");
+    return `<table class="movement-table"><caption>${esc(title)}</caption><tbody>${rows}</tbody></table>`;
+  }).join("");
+}
+
+function envelopeSvg(envelope) {
+  if (!envelope) return "";
+  const caseD = Number(envelope.case_diameter_mm) || 40;
+  const moveD = Number(envelope.movement_diameter_mm) || 26;
+  const caseT = Number(envelope.case_thickness_mm) || 11;
+  const moveT = Number(envelope.movement_thickness_mm) || 4.6;
+  const scale = 58 / Math.max(1, caseD / 2);
+  const cx = 64, cy = 64;
+  const rCase = (caseD / 2) * scale;
+  const rMove = (moveD / 2) * scale;
+  const sideScale = Math.min(6, 90 / Math.max(caseT, 1));
+  const x0 = 150, y0 = 24;
+  return `<svg class="envelope-svg" viewBox="0 0 244 130" role="img"
+      aria-label="Case and movement envelope preview">
+    <title>Case Ø${fmt(caseD)} mm against movement Ø${fmt(moveD)} mm</title>
+    <circle cx="${cx}" cy="${cy}" r="${rCase}" fill="none" stroke="#59677a" stroke-width="1.4"/>
+    <circle cx="${cx}" cy="${cy}" r="${rMove}" fill="rgba(100,168,232,.14)" stroke="#64a8e8" stroke-width="1.2"/>
+    <line x1="${cx - rCase}" y1="${cy}" x2="${cx + rCase}" y2="${cy}" stroke="#59677a" stroke-dasharray="3 3"/>
+    <text x="${cx}" y="${cy + rCase + 12}" text-anchor="middle" class="svg-label">top · Ø case / movement</text>
+    <rect x="${x0}" y="${y0}" width="${caseT * sideScale}" height="76" fill="none" stroke="#59677a" stroke-width="1.4"/>
+    <rect x="${x0}" y="${y0 + 6}" width="${moveT * sideScale}" height="64" fill="rgba(100,168,232,.14)" stroke="#64a8e8" stroke-width="1.2"/>
+    <text x="${x0}" y="${y0 + 90}" class="svg-label">section · H case / movement</text>
+  </svg>`;
+}
+
+function movementDetailHtml() {
+  const detail = MOVEMENT.detail;
+  if (!detail) return MOVEMENT.loading
+    ? `<p class="movement-empty">Loading movement record…</p>`
+    : `<p class="movement-empty">Choose a calibre to inspect its published specifications, provenance and fit.</p>`;
+  const record = detail.record;
+  const fit = detail.compatibility || {};
+  const checks = fit.checks || [];
+  const envelope = detail.envelope || {};
+  const proposal = MOVEMENT.proposal;
+  const counts = fit.counts || {};
+  const suggested = proposal?.suggested_changes || [];
+  const identity = proposal?.variant?.changes || [];
+  const missing = detail.missing || [];
+  const sources = detail.sources || record.sources_full || [];
+  const diffRows = [...identity, ...suggested].map((change) =>
+    `<tr><td>${esc(change.path)}</td><td>${esc(movementValue(change.from))}</td>
+      <td>${esc(movementValue(change.to))}</td>
+      <td>${esc(change.reason || change.note || "")}</td></tr>`).join("");
+  return `<section class="movement-record">
+    <div class="movement-record-head">
+      <div>
+        <h3>${esc(record.name)}</h3>
+        <p>${esc(record.manufacturer)} · ${esc(record.type)} · ${esc(record.status)} ·
+          verified ${esc(record.verified_at)}</p>
+      </div>
+      <div class="movement-score">${fitStatus(fit.overall)}
+        <span>${counts.PASS || 0} pass · ${counts.WARNING || 0} warn ·
+          ${counts.FAIL || 0} fail · ${counts.UNKNOWN || 0} unknown</span></div>
+    </div>
+    ${MOVEMENT.loading ? `<p class="provenance">Refreshing…</p>` : ""}
+    ${movementSpecRows(record, detail.provenance || {})}
+    <div class="movement-envelope-wrap">
+      ${envelopeSvg(envelope)}
+      <dl class="movement-envelope">
+        <div><dt>Case</dt><dd>Ø${fmt(envelope.case_diameter_mm)} × ${fmt(envelope.case_thickness_mm)} mm</dd></div>
+        <div><dt>Case bore</dt><dd>Ø${fmt(envelope.case_bore_mm)} mm</dd></div>
+        <div><dt>Movement</dt><dd>Ø${fmt(envelope.movement_diameter_mm)} × ${fmt(envelope.movement_thickness_mm)} mm</dd></div>
+        <div><dt>Radial clearance</dt><dd>${envelope.radial_clearance_mm === null ? "unknown" : `${fmt(envelope.radial_clearance_mm, 3)} mm`}</dd></div>
+      </dl>
+    </div>
+    <h4>Compatibility report</h4>
+    <div class="fit-list">${checks.map((check) => `<article class="fit-check ${esc(check.status.toLowerCase())}">
+      <div class="fit-check-head">${fitStatus(check.status)} <b>${esc(check.label)}</b></div>
+      <p>${esc(check.detail)}</p>
+      ${check.fix ? `<div class="movement-note">Suggested: ${esc(check.fix.path)} → ${esc(movementValue(check.fix.to))}</div>` : ""}
+    </article>`).join("")}</div>
+    <p class="movement-assumption">${esc(fit.assumptions?.note || "")}</p>
+    <div class="movement-propose">
+      <div>
+        <h4>Adopt this calibre</h4>
+        <p class="movement-note">The proposal is a diff only. Nothing changes until you confirm below; applying runs the solver, mesh builder and verifier.</p>
+      </div>
+      <button class="btn small primary" data-movement-propose="${esc(record.id)}">Review fit proposal</button>
+    </div>
+    ${proposal ? `<div class="movement-proposal">
+      <div class="movement-proposal-head">
+        <b>Spec diff</b>
+        <span class="provenance">baseline ${esc(String(proposal.baseline?.checksum || "").slice(0, 12))}</span>
+      </div>
+      ${diffRows ? `<table class="movement-diff"><thead><tr><th>path</th><th>from</th><th>to</th><th>reason</th></tr></thead><tbody>${diffRows}</tbody></table>`
+        : `<p class="movement-note">The identity fields already match this record. No fit correction is suggested.</p>`}
+      ${(proposal.notes || []).map((note) => `<p class="movement-note">${esc(note)}</p>`).join("")}
+      ${(proposal.locked || []).length ? `<p class="movement-note locked-note">Locked fields are skipped: ${proposal.locked.map((item) => esc(item.path)).join(", ")}</p>` : ""}
+      <p class="movement-note">Consequences: ${suggested.length} fit correction(s) would be applied with the movement identity. ${counts.FAIL || 0} check(s) currently fail and ${counts.UNKNOWN || 0} cannot be confirmed from the retained source.</p>
+      <div class="movement-proposal-actions">
+        <button class="btn small primary" data-movement-apply="fit">Apply movement + fit changes</button>
+        <button class="btn small" data-movement-apply="identity">Apply movement identity only</button>
+        <button class="btn small ghost" data-movement-cancel>Cancel</button>
+      </div>
+    </div>` : ""}
+    <details class="movement-missing" ${missing.length ? "open" : ""}>
+      <summary>${missing.length} unpublished field(s)</summary>
+      <ul>${missing.map((item) => `<li><b>${esc(item.path)}</b> — ${esc(item.reason)}</li>`).join("")}</ul>
+    </details>
+    <h4>Sources</h4>
+    <ul class="movement-sources">${sources.map((source) => `<li>
+      <a href="${esc(source.url)}" target="_blank" rel="noreferrer noopener">${esc(source.name)}</a>
+      <span>${esc(source.publisher)}${source.revision ? ` · ${esc(source.revision)}` : ""}${source.published ? ` · ${esc(source.published)}` : ""} · retrieved ${esc(source.retrieved)}</span>
+      ${source.note ? `<small>${esc(source.note)}</small>` : ""}
+    </li>`).join("")}</ul>
+    <p class="movement-note">${esc(detail.current?.note || "")} Compatibility uses the current design as the baseline; it is not a tolerance stack or a solid-kernel interference check.</p>
+  </section>`;
+}
+
+function renderMovement() {
+  const list = $("#movementList");
+  const detail = $("#movementDetail");
+  if (!list || !detail) return;
+  if (MOVEMENT.error) {
+    list.innerHTML = `<p class="movement-empty bad">${esc(MOVEMENT.error)}</p>`;
+    detail.innerHTML = "";
+    return;
+  }
+  if (!MOVEMENT.catalog) {
+    list.innerHTML = `<p class="movement-empty">Loading the sourced movement catalogue…</p>`;
+    detail.innerHTML = "";
+    return;
+  }
+  const items = MOVEMENT.list || [];
+  list.innerHTML = items.length ? items.map((item) => {
+    const active = MOVEMENT.detail?.record?.id === item.id;
+    return `<button class="movement-item ${active ? "active" : ""}" data-movement="${esc(item.id)}">
+      <span class="movement-item-name"><b>${esc(item.manufacturer)}</b> ${esc(item.calibre)}</span>
+      <span class="movement-item-meta">${esc(item.type)} · Ø${fmt(item.diameter_mm)} × ${fmt(item.thickness_mm)} mm
+        · ${item.missing_count} unpublished</span>
+      <span class="prov ${esc(item.status)}">${esc(item.status)}</span>
+    </button>`;
+  }).join("") : `<p class="movement-empty">No records match those filters. Widen the dimensions or include unknown values.</p>`;
+  detail.innerHTML = movementDetailHtml();
+}
+
+async function proposeMovement() {
+  const id = MOVEMENT.detail?.record?.id;
+  if (!id) return;
+  MOVEMENT.loading = true;
+  try {
+    MOVEMENT.proposal = await api("/api/movements/propose", { id });
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    MOVEMENT.loading = false;
+    renderMovement();
+  }
+}
+
+async function applyMovementProposal(scope) {
+  const proposal = MOVEMENT.proposal;
+  if (!proposal) return;
+  const merged = new Map();
+  const push = (change) => {
+    if (!change?.path) return;
+    merged.set(change.path, {
+      path: change.path,
+      from: change.from,
+      to: change.to,
+      note: change.reason || change.note || "movement fit",
+    });
+  };
+  (proposal.variant?.changes || []).forEach(push);
+  if (scope === "fit") (proposal.suggested_changes || []).forEach(push);
+  const changes = [...merged.values()];
+  if (!changes.length) { toast("no spec changes are needed for this movement", true); return; }
+  const record = proposal.movement;
+  const label = scope === "fit"
+    ? `Fit ${record.name} with corrections`
+    : `Fit ${record.name}`;
+  setLoading(true, "applying movement through solver and verifier");
+  try {
+    const payload = await api("/api/agent/variant", {
+      variant: {
+        label,
+        rationale: `Adopt ${record.manufacturer} ${record.calibre} from the sourced movement database.`,
+        changes,
+      },
+      mode: "safe",
+    });
+    applyAgentResult(payload);
+    CHAT.messages.push(assistantFromAgent(payload));
+    renderChat();
+    MOVEMENT.proposal = null;
+    await loadMovementDetail(record.id);
+    const failed = Number(payload.verification?.fail ?? payload.summary?.fail ?? 0);
+    toast(failed
+      ? `applied as a new design version with ${failed} failing check(s); inspect Checks`
+      : "applied as a new design version; use undo to return to the previous version");
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -2868,8 +3462,41 @@ function onGlobalClick(event) {
   if (workspace) { setWorkspace(workspace.dataset.workspace); return; }
   const dialSwatch = event.target.closest("[data-dial-color]");
   if (dialSwatch) { setField("dial.color", dialSwatch.dataset.dialColor); return; }
+  const confirmCandidate = event.target.closest("[data-confirm-candidate]");
+  if (confirmCandidate) { applyCandidate(confirmCandidate.dataset.confirmCandidate); return; }
+  if (event.target.closest("[data-cancel-apply]")) {
+    DESIGN.pendingApply = null;
+    renderOptimisation();
+    return;
+  }
+  if (event.target.closest("[data-clear-preview]")) { clearCandidatePreview(); return; }
+  if (event.target.closest("[data-undo-candidate]")) { undoTurn(); return; }
   const candidate = event.target.closest("[data-apply-candidate]");
-  if (candidate) { applyCandidate(candidate.dataset.applyCandidate); return; }
+  if (candidate) { armCandidateApply(candidate.dataset.applyCandidate); return; }
+  const previewCandidateButton = event.target.closest("[data-preview-candidate]");
+  if (previewCandidateButton) {
+    previewCandidate(previewCandidateButton.dataset.previewCandidate);
+    return;
+  }
+  const inspected = event.target.closest("[data-select-candidate]")
+    || event.target.closest("[data-inspect-candidate]");
+  if (inspected) {
+    DESIGN.selectedCandidate = inspected.dataset.selectCandidate
+      || inspected.dataset.inspectCandidate;
+    renderOptimisation();
+    return;
+  }
+  const movement = event.target.closest("[data-movement]");
+  if (movement) { loadMovementDetail(movement.dataset.movement); return; }
+  const movementPropose = event.target.closest("[data-movement-propose]");
+  if (movementPropose) { proposeMovement(); return; }
+  const movementApply = event.target.closest("[data-movement-apply]");
+  if (movementApply) { applyMovementProposal(movementApply.dataset.movementApply); return; }
+  if (event.target.closest("[data-movement-cancel]")) {
+    MOVEMENT.proposal = null;
+    renderMovement();
+    return;
+  }
   const provider = event.target.closest("[data-provider]");
   if (provider) { selectProvider(provider.dataset.provider); return; }
   if (event.target.closest("[data-close-provider]")) { closeProviders(); return; }
@@ -2984,6 +3611,7 @@ function switchTab(name) {
   $$(".tab-panel").forEach((panel) =>
     panel.classList.toggle("active", panel.id === `tab-${name}`));
   if (name === "critic" && !CRITIC.report && !CRITIC.loading) refreshCritic();
+  if (name === "movement" && !MOVEMENT.catalog) loadMovementCatalog();
 }
 
 /* --------------------------------------------------------------- viewer */

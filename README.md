@@ -41,11 +41,11 @@ python3 -m watchcad export dress.json --format pdf -o out/dress.pdf
 Run the test suite:
 
 ```bash
-python3 -m unittest discover -s tests -v     # 119 tests, ~33 s
+python3 -m unittest discover -s tests -v     # 161 tests, ~54 s
 
 # browser smoke test (Node 18+, no npm packages)
 python3 -m watchcad serve --port 8766 &
-node tests/ui_smoke.js                        # boot, chat stream, copilot, undo, steppers, views, sidebars
+node tests/ui_smoke.js                        # boot, chat, undo, focus/critic, movements, Pareto lab, preview/rollback
 ```
 
 Optional editable install:
@@ -84,12 +84,17 @@ The generated specs are in [`examples/`](examples/).
   and slide them in and out smoothly in both directions: click to hide, click
   again to show.
 - **Three.js PBR preview.** `/api/model.glb` is a binary glTF export of the
-  solved assembly with per-part materials and vertex normals. The browser
+  solved assembly with UVs, vertex normals and PBR material extras. The browser
   renders it with physically based materials, image-based lighting from a
   procedural room environment, a directional shadow and OrbitControls. A local
   copy of Three.js 0.160 is vendored under `web/vendor/`, so the studio does not
   depend on a CDN. If WebGL is unavailable the original software canvas stays
   active as a complete fallback.
+- **Render quality presets.** Low, Medium and High change tessellation, shadow
+  size, pixel ratio and procedural texture size; scenes are cached per quality
+  and textures are reused by the viewer. Geometry dimensions and verification
+  are identical across presets — quality is a performance hint, not an
+  engineering-accuracy setting.
 - **Conversational assistant.** The right panel is a chat-first assistant, not a
   one-shot prompt box. Most messages are answered directly: it can explain a
   material, compare movements, research a standard, inspect the current design
@@ -150,13 +155,25 @@ The generated specs are in [`examples/`](examples/).
   assistant is required to say when the configured model cannot see them.
   **Generate alternatives** calls the deterministic variant planner; nothing is
   applied until you choose a card.
-- **Optimisation Lab.** One objective at a time (weight, material cost,
-  manufacturability, tolerance or assembly). The lab evaluates a deterministic
-  field of real spec changes through the solver, mesh builder and verifier.
-  Candidates show mass, estimated cost, part count, DFM failures, stack margin,
-  failing checks and rank. Applying a candidate sends its changes through the
-  same validated variant pipeline; the design is never patched directly by the
-  optimiser.
+- **Pareto Optimisation Lab.** The lab evaluates a deterministic field of real
+  spec changes through the solver, mesh builder and verifier. Hard constraints
+  are separate from five mixed-direction objectives (minimum mass/cost/
+  manufacturability/assembly index, maximum tolerance margin). A selectable
+  scatter splits the Pareto frontier from dominated and infeasible candidates;
+  inspection shows objective deltas, constraints, verification and the baseline
+  diff. A candidate can be loaded as a non-mutating 3-D preview, then applied
+  only after explicit confirmation through the validated variant pipeline as a
+  new version. Undo restores the prior solved design. The single-objective
+  recommendation is a finite-probe suggestion, with the Pareto front reported
+  separately and no global-optimality claim.
+- **Movement database tab.** A small, source-gated catalogue of ETA 2824-2,
+  Miyota 9015, Sellita SW200-1 and Seiko NH35A calibres lives in
+  `watchcad/movements.py` and is fetched through the API, never embedded in the
+  frontend. Each field is `verified`, `secondary`, `estimated` or `unknown`;
+  blanks mean the source does not publish the value. Detail shows sources,
+  per-field provenance, an envelope and structured PASS/WARNING/FAIL/UNKNOWN
+  compatibility for case diameter/height, mounting, stem/crown, dial, hands,
+  date alignment and caseback clearance. Nothing is applied without approval.
 
 ---
 
@@ -177,9 +194,14 @@ The generated specs are in [`examples/`](examples/).
    checksum. Gear ratios are found with exact `Fraction` arithmetic; only the
    final presentation profiles are approximated.
 4. **Parts.** Pure functions turn the solved spec into meshes with a small
-   dependency-free kernel (revolve, extrude, tube, dome, torus, sweep).
+   dependency-free kernel (revolve, extrude, tube, dome, torus, sweep, lens,
+   chamfered disc, arc ring and knurl). Case/dial/hand furniture is spec-driven;
+   PBR finishes and nominal densities live in one central material library.
 5. **Verification.** Checks are labelled `calculated` / `estimated` /
-   `needs_test`, and failures carry one-click fixes.
+   `needs_test`, and failures carry one-click fixes. A scene-level pass also
+   reports missing or disconnected parts, layer order, envelope violations,
+   collisions and invalid dimensions. Visual approximation, parametric geometry
+   and validated solid geometry are reported as distinct things.
 6. **Build.** Everything is written to one directory with a sha256 manifest.
    Rebuilding an unchanged spec is a cache hit.
 
@@ -223,6 +245,11 @@ Locks survive prompts: parsing "make it 44 mm" against a spec with
 `case.diameter_mm` locked keeps the old value and reports `locked, kept:
 case.diameter_mm` in the result.
 
+Saved projects carry `schema_version`. `migrate_spec_dict()` upgrades older
+documents to `SCHEMA_VERSION = 3` additively: existing values are preserved and
+new fields come from current defaults, with a migration entry in the spec
+history. Nothing that was previously supplied is guessed or overwritten.
+
 ---
 
 ## Verification without a single badge
@@ -248,13 +275,82 @@ Layers: `spec`, `geometry`, `kinematics`, `energy`, `tolerance`,
 
 ---
 
+## Higher-fidelity geometry and rendering
+
+The deterministic builder in `watchcad/parts.py` adds profile transitions,
+bezels, lugs, crown guards and grips, crystal curvature and edge detail,
+caseback options, applied and printed indices, lume, detailed hands, date and
+complication apertures, and dial textures from the same spec fields used by the
+solver. It has explicit layer stacking and clearance fields rather than
+decorative drawing-only shapes. `watchcad/mesh.py` supplies UV-mapped lens,
+chamfer and arc-ring primitives; `watchcad/materials.py` is the one place for
+PBR finishes and nominal densities.
+
+These are **parametric mesh approximations**, not B-rep solids. Chamfers,
+curved crystals and knurls are generated deterministically and labelled as
+approximations; there are no booleans, fillet kernel, draft or screw threads.
+`watchcad/verify.py` checks missing/disconnected parts, positions, collisions,
+invalid dimensions, inconsistent references and generation failures in addition
+to the classic engineering checks. A scene can render convincingly and still be
+unmanufacturable — the verifier does not collapse that distinction into a badge.
+
+Rendering runs through Low/Medium/High presets. The server caches solved scenes
+per quality; GLB carries PBR information and UVs; the viewer reuses procedural
+textures, caps pixel ratio and shadows, and renders on demand. Candidate
+previews use short-lived session tokens and never replace the live design.
+
+---
+
+## Movement database and compatibility
+
+`watchcad/movements.py` is the only server-side source of manufacturer data.
+Four calibres ship with manufacturer URLs and a retrieval date; records are
+versioned, validated on load, append-only corrected, and migrated independently
+of the watch spec (`MOVEMENT_SCHEMA_VERSION = 1`). Every scalar has a
+`verified`, `secondary`, `estimated` or `unknown` status. Missing values remain
+`null` and appear as UNKNOWN in the UI; they are never silently treated as zero
+or as a pass.
+
+`GET /api/movements` provides searchable catalogue data with filters;
+`GET /api/movements/detail?id=…` returns the record, sources, field provenance,
+missing fields, an envelope and a structured compatibility report;
+`POST /api/movements/propose` builds candidate spec changes without applying
+them. Checks cover case diameter and height, mounting, stem/crown, dial,
+hand clearance, date/complication alignment and caseback clearance. They use
+stated assumptions such as case wall thickness and radial/stack clearances;
+UNKNOWN never passes silently, and a proposal is applied only through the
+normal approval pipeline.
+
+---
+
+## Pareto optimisation
+
+`watchcad/optimise.py` evaluates a finite, deterministic probe set. Each
+candidate is a real spec delta passed through the solver, mesh builder and
+verifier. Schema validity, locks, solver success and verification failures are
+hard constraints; objectives are mass, estimated unit cost,
+manufacturability, tolerance margin and assembly simplicity, with mixed
+minimisation/maximisation directions. Feasible candidates are compared with
+Pareto dominance, NSGA-II non-dominated sorting and crowding distance. A
+seed/signature records the baseline checksum, objective, axes, budget and
+generator version so a repeated run is reproducible.
+
+The lab shows a frontier/dominated/infeasible scatter with selectable X/Y
+objectives, per-candidate constraints and baseline deltas, a non-mutating 3-D
+preview, and explicit confirmation before applying as a new version. Undo
+restores the previous solved design. The recommendation is the best feasible
+candidate for the chosen single objective within this probe set; the Pareto
+front is reported separately. No global or continuous optimum is claimed.
+
+---
+
 ## Production package
 
 `watchcad build` writes ~65 files (about 7 MB for a mechanical design):
 
 ```text
 spec.json / spec.md          source of truth + readable summary
-model.stl .obj .gltf .glb    assembly meshes (glTF 2.0 with normals)
+model.stl .obj .gltf .glb    assembly meshes (glTF 2.0 with UVs/normals/PBR)
 parts/<part>.stl             one mesh per component (~114 parts by default)
 drawings/front.svg           front view
 drawings/section.svg         case section
@@ -467,10 +563,13 @@ uses only these endpoints, so scripts can drive the same session:
 |---|---|---|
 | GET | `/api/state` | spec, checks, summary, scene stats, derivation report |
 | GET | `/api/schema` | field registry, groups, complications, presets, ideas |
-| GET | `/api/scene` | per-part vertices/faces for the software renderer |
+| GET | `/api/scene` | `?quality=low|medium|high&preview=<token>` → per-part vertices/faces and scene stats |
 | GET | `/api/component/context` | `?component=<id, alias, part, role, group or field>` → fields, locks, checks, parts and bounds |
 | GET | `/api/critic` | `?component=<optional selection>` → deterministic five-axis report and safe fixes |
-| GET | `/api/model.glb` | binary glTF assembly for the Three.js preview |
+| GET | `/api/model.glb` | `?quality=low|medium|high&preview=<token>` → binary glTF for the Three.js preview |
+| GET | `/api/movements` | `?q=&maker=&type=&min_diameter=&max_diameter=&min_thickness=&max_thickness=&include_unknown=1` → catalogue |
+| GET | `/api/movements/detail` | `?id=<calibre>` → record, sources, provenance, envelope and compatibility |
+| POST | `/api/movements/propose` | `{id}` → unapplied spec-change proposal |
 | GET | `/api/builds` | last build manifest |
 | POST | `/api/prompt` | `{prompt, use_llm}` → applied patches, questions, state |
 | POST | `/api/set` | `{path, value, force}`; `409` if the path is locked |
@@ -479,7 +578,8 @@ uses only these endpoints, so scripts can drive the same session:
 | POST | `/api/spec` | `{spec}` replace the whole document |
 | POST | `/api/reset` | `{preset?, name?}` |
 | POST | `/api/build` | `{per_part?}` → files and manifest |
-| POST | `/api/optimise` | `{objective, budget}` → ranked deterministic candidates and provenance |
+| POST | `/api/optimise` | `{objective, budget, axes?}` → Pareto fronts, winner, constraints and reproducibility |
+| POST | `/api/optimise/preview` | `{changes, label, baseline_checksum?}` → short-lived preview token; `409` if the baseline changed |
 | GET | `/api/download/file` | `?path=<relative path inside the build>` |
 | GET | `/api/download/zip` | package as one archive |
 
@@ -607,12 +707,14 @@ watchcad/
   modules.py     complication registry: height, torque, envelope, conflicts
   gears.py       exact Fraction ratio search; presentation tooth profiles
   solver.py      derivation order, train layout, stack z-levels, torque, mass
-  mesh.py        dependency-free mesh kernel + STL/OBJ/glTF/GLB writers
-  parts.py       every component builder; build_scene()
-  verify.py      layered checks, same-plane collision, fixes
+  mesh.py        dependency-free mesh kernel, UVs + STL/OBJ/glTF/GLB writers
+  materials.py   central PBR finishes and nominal densities
+  parts.py       every component builder; build_scene(); quality tiers
+  verify.py      layered checks, same-plane collision, scene validation, fixes
   components.py  component registry, selection resolver, field/check/part scope
   critic.py      deterministic five-axis design critic and safe fixes
-  optimise.py    deterministic candidate field, metrics, ranking, provenance
+  movements.py   source-backed calibres, provenance, migration, compatibility
+  optimise.py    deterministic candidates, hard constraints, Pareto fronts
   providers.py   BYOK presets, session key vault, capability probes
   drawing.py     SVG, ASCII DXF and hand-written PDF from one canvas
   exporters.py   BOM, assembly, test plan, DFM, docs, manifest
@@ -636,16 +738,18 @@ watchcad/
     research.py       curated + optional live research, provenance, SSRF guard
     knowledge.py      materials, components and finishes reference
 web/
-  index.html, style.css, app.js   workspace UI, design controls, chat, fallback canvas
-  viewer3d.js                     Three.js PBR/IBL preview loaded as an ES module
+  index.html, style.css, app.js   workspace UI, design/movement/Pareto controls, chat
+  viewer3d.js                     Three.js PBR/IBL preview, quality and candidate previews
   vendor/                         vendored Three.js 0.160 modules and addons
 tests/
   test_watchcad.py               engine, glTF/GLB, build, export tests
   test_agent.py                  deterministic agent/API tests
   test_chat.py                   conversational runtime/API tests
-  test_optimise.py               optimisation determinism, provenance, schema safety
+  test_optimise.py               Pareto dominance, constraints, reproducibility, API
   test_providers.py              key isolation, redaction, probe and provider API
   test_increment_a.py            component focus, scoped edits, critic determinism/API
+  test_geometry.py               PBR/materials, quality invariance, mesh/scene validation
+  test_movements.py              provenance, migration, corrections, compatibility
   ui_smoke.js                    dependency-free browser/API smoke harness
 examples/                         seven verified specs
 ```
@@ -661,6 +765,9 @@ Some deliberate design choices:
   same-plane collisions are checked with real clearances.
 - **Barrel bore = 34 % of movement width.** A documented empirical rule, kept in
   one place and surfaced as an `estimated` check rather than a hidden constant.
+- **One canonical spec.** Quality tiers change rendering cost, not dimensions or
+  verification; movement manufacturer data stays on the server and is served
+  through the API.
 - **No fake STEP, no fake physics.** The package says what it cannot do.
 
 ---
@@ -674,20 +781,27 @@ Some deliberate design choices:
   conjugate action are not modelled.
 - **Torque, spring and mass models are empirical** with documented constants.
   They are `estimated`, not validated against a specific calibre.
-- **Dial openings (date, moonphase, subdials) are surface features** on the dial
-  mesh, not boolean cuts through the solid.
-- **No automatic brand/calibre lookup.** The `sourced` provenance tag, URL and
-  timestamp are supported. Curated reference data ships with the tool; live
-  search is opt-in through `WATCHCAD_SEARCH_URL`, and the assistant says when it
-  is unavailable. A retrieved page is still unverified text, not a datasheet.
-- **No screw threads, fillets, chamfers, jewels as bearings, lubrication,
-  escapement dynamics, FEA, tolerance Monte-Carlo or CAM toolpaths.**
+- **Dial/aperture furniture is layered geometry, not boolean cuts.** Date,
+  moonphase and sub-dial detail is built as frames, discs and rings above the
+  dial rather than by cutting a solid; no B-rep boolean operation is performed.
+- **Movement coverage is deliberately small.** Four manufacturer-sourced
+  calibres are included; a blank field stays UNKNOWN rather than being guessed.
+  Live search is opt-in through `WATCHCAD_SEARCH_URL`, and a retrieved page is
+  still text, not a validated datasheet. There is no general RAG corpus.
+- **No solid fillets, drafts, screw threads or B-rep booleans.** Deterministic
+  mesh chamfers, lens edges and knurls are generated, but they are visual
+  approximations, not manufacturing features. Jewels as bearings, lubrication,
+  escapement dynamics, FEA, tolerance Monte-Carlo and CAM toolpaths are absent.
+- **Assembly-wide interference is not proven.** Tooth outlines and scene-level
+  envelopes/clearances are checked, but there is no general part-vs-part mesh
+  intersection or swept-volume study.
 - **Bench properties are `needs_test`.** Rate, amplitude, water resistance,
   shock, magnetism and thermal behaviour cannot be certified by this tool.
-- **The web UI is a software renderer** (depth-sorted canvas triangles), not a
-  GPU CAD viewer; very large assemblies are intentionally kept modest. It
-  offers orbit, pan, zoom, group visibility, view presets, exploded views and
-  per-part picking, but not section planes or measurement.
+- **The web UI is a Three.js GPU viewer with a software fallback.** It offers
+  PBR/IBL, shadows, orbit/pan/zoom, quality tiers, view presets, exploded views,
+  per-part picking and non-mutating candidate previews. The classic canvas
+  fallback is depth-sorted triangles. Neither has section planes, measurement
+  tools or distance-based LOD; quality tiers are performance hints only.
 - **Conversations persist, but there are no user accounts.** Chat transcripts,
   design snapshots, tool events, summaries and design references live in the
   SQLite file (`out/watchcad.sqlite3` by default) and survive a restart. Session
@@ -698,10 +812,11 @@ Some deliberate design choices:
   network.
 - **The agent is bounded, not open-ended.** It can hold a conversation, interpret
   a request, use validated tools, repair within three iterations by default,
-  critique, explain, propose variants and build a package. It does not perform
-  Pareto optimisation, learned layout proposals, the Electron shell, a module
-  marketplace or live collaboration. The deterministic core exists so those can
-  be added without changing the spec contract.
+  critique, explain, propose variants and build a package. Pareto analysis is a
+  separate deterministic tab, not an autonomous agent capability. Optimisation
+  is synchronous with no durable job queue, progress stream or resumable run.
+  There are no learned layout proposals, Electron shell, module marketplace or
+  live collaboration.
 - **Vision input is advisory.** A configured vision model can discuss a photo's
   style, proportions and visible features, but the assistant must not infer
   exact dimensions from it. Without a vision model the image is stored with the
@@ -714,16 +829,24 @@ Some deliberate design choices:
 The suite covers the parts that must not silently break:
 
 - schema defaults, round-trip, provenance, versions, locks, diff/patch,
-  validation;
+  validation and additive `v1 → v3` migration;
 - exact gear ratios and bounded tooth outlines;
-- mesh volume/winding and all three mesh exporters;
+- mesh volume/winding, UVs/PBR extras and all three mesh exporters;
+- material/finish centralisation, lens/chamfer/arc primitives, spec-driven
+  case/dial/hand detail and quality-tier invariance of dimensions/verification;
+- scene validation for missing/orphaned parts, layer order and collisions;
 - mechanical and quartz solving, stack ordering, centre distances, checksum;
 - layered verdicts, failure fixes, complication conflicts;
 - four drawing views, SVG/DXF/PDF structure;
 - package contents, manifest hashes, STEP status, build cache;
 - prompt parsing, preset coverage, locks and complication conflicts;
-- the full HTTP session: state, schema, scene, set, lock `409`, prompt, build,
-  file/zip download, traversal `403`;
+- movement provenance, unknown fields, migration/validation, corrections,
+  catalog search, envelope and structured compatibility;
+- Pareto dominance, non-dominated sorting/crowding, mixed objectives, hard
+  constraints, reproducibility, preview/apply/rollback and the optimisation API;
+- the full HTTP session: state, schema, movement and optimisation endpoints,
+  scene/GLB quality and preview, set, lock `409`, prompt, build, file/zip
+  download, traversal `403`;
 - the agent: shadow-copy commits, suggest/approval/autonomous modes, locked-field
   denial, bounded verifier-guided repair, undo/redo, variants, tool-argument
   validation, cancellation, scripted model tool calls, LLM fallback, prompt
@@ -740,6 +863,8 @@ The UI was exercised headlessly with Node against the real API (boot, chat SSE
 stream, attachments, history sidebar, settings, message edit/regenerate/delete,
 chat approval, copilot brief, undo, number steppers, explode 0–250%, deep zoom,
 per-part picking, component focus chip, the five-axis critic panel, critic fixes,
+movement filters/detail/proposal, Pareto scatter axes, frontier/dominated split,
+candidate inspection, confirmation, non-mutating 3-D preview and rollback,
 opaque materials, gear/layer views, zoom, projection sanity) and in real Firefox
 through Marionette (rendered screenshots, stepper click, copilot brief, hover +
 part selection, sidebar close/reopen with persistence, zero runtime errors).

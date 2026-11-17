@@ -46,6 +46,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import urllib.parse
 import zipfile
@@ -74,6 +75,7 @@ from .components import UnknownComponent, component_context
 from .critic import critique
 from .llm import LLMConfig
 from .modules import MODULES, QUARTZ_MODULES
+from . import movements as movement_db
 from .nlp import describe, ideas, parse, preset_prompt
 from .parts import build_scene
 from .schema import ESSENTIAL, SCHEMA, Spec, new_spec
@@ -102,14 +104,32 @@ class Studio:
         self.checks: list[dict] = []
         self.summary: dict = {}
         self.last_build: BuildResult | None = None
+        self._scenes: dict[str, dict] = {}
         self.rebuild()
 
     def rebuild(self) -> None:
         with self.lock:
             self.solved, self.report = solve(self.spec)
-            self.scene = build_scene(self.solved)
+            self._scenes = {}
+            self.scene = self.scene_for("high")
             self.checks = verify(self.solved, self.scene)
             self.summary = summary(self.checks)
+
+    def scene_for(self, quality: str = "high") -> dict:
+        """Return the mesh scene for a render preset, cached by quality.
+
+        Quality only changes triangle counts and texture detail.  Every
+        dimension, mass and verification result is identical across presets, so
+        the low preset is safe on an integrated GPU.
+        """
+        quality = str(quality or "high").lower()
+        if quality not in ("low", "medium", "high"):
+            quality = "high"
+        if quality == "high" and self.scene:
+            return self.scene
+        if quality not in self._scenes:
+            self._scenes[quality] = build_scene(self.solved, quality)
+        return self._scenes[quality]
 
     def set(self, path: str, value, force: bool = False) -> bool:
         with self.lock:
@@ -182,6 +202,13 @@ STUDIO = Studio()
 # The default session binds to the module-level ``STUDIO`` on every lookup, so
 # tests (and embedders) can replace it.  Other sessions get their own studio.
 SESSIONS = SessionManager(lambda: STUDIO, lambda: Studio())
+
+# Short-lived, session-scoped candidate previews.  A preview holds a solved
+# Spec copy only; it is never applied to the live studio.  Entries expire so an
+# abandoned preview cannot hold a large scene in memory indefinitely.
+OPTIMISE_PREVIEWS: dict[tuple[str, str], dict] = {}
+OPTIMISE_PREVIEW_TTL_S = 900
+_OPTIMISE_PREVIEW_LOCK = threading.RLock()
 
 # Persistent conversations and designs.  The store is created lazily so that
 # importing the API cannot create files as a side effect.  Tests may replace
@@ -445,6 +472,34 @@ class Handler(BaseHTTPRequestHandler):
     def _session(self, query: dict | None = None, body: dict | None = None):
         return SESSIONS.get(self._session_id(query, body))
 
+    def _store_preview(self, session_id: str, spec) -> str:
+        token = os.urandom(12).hex()
+        with _OPTIMISE_PREVIEW_LOCK:
+            now = time.time()
+            for key in list(OPTIMISE_PREVIEWS):
+                if now - OPTIMISE_PREVIEWS[key]["at"] > OPTIMISE_PREVIEW_TTL_S:
+                    OPTIMISE_PREVIEWS.pop(key, None)
+            OPTIMISE_PREVIEWS[(session_id, token)] = {"spec": spec.copy(), "at": now}
+        return token
+
+    def _preview_spec(self, query: dict | None = None, body: dict | None = None):
+        token = ""
+        if query:
+            token = str((query.get("preview") or [""])[0] or "")
+        if not token and body:
+            token = str(body.get("preview") or "")
+        if not token:
+            return None
+        key = (self._session_id(query, body), token)
+        with _OPTIMISE_PREVIEW_LOCK:
+            entry = OPTIMISE_PREVIEWS.get(key)
+            if entry is None:
+                return None
+            if time.time() - entry["at"] > OPTIMISE_PREVIEW_TTL_S:
+                OPTIMISE_PREVIEWS.pop(key, None)
+                return None
+            return entry["spec"]
+
     def _api_get(self, route: str, query: dict) -> None:
         session = self._session(query)
         studio = session.studio
@@ -492,20 +547,73 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(400, str(exc))
         elif route == "/api/schema":
             self._json(200, _schema_payload(studio))
-        elif route == "/api/scene":
+        elif route == "/api/movements":
+            def number(name):
+                raw = (query.get(name) or [""])[0]
+                try:
+                    return float(raw) if raw not in ("", None) else None
+                except ValueError:
+                    return None
+            catalog = movement_db.catalog()
+            catalog["movements"] = movement_db.search(
+                (query.get("q") or [""])[0],
+                maker=(query.get("maker") or [""])[0],
+                type=(query.get("type") or [""])[0],
+                min_diameter=number("min_diameter"),
+                max_diameter=number("max_diameter"),
+                min_thickness=number("min_thickness"),
+                max_thickness=number("max_thickness"),
+                include_unknown=bool((query.get("include_unknown") or [""])[0]))
+            catalog["filters"] = {key: (query.get(key) or [""])[0]
+                                  for key in ("q", "maker", "type", "min_diameter",
+                                              "max_diameter", "min_thickness", "max_thickness")}
+            self._json(200, catalog)
+        elif route == "/api/movements/detail":
+            movement_id = (query.get("id") or [""])[0]
+            record = movement_db.get_record(movement_id)
+            if record is None:
+                self._error(404, f"unknown movement {movement_id!r}")
+                return
             with studio.lock:
-                parts = [p.to_viewer() for p in studio.scene.get("parts", [])]
-                payload = {"parts": parts,
-                           "tree": studio.scene.get("tree", {}),
-                           "mass_g": studio.scene.get("mass_g", 0),
-                           "bounds": studio.scene.get("bounds", {}),
-                           "triangles": studio.scene.get("triangles", 0)}
-            self._json(200, payload)
-        elif route == "/api/model.glb":
+                solved = studio.solved
+                self._json(200, {
+                    "record": record,
+                    "provenance": movement_db.field_provenance(record),
+                    "missing": movement_db.missing_fields(record),
+                    "compatibility": movement_db.compatibility(solved, record),
+                    "envelope": movement_db.envelope(solved, record),
+                    "current": {
+                        "movement": solved.get("movement.base_calibre"),
+                        "calibre_id": solved.get("movement.calibre_id"),
+                        "case_diameter_mm": solved.get("case.diameter_mm"),
+                        "case_thickness_mm": solved.get("case.thickness_mm"),
+                        "checksum": solved.get("derived.checksum"),
+                    },
+                    "sources": record.get("sources_full", []),
+                    "schema_version": movement_db.MOVEMENT_SCHEMA_VERSION,
+                })
+        elif route in ("/api/scene", "/api/model.glb"):
+            quality = (query.get("quality") or ["high"])[0]
+            preview = self._preview_spec(query)
             with studio.lock:
-                parts = studio.scene.get("parts", [])
-                name = studio.solved.get("meta.name") or "watch"
-                data = mesh_kernel.to_glb(list(parts), str(name))
+                if preview is not None:
+                    scene = build_scene(preview, quality)
+                    name = preview.get("meta.name") or "watch"
+                else:
+                    scene = studio.scene_for(quality)
+                    name = studio.solved.get("meta.name") or "watch"
+                if route == "/api/scene":
+                    parts = [p.to_viewer() for p in scene.get("parts", [])]
+                    payload = {"parts": parts,
+                               "tree": scene.get("tree", {}),
+                               "mass_g": scene.get("mass_g", 0),
+                               "bounds": scene.get("bounds", {}),
+                               "triangles": scene.get("triangles", 0),
+                               "quality": scene.get("quality", "high"),
+                               "preview": preview is not None}
+                    self._json(200, payload)
+                    return
+                data = mesh_kernel.to_glb(list(scene.get("parts", [])), str(name))
             self._send(200, data, "model/gltf-binary")
         elif route == "/api/builds":
             self._json(200, studio.last_build.to_dict() if studio.last_build else {"build": None})
@@ -618,17 +726,65 @@ class Handler(BaseHTTPRequestHandler):
             result = provider_vault.probe(body, session.session_id)
             self._json(200, result)
             return
+        if route == "/api/movements/propose":
+            movement_id = str(body.get("id") or "")
+            record = movement_db.get_record(movement_id)
+            if record is None:
+                self._error(404, f"unknown movement {movement_id!r}")
+                return
+            with studio.lock:
+                proposal = movement_db.propose(studio.solved, movement_id)
+                proposal["baseline"] = {
+                    "checksum": studio.solved.get("derived.checksum"),
+                    "name": studio.solved.get("meta.name"),
+                }
+            self._json(200, proposal)
+            return
+
         if route == "/api/optimise":
             try:
                 budget = int(body.get("budget") or 9)
             except (TypeError, ValueError):
                 budget = 9
+            axes = body.get("axes")
+            if not isinstance(axes, list):
+                axes = None
             with studio.lock:
                 result = optimiser.run(
                     studio.solved,
                     str(body.get("objective") or "weight"),
-                    budget)
+                    budget,
+                    axes=axes)
             self._json(200, result)
+            return
+
+        if route == "/api/optimise/preview":
+            changes = body.get("changes")
+            if not isinstance(changes, list):
+                self._error(400, "preview needs a change list")
+                return
+            baseline = str(body.get("baseline_checksum") or "")
+            with studio.lock:
+                current = str(studio.solved.get("derived.checksum") or "")
+                if baseline and baseline != current:
+                    self._error(409, "design changed; rerun optimisation before previewing")
+                    return
+                try:
+                    preview = optimiser.build_candidate(
+                        studio.solved, changes, label=str(body.get("label") or "preview"))
+                    if preview["error"]:
+                        raise ValueError(preview["error"])
+                    token = self._store_preview(session.session_id, preview["spec"])
+                except (ValueError, TypeError) as exc:
+                    self._error(400, f"candidate could not be previewed: {exc}")
+                    return
+            self._json(200, {
+                "preview": token,
+                "checksum": str(preview["spec"].get("derived.checksum") or ""),
+                "mass_g": float((preview["spec"].get("derived") or {}).get("mass_g") or 0),
+                "failing_checks": len([c for c in preview["checks"]
+                                       if c.get("passed") is False]),
+            })
             return
 
         if route == "/api/prompt":

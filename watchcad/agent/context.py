@@ -226,7 +226,10 @@ class Session:
                 index=len(self.versions) + 1,
                 label=label,
                 kind=kind,
-                spec=_clean_spec(self.studio.spec),
+                # Snapshot the solved spec so derived values keep their tags.
+                # Snapshotting the raw spec loses provenance for solved fields;
+                # restoring it then freezes them as user-owned values.
+                spec=_clean_spec(self.studio.solved),
                 checksum=_checksum(self.studio),
                 summary=_summary(self.studio),
             )

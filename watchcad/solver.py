@@ -255,6 +255,13 @@ def _derive_stack(spec: Spec, report: list[dict]) -> None:
     z_dial_bottom = z_dial_top - dial_h
     z_comp_top = z_dial_bottom - 0.05
     z_movement_top = back_h + movement_h
+    # Crown axis: an explicit user/sourced height wins; otherwise keep the
+    # existing design convention (45% of the case thickness from the back).
+    crown_axis = spec.get("case.crown_height_mm")
+    if crown_axis is None:
+        crown_axis = round(case_thickness * 0.45, 2)
+    else:
+        crown_axis = round(float(crown_axis), 2)
     stack = {
         "caseback_mm": back_h,
         "movement_mm": movement_h,
@@ -278,6 +285,7 @@ def _derive_stack(spec: Spec, report: list[dict]) -> None:
         "z_hands_top": round(z_hands_top, 2),
         "z_crystal_bottom": round(crystal_bottom, 2),
         "z_case_top": round(case_thickness, 2),
+        "z_crown_axis": crown_axis,
         "movement_to_dial_gap_mm": round(z_dial_bottom - (z_movement_top + comp_h), 2),
     }
     spec.set("derived.stack", stack, tag="derived")

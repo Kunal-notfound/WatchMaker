@@ -14,6 +14,8 @@ import math
 import struct
 from dataclasses import dataclass, field
 
+from . import materials as material_lib
+
 Vec = tuple[float, float, float]
 
 
@@ -135,6 +137,90 @@ def dome(radius: float, z0: float, height: float, segments: int = 64,
         profile.append((radius * math.cos(t), z0 + height * math.sin(t)))
     profile.append((0.0, z0 + height))
     return _ring(profile, segments, closed=False)
+
+
+def lens(radius: float, z0: float, height: float, edge: float = 0.12,
+         segments: int = 64, steps: int = 8) -> Mesh:
+    """A solid crystal with a short cylindrical edge and a domed top.
+
+    ``height`` is the total height above ``z0``.  ``edge`` is the vertical
+    cylindrical land before the curvature starts.  This is still a
+    presentation-grade surface, not an optical or manufacturable lens.
+    """
+    height = max(0.05, float(height))
+    edge = max(0.0, min(float(edge), height * 0.9))
+    cap = max(0.01, height - edge)
+    profile: list[tuple[float, float]] = [(0.0, z0), (radius - 0.08, z0),
+                                          (radius, z0 + min(0.08, edge)),
+                                          (radius, z0 + edge)]
+    for i in range(1, steps + 1):
+        t = (math.pi / 2) * i / steps
+        profile.append((radius * math.cos(t), z0 + edge + cap * math.sin(t)))
+    profile.append((0.0, z0 + height))
+    return _ring(profile, segments, closed=False)
+
+
+def chamfered_disc(radius: float, z0: float, z1: float, chamfer: float = 0.15,
+                   segments: int = 64) -> Mesh:
+    """A disc with a 45-degree chamfer on both rims (a visual fillet stand-in)."""
+    c = max(0.0, min(float(chamfer), min(radius * 0.4, (z1 - z0) * 0.45)))
+    profile = [(0.0, z0), (radius - c, z0), (radius, z0 + c),
+               (radius, z1 - c), (radius - c, z1), (0.0, z1)]
+    return _ring(profile, segments, closed=True)
+
+
+def arc_ring(inner: float, outer: float, z0: float, z1: float,
+             start_deg: float = 0.0, end_deg: float = 360.0,
+             segments: int = 48) -> Mesh:
+    """A flat annular sector, used for rotors, arcs and aperture frames.
+
+    Unlike :func:`tube` this can be partial.  The caps are built as explicit
+    quad strips, so the result is a closed solid without relying on a fan
+    triangulation of a non-convex polygon.
+    """
+    inner = max(0.0, float(inner))
+    outer = max(inner + 1e-6, float(outer))
+    if end_deg <= start_deg:
+        end_deg = start_deg + 360.0
+    steps = max(2, int(segments))
+    full = abs((end_deg - start_deg) - 360.0) < 1e-6
+    count = steps if full else steps + 1
+    verts: list[Vec] = []
+    for i in range(count):
+        a = math.radians(start_deg + (end_deg - start_deg) * i / steps)
+        c, s = math.cos(a), math.sin(a)
+        verts += [(inner * c, inner * s, z0), (outer * c, outer * s, z0),
+                  (outer * c, outer * s, z1), (inner * c, inner * s, z1)]
+    faces: list[tuple[int, int, int]] = []
+    for i in range(steps if full else steps):
+        j = (i + 1) % count if full else i + 1
+        a = i * 4
+        b = j * 4
+        # bottom (0,1), outer (1,2), top (2,3), inner (3,0)
+        faces += [(a, a + 1, b + 1), (a, b + 1, b)]
+        faces += [(a + 1, a + 2, b + 2), (a + 1, b + 2, b + 1)]
+        faces += [(a + 2, a + 3, b + 3), (a + 2, b + 3, b + 2)]
+        faces += [(a + 3, a, b), (a + 3, b, b + 3)]
+    if not full:
+        # end caps at the two radial faces
+        first, last = 0, steps * 4
+        faces += [(first, first + 2, first + 1), (first, first + 3, first + 2)]
+        faces += [(last, last + 1, last + 2), (last, last + 2, last + 3)]
+    return ensure_outward(Mesh("arc", verts, faces))
+
+
+def knurled_disc(radius: float, z0: float, z1: float, teeth: int = 36,
+                 depth: float = 0.35, segments: int = 40) -> Mesh:
+    """A toothed/knurled cylinder for a crown, bezel edge or grip ring."""
+    teeth = max(6, int(teeth))
+    depth = max(0.02, min(float(depth), radius * 0.45))
+    count = max(teeth * 2, int(segments))
+    poly: list[tuple[float, float]] = []
+    for i in range(count):
+        a = 2 * math.pi * i / count
+        r = radius - (depth if i % 2 else 0.0)
+        poly.append((r * math.cos(a), r * math.sin(a)))
+    return extrude(poly, z0, z1, "knurled")
 
 
 def torus(radius: float, wire: float, z: float = 0.0, segments: int = 48,
@@ -365,6 +451,34 @@ def to_obj(meshes: list[Mesh]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _uv_coords(m: Mesh) -> list[tuple[float, float]]:
+    """Deterministic UVs for procedural finish textures.
+
+    Planar projection for dial/hand/crystal surfaces (the viewer's radial and
+    grain patterns assume the centre is at 0.5, 0.5); cylindrical projection for
+    case, movement and strap parts.  These are presentation UVs, not a
+    manufacturable print layout.
+    """
+    if not m.verts:
+        return [(0.0, 0.0)]
+    xs = [v[0] for v in m.verts]
+    ys = [v[1] for v in m.verts]
+    zs = [v[2] for v in m.verts]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    zmin, zmax = min(zs), max(zs)
+    if m.role in ("dial", "hand", "crystal", "complication", "gasket"):
+        w = max(1e-6, xmax - xmin)
+        h = max(1e-6, ymax - ymin)
+        return [((x - xmin) / w, (y - ymin) / h) for x, y, _ in m.verts]
+    span = max(1e-6, zmax - zmin)
+    out = []
+    for x, y, z in m.verts:
+        u = (math.atan2(y, x) / (2.0 * math.pi)) % 1.0
+        out.append((u, (z - zmin) / span))
+    return out
+
+
 def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
     """Single-file glTF 2.0 with one node, mesh and material per part."""
     chunks: list[bytes] = []
@@ -390,9 +504,13 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
         nrm_bytes = struct.pack(f"<{len(nrm)}f", *nrm)
         idx = [i for f in m.faces for i in f]
         idx_bytes = struct.pack(f"<{len(idx)}I", *idx)
+        uvs = _uv_coords(m)
+        uv = [c for pair in uvs for c in pair]
+        uv_bytes = struct.pack(f"<{len(uv)}f", *uv)
         pv = add_view(pos_bytes, 34962)
         nv = add_view(nrm_bytes, 34962)
         iv = add_view(idx_bytes, 34963)
+        uvv = add_view(uv_bytes, 34962)
 
         xs, ys, zs = m.verts and ([v[0] for v in m.verts], [v[1] for v in m.verts], [v[2] for v in m.verts]) or ([0], [0], [0])
         accessors.append({"bufferView": pv, "componentType": 5126, "count": len(m.verts),
@@ -405,24 +523,42 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
         accessors.append({"bufferView": iv, "componentType": 5125,
                           "count": len(idx), "type": "SCALAR"})
         idx_acc = len(accessors) - 1
+        accessors.append({"bufferView": uvv, "componentType": 5126,
+                          "count": len(uvs), "type": "VEC2"})
+        uv_acc = len(accessors) - 1
         rgb = _hex_rgb(m.color)
+        surface = material_lib.pbr(m)
         material = {
             "name": m.name,
             "pbrMetallicRoughness": {
-                "baseColorFactor": [*rgb, 1.0],
-                "metallicFactor": 0.15 if m.role in ("dial", "crystal") else 0.85,
-                "roughnessFactor": 0.6 if m.role == "dial" else 0.3,
+                "baseColorFactor": [*rgb, float(surface["opacity"])],
+                "metallicFactor": round(float(surface["metalness"]), 4),
+                "roughnessFactor": round(float(surface["roughness"]), 4),
             },
-            "extras": {"role": m.role, "watch_material": m.material},
+            "extras": {
+                "role": m.role,
+                "watch_material": m.material,
+                "material_key": surface["material_key"],
+                "finish": surface["finish"],
+                "texture": surface["texture"],
+                "provenance": surface["provenance"],
+            },
         }
-        if m.role == "crystal":
+        if m.role == "crystal" or float(surface["transmission"]) > 0.0:
             material["alphaMode"] = "BLEND"
             material["doubleSided"] = True
-            material["pbrMetallicRoughness"]["baseColorFactor"] = [*rgb, 0.42]
-            material["pbrMetallicRoughness"]["roughnessFactor"] = 0.08
+            material["pbrMetallicRoughness"]["baseColorFactor"] = [
+                *rgb, min(1.0, float(surface["opacity"]))]
+            material["pbrMetallicRoughness"]["roughnessFactor"] = round(
+                min(0.2, float(surface["roughness"])), 4)
+            material["extras"]["transmission"] = round(float(surface["transmission"]), 4)
+            material["extras"]["ior"] = round(float(surface["ior"]), 4)
+        elif float(surface["clearcoat"]) > 0:
+            material["extras"]["clearcoat"] = round(float(surface["clearcoat"]), 4)
         materials.append(material)
         gl_meshes.append({"name": m.name, "primitives": [{
-            "attributes": {"POSITION": pos_acc, "NORMAL": nrm_acc},
+            "attributes": {"POSITION": pos_acc, "NORMAL": nrm_acc,
+                           "TEXCOORD_0": uv_acc},
             "indices": idx_acc,
             "material": len(materials) - 1}]})
         nodes.append({"mesh": len(gl_meshes) - 1, "name": m.name,
