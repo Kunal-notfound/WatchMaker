@@ -95,7 +95,88 @@ const document = {
   createElement() { return new El(); },
 };
 
-const window = { devicePixelRatio: 1, addEventListener() {} };
+class FakeCustomEvent {
+  constructor(type, options = {}) {
+    this.type = type;
+    this.detail = options.detail;
+    this.defaultPrevented = false;
+  }
+  preventDefault() { this.defaultPrevented = true; }
+}
+
+const window = {
+  devicePixelRatio: 1,
+  listeners: new Map(),
+  addEventListener(type, fn) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(fn);
+  },
+  removeEventListener(type, fn) { this.listeners.get(type)?.delete(fn); },
+  dispatchEvent(event) {
+    for (const fn of [...(this.listeners.get(event.type) || [])]) fn(event);
+    return !event.defaultPrevented;
+  },
+};
+const eventLog = [];
+const watchedEvents = [
+  "watchcad:scene-changed", "watchcad:model-url", "watchcad:viewer-model",
+  "watchcad:viewer-stale",
+];
+for (const type of watchedEvents) {
+  window.addEventListener(type, (event) => {
+    eventLog.push({ type, detail: event.detail ? { ...event.detail } : null, at: Date.now() });
+  });
+}
+
+// The Three.js module cannot run in this DOM-less harness.  This minimal stand-in
+// keeps the same revision/generation fences so the smoke test exercises the
+// complete event path from a committed spec to a rendered-model acknowledgement.
+const fakeViewer = { token: 0, revision: 0, generation: 0 };
+async function simulateViewerLoad(url, expectedRevision) {
+  const token = ++fakeViewer.token;
+  let base = String(url || "");
+  if (!base) base = `/api/model.glb?quality=high&revision=${expectedRevision}`;
+  else if (!/[?&]revision=/.test(base)) {
+    base += `${base.includes("?") ? "&" : "?"}revision=${expectedRevision}`;
+  }
+  const session = window.localStorage.getItem("watchcad.session") || "default";
+  try {
+    const response = await realFetch(BASE + base, {
+      headers: { "X-WatchCAD-Session": session },
+      cache: "no-store",
+    });
+    if (token !== fakeViewer.token) return;
+    if (!response.ok) return;
+    const headerRevision = Number(response.headers.get("X-Design-Revision") || 0);
+    const generation = Number(response.headers.get("X-Model-Generation") || 0);
+    const preview = response.headers.get("X-Model-Preview") === "true";
+    if (expectedRevision && headerRevision && headerRevision !== expectedRevision) {
+      window.dispatchEvent(new FakeCustomEvent("watchcad:viewer-stale", {
+        detail: { expected: expectedRevision, received: headerRevision },
+      }));
+      return;
+    }
+    if (generation && generation <= fakeViewer.generation && !preview) return;
+    await response.arrayBuffer();
+    if (token !== fakeViewer.token) return;
+    fakeViewer.revision = headerRevision || fakeViewer.revision;
+    fakeViewer.generation = generation || fakeViewer.generation + 1;
+    window.dispatchEvent(new FakeCustomEvent("watchcad:viewer-model", {
+      detail: { revision: fakeViewer.revision, generation: fakeViewer.generation, preview },
+    }));
+  } catch (error) {
+    window.dispatchEvent(new FakeCustomEvent("watchcad:viewer-error", {
+      detail: { message: String(error?.message || error) },
+    }));
+  }
+}
+window.addEventListener("watchcad:scene-changed", (event) => {
+  simulateViewerLoad("", Number(event.detail?.revision || 0));
+});
+window.addEventListener("watchcad:model-url", (event) => {
+  simulateViewerLoad(event.detail?.url, Number(event.detail?.revision || 0));
+});
+
 const stored = new Map();
 window.localStorage = {
   getItem: (key) => (stored.has(key) ? stored.get(key) : null),
@@ -109,7 +190,7 @@ class FakeFileReader {
   }
 }
 const context = {
-  console, document, window,
+  console, document, window, CustomEvent: FakeCustomEvent,
   localStorage: window.localStorage,
   fetch: (path, options) => realFetch(BASE + path, options),
   setTimeout, clearTimeout, setInterval, clearInterval,
@@ -144,6 +225,8 @@ const source = fs.readFileSync(appPath, "utf8")
     get CRITIC() { return CRITIC; },
     get AGENT() { return AGENT; }, get DESIGN() { return DESIGN; },
     get selected() { return V.selected; },
+    get appliedRevision() { return appliedRevision; },
+    get renderedRevision() { return renderedRevision; },
   };\n`;
 vm.runInContext(source, context, { filename: "app.js" });
 
@@ -176,6 +259,19 @@ const waitFor = async (fn, label, timeout = 15000) => {
   check(t.V.mesh.triRange.length === t.V.mesh.triangles, "every triangle maps to a part");
   check(t.V.mesh.alphas.every((alpha) => alpha === 1), "all parts render opaque");
   check(t.V.mesh.selectedColors.length === t.V.mesh.triangles, "selection colors are precomputed");
+
+  await waitFor(() => eventLog.some((entry) => entry.type === "watchcad:viewer-model"),
+    "initial viewer model");
+  const initialSceneEvent = eventLog.find((entry) => entry.type === "watchcad:scene-changed");
+  const initialViewerEvent = eventLog.find((entry) => entry.type === "watchcad:viewer-model");
+  check(Boolean(initialSceneEvent) && Number(initialSceneEvent.detail.revision) > 0,
+    "scene-changed carries the committed revision");
+  check(initialViewerEvent?.detail.revision === initialSceneEvent?.detail.revision,
+    "viewer acknowledges the same revision the scene was built from");
+  check(t.appliedRevision === t.renderedRevision && t.appliedRevision > 0,
+    `applied and rendered revisions agree (${t.appliedRevision})`);
+  check(!eventLog.some((entry) => entry.type === "watchcad:viewer-stale"),
+    "no stale model was accepted during boot");
 
   console.log("fields");
   const form = el("specForm").innerHTML;
@@ -304,12 +400,26 @@ const waitFor = async (fn, label, timeout = 15000) => {
   check(t.CHAT.messages.length >= 1, "copilot has an opening message");
   check(el("chatLog").innerHTML.includes("Design copilot") === false, "chat log does not duplicate the panel title");
   const original = t.STATE.spec.data.case.diameter_mm;
+  const revisionBeforePrompt = t.appliedRevision;
   await t.runPrompt("Make it 40 mm titanium with a dive bezel");
   check(t.STATE.spec.data.case.diameter_mm === 40, `brief changed diameter to ${t.STATE.spec.data.case.diameter_mm}`);
   check(t.CHAT.messages.some((m) => m.role === "user"), "user message recorded");
   check(t.CHAT.messages.some((m) => m.role === "assistant" && m.patches?.length), "assistant returned change chips");
   check(el("chatLog").innerHTML.includes('data-undo="1"'), "undo button rendered");
   check(el("engineChip").textContent.length > 0, `engine chip: ${el("engineChip").textContent}`);
+  await waitFor(() => t.renderedRevision > revisionBeforePrompt
+    && eventLog.some((entry) => entry.type === "watchcad:viewer-model"
+      && entry.detail.revision === t.renderedRevision),
+  "viewer renders the prompt revision");
+  const promptScene = eventLog.find((entry) => entry.type === "watchcad:scene-changed"
+    && entry.detail.revision === t.appliedRevision);
+  const promptViewer = eventLog.find((entry) => entry.type === "watchcad:viewer-model"
+    && entry.detail.revision === t.renderedRevision);
+  check(Boolean(promptScene), "a committed prompt emits a new scene revision");
+  check(promptViewer?.detail.revision === promptScene?.detail.revision,
+    `prompt revision survives scene -> GLB -> viewer (r${promptViewer?.detail.revision})`);
+  check(!eventLog.some((entry) => entry.type === "watchcad:viewer-stale"),
+    "no stale model was accepted after the prompt");
 
   console.log("undo");
   await t.undoPrompt();
@@ -467,11 +577,32 @@ const waitFor = async (fn, label, timeout = 15000) => {
     t.armCandidateApply(winner.id);
     check(el("candidateDetail").innerHTML.includes("Confirm apply"),
       "applying requires an explicit confirmation step");
+    const modelEventsBeforePreview = eventLog.filter(
+      (entry) => entry.type === "watchcad:model-url").length;
+    const generationBeforePreview = fakeViewer.generation;
     await t.previewCandidate(winner.id);
     check(Boolean(t.DESIGN.previewId) && el("btnClearPreview").hidden === false,
       "candidate preview loads a non-mutating 3D scene");
+    await waitFor(() => eventLog.some((entry) => entry.type === "watchcad:viewer-model"
+      && entry.detail.preview && entry.detail.revision === t.appliedRevision),
+    "viewer renders the candidate preview");
+    const previewUrlEvent = eventLog.filter(
+      (entry) => entry.type === "watchcad:model-url").slice(modelEventsBeforePreview)
+      .find((entry) => String(entry.detail.url).includes("preview="));
+    const previewViewerEvent = eventLog.find((entry) => entry.type === "watchcad:viewer-model"
+      && entry.detail.preview && entry.detail.revision === t.appliedRevision);
+    check(previewUrlEvent?.detail.revision === t.appliedRevision,
+      "preview model-url keeps the applied revision");
+    check(previewViewerEvent?.detail.revision === previewUrlEvent?.detail.revision
+      && previewViewerEvent?.detail.generation > generationBeforePreview,
+    "preview revision and generation reach the viewer without mutating the design");
+
     t.clearCandidatePreview();
     check(!t.DESIGN.previewId, "clearing preview restores the live design view");
+    await waitFor(() => eventLog.some((entry) => entry.type === "watchcad:viewer-model"
+      && !entry.detail.preview && entry.detail.revision === t.appliedRevision
+      && entry.detail.generation > previewViewerEvent.detail.generation),
+    "viewer restores the live model after clearing the preview");
     const beforeChecksum = t.STATE.spec.data.derived.checksum;
     const applied = winner.applied || [];
     await t.applyCandidate(winner.id);

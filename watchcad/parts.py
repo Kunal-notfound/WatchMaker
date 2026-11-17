@@ -48,7 +48,14 @@ def _quality_name(value: str | None) -> str:
 
 
 def _seg(base: int, quality: str) -> int:
-    return max(8, int(round(base * _QUALITY[_quality_name(quality)])))
+    """Segment count for a circular primitive at a render preset.
+
+    Counts are rounded up to a multiple of four so every circle keeps vertices
+    at 0, 90, 180 and 270 degrees.  A low-preset watch therefore has fewer
+    triangles but exactly the same measured envelope as the high preset.
+    """
+    raw = max(8, int(round(base * _QUALITY[_quality_name(quality)])))
+    return int(math.ceil(raw / 4.0) * 4)
 
 
 def _styled(mesh: M.Mesh, name: str, color: str, role: str, material_key: str,
@@ -214,29 +221,48 @@ def _bezel_details(spec, t, ro, ri, lip, color, case_material, style, quality):
 
 
 def _lugs(spec, d, l2l, lug_w, color, case_material, finish, quality):
+    """Build solid lugs whose centre-line follows the case-to-strap curve.
+
+    The root starts inside the case flank and the tip ends at the spring-bar
+    axis.  Width, thickness and centre height vary along that path, so the top
+    surface reads as a continuous curved lug rather than a flat slab.
+    """
     parts: list[M.Mesh] = []
-    ext = max(0.5, (l2l - d) / 2 + 1.2)
-    lug_len = ext + 1.5
     lug_count = int(spec.get("case.lug_count") or 4)
     lx_values = (-1, 1) if lug_count >= 4 else (0,)
     lug_style = str(spec.get("case.lug_style") or "curved")
+    corner_steps = max(2, int(round(3 * _QUALITY[_quality_name(quality)])))
     for side in (-1, 1):
+        y_root = side * (d / 2 - 1.0)
+        y_tip = side * (l2l / 2 - 0.25)
         for lx in lx_values:
-            lug = M.rounded_slab(lug_w / 2.05, lug_len, 2.6, 1.0,
-                                 segments=_seg(6, quality), name="lug")
-            if lug_style == "straight":
-                lug.rotated_z(90).translated(
-                    lx * lug_w / 4.0,
-                    side * (l2l / 2 - lug_len / 2), 1.6)
-            else:
-                # A slight cant and a raised root read as a curved transition.
-                lug.rotated_z(90).translated(
-                    lx * lug_w / 4.0,
-                    side * (l2l / 2 - lug_len / 2), 1.7)
-                root = M.rounded_slab(lug_w / 2.25, 3.2, 2.4, 0.9,
-                                      segments=_seg(6, quality), name="lug_root")
-                root.rotated_z(90).translated(
-                    lx * lug_w / 4.0, side * (d / 2 - 0.9), 1.8)
+            path: list[tuple[float, float, float]] = []
+            sections: list[tuple[float, float, float]] = []
+            for fraction in (0.0, 0.30, 0.66, 1.0):
+                y = y_root + (y_tip - y_root) * fraction
+                arch = math.sin(math.pi * fraction) if lug_style != "straight" else 0.0
+                centre_z = 2.72 + 0.34 * arch + 0.16 * fraction
+                centre_x = lx * lug_w / 4.0 * (1.0 - 0.035 * fraction)
+                width = max(6.0, lug_w / 2.05 - 0.85 * fraction)
+                height = 3.0 - 0.72 * fraction
+                radius = min(1.05, width * 0.16, height * 0.30)
+                path.append((centre_x, y, centre_z))
+                sections.append((width, height, radius))
+            lug = M.sweep_sections(path, sections, "lug",
+                                   corner_segments=corner_steps)
+            if lug_style in ("curved", "drilled"):
+                root_path = [
+                    (lx * lug_w / 4.0, side * (d / 2 - 2.0), 2.68),
+                    (lx * lug_w / 4.0, side * (d / 2 - 0.6), 2.82),
+                    (lx * lug_w / 4.0 * 0.99, side * (d / 2 + 0.9), 2.88),
+                ]
+                root_sections = []
+                for fade in (0.0, 0.5, 1.0):
+                    width = max(6.0, lug_w / 2.25 - 0.35 * fade)
+                    root_sections.append((width, 3.15 - 0.25 * fade,
+                                          min(0.9, width * 0.16)))
+                root = M.sweep_sections(root_path, root_sections, "lug_root",
+                                        corner_segments=corner_steps)
                 _styled(root, "lug_root", color, "case", case_material, finish)
                 parts.append(root)
             _styled(lug, "lug", color, "case", case_material, finish,
@@ -1038,6 +1064,80 @@ def _hand(name, style, length, width, thickness, z, angle, color,
 # ---------------------------------------------------------------------------
 # Strap
 # ---------------------------------------------------------------------------
+def _wrist_strap_geometry(width: float, taper: float, thickness: float,
+                          l2l: float) -> dict:
+    """Analytic wrist arc shared by every render preset."""
+    end_y = max(8.0, l2l / 2 - 0.8)
+    radius = max(end_y + 7.0, 30.0)
+    theta0 = math.asin(min(0.985, end_y / radius))
+    return {
+        "width": width, "taper": taper, "thickness": thickness,
+        "end_y": end_y, "radius": radius,
+        "theta0": theta0, "theta1": 2.0 * math.pi - theta0,
+        "z_centre": 3.0 - radius * math.cos(theta0),
+    }
+
+
+def _wrist_strap_point(geometry: dict, theta: float) -> tuple[float, float, float]:
+    radius = geometry["radius"]
+    return (0.0, radius * math.sin(theta),
+            geometry["z_centre"] + radius * math.cos(theta))
+
+
+def _wrist_strap_section(geometry: dict, theta: float) -> tuple[float, float, float]:
+    y = geometry["radius"] * math.sin(theta)
+    away = 1.0 - min(1.0, abs(y) / geometry["end_y"])
+    width = max(8.0, geometry["width"] - geometry["taper"] * away)
+    thickness = geometry["thickness"]
+    corner = min(0.65, thickness * 0.34, width * 0.12)
+    return width, thickness, corner
+
+
+def _wrist_strap_frame(geometry: dict, theta: float):
+    """Width, tangent and outward normal at one point of the wrist arc."""
+    return ((1.0, 0.0, 0.0),
+            (0.0, math.cos(theta), -math.sin(theta)),
+            (0.0, math.sin(theta), math.cos(theta)))
+
+
+def _wrist_strap_theta(geometry: dict, fraction: float) -> float:
+    return (geometry["theta0"]
+            + fraction * (geometry["theta1"] - geometry["theta0"]))
+
+
+def _wrist_strap_sections(geometry: dict, quality: str):
+    """Centre-line and sections for one continuous wrist-following strap.
+
+    Critical angles (both spring-bar ends, +/-Y and the low point) are always
+    sampled.  Extra points are distributed between those anchors by the render
+    preset, so a low-preset band has fewer triangles but the same envelope.
+    """
+    theta0 = geometry["theta0"]
+    theta1 = geometry["theta1"]
+    anchors = (theta0, math.pi / 2.0, math.pi, 3.0 * math.pi / 2.0, theta1)
+    total = max(16, 2 * int(round(32 * _QUALITY[_quality_name(quality)])))
+    span = theta1 - theta0
+    thetas: list[float] = []
+    for start, end in zip(anchors, anchors[1:]):
+        count = max(2, int(round(total * (end - start) / span)))
+        thetas.extend(start + (end - start) * index / count
+                      for index in range(count))
+    thetas.append(theta1)
+    path = [_wrist_strap_point(geometry, theta) for theta in thetas]
+    sections = [_wrist_strap_section(geometry, theta) for theta in thetas]
+    return path, sections
+
+
+def _place_on_frame(mesh: M.Mesh, centre, width_axis, tangent, normal) -> M.Mesh:
+    """Map a locally XY/Z mesh onto a swept section (width/tangent/normal)."""
+    mesh.verts = [
+        tuple(centre[axis] + width_axis[axis] * x + tangent[axis] * y
+              + normal[axis] * z for axis in range(3))
+        for x, y, z in mesh.verts
+    ]
+    return mesh
+
+
 def strap_parts(spec: Spec, stack: dict, quality: str = "high") -> list[M.Mesh]:
     material_name = str(spec.get("strap.material") or "none")
     if material_name == "none":
@@ -1046,51 +1146,79 @@ def strap_parts(spec: Spec, stack: dict, quality: str = "high") -> list[M.Mesh]:
     taper = float(spec.get("strap.taper_mm") or 0)
     color = str(spec.get("strap.color") or "black")
     l2l = float(spec.get("case.lug_to_lug_mm"))
-    parts: list[M.Mesh] = []
     key = {"leather": "leather", "rubber": "rubber",
            "steel bracelet": "steel", "nato": "nato"}[material_name]
     thickness = {"leather": 2.2, "rubber": 2.4, "steel bracelet": 2.8,
                  "nato": 1.3}[material_name]
-    link_count = 7 if material_name != "steel bracelet" else 9
-    if _quality_name(quality) == "low":
-        link_count = max(3, link_count // 2)
-    for side in (-1, 1):
-        start = l2l / 2 - 1.0
-        link_len = 6.0
-        for index in range(link_count):
-            w = max(8.0, width - taper * (index / max(1, link_count - 1)))
-            if material_name == "steel bracelet":
-                seg = M.rounded_slab(w, link_len * 0.86, thickness, 1.4,
-                                     segments=_seg(5, quality),
-                                     name="strap_link")
-                seg.translated(0, side * (start + index * link_len + link_len / 2), 2.4)
-                _styled(seg, "strap_link", "#b7bec6", "strap", key, "brushed")
-            else:
-                length = link_len * 1.08
-                seg = M.rounded_slab(w, length, thickness, 1.0,
-                                     segments=_seg(5, quality), name="strap")
-                seg.translated(0, side * (start + index * link_len + link_len / 2), 2.2)
-                _styled(seg, "strap", color if material_name != "nato" else "#3f4b3a",
-                        "strap", key, "matte" if material_name != "nato" else "brushed",
-                        "grain" if material_name != "nato" else "weave")
-                if material_name in ("leather", "rubber") and index in (2, 4, 6):
-                    hole = M.disc(0.34, 0, 0.08, segments=_seg(14, quality))
-                    hole.translated(0, side * (start + index * link_len + link_len / 2),
-                                    2.2 + thickness)
-                    _styled(hole, "strap_hole", "#14171c", "strap", "rubber", "matte")
-                    parts.append(hole)
-            parts.append(seg)
-        if material_name != "steel bracelet":
-            keeper = M.rounded_slab(width + 1.6, 1.6, thickness + 0.6, 0.4,
-                                    segments=_seg(5, quality), name="strap_keeper")
-            keeper.translated(0, side * (start + 2 * link_len), 2.2)
-            _styled(keeper, "strap_keeper", color, "strap", key, "matte")
-            parts.append(keeper)
+    geometry = _wrist_strap_geometry(width, taper, thickness, l2l)
+    path, sections = _wrist_strap_sections(geometry, quality)
+    corner_steps = max(2, int(round(3 * _QUALITY[_quality_name(quality)])))
+    parts: list[M.Mesh] = []
+
+    # One continuous band replaces the old row of disconnected flat links.
+    band = M.sweep_sections(path, sections, "strap",
+                            corner_segments=corner_steps)
+    band_color = "#3f4b3a" if material_name == "nato" else (
+        "#b7bec6" if material_name == "steel bracelet" else color)
+    band_finish = "brushed" if material_name in ("nato", "steel bracelet") else "matte"
+    band_texture = "weave" if material_name == "nato" else (
+        "grain" if material_name in ("leather", "rubber") else None)
+    _styled(band, "strap", band_color, "strap", key, band_finish, band_texture)
+    parts.append(band)
+
+    def add_section_part(name: str, fractions, width_delta: float,
+                         height_delta: float, part_color: str,
+                         part_material: str, finish: str) -> None:
+        # Accessories are positioned on the analytic arc, not on a quality
+        # dependent sample index.  Only the number of intermediate samples
+        # changes with the preset.
+        samples = max(3, int(round(8 * _QUALITY[_quality_name(quality)])))
+        start, end = fractions
+        thetas = [_wrist_strap_theta(
+            geometry, start + (end - start) * index / (samples - 1))
+                  for index in range(samples)]
+        sub_path = [_wrist_strap_point(geometry, theta) for theta in thetas]
+        sub_sections = []
+        for theta in thetas:
+            width, height, corner = _wrist_strap_section(geometry, theta)
+            sub_sections.append((
+                width + width_delta, height + height_delta,
+                min(0.8, corner + max(0.0, width_delta) * 0.3)))
+        mesh = M.sweep_sections(sub_path, sub_sections, name,
+                                corner_segments=corner_steps)
+        _styled(mesh, name, part_color, "strap", part_material, finish)
+        parts.append(mesh)
+
+    if material_name != "steel bracelet":
+        for fraction in (0.24, 0.76):
+            add_section_part("strap_keeper", (fraction - 0.02, fraction + 0.02),
+                             1.6, 0.6, band_color, key, band_finish)
+    else:
+        link_count = 9 if _quality_name(quality) != "low" else 5
+        for link in range(link_count):
+            fraction = (link + 1) / (link_count + 1)
+            add_section_part("strap_link", (fraction - 0.018, fraction + 0.018),
+                             0.8, 0.5, "#c3c9d0", "steel", "brushed")
+
     if material_name in ("leather", "rubber"):
-        buckle = M.tube(2.0, 2.7, 0, 0.55, segments=_seg(24, quality))
-        buckle.verts = [(x, y, z_) for x, y, z_ in rotate_y(buckle.verts, 90)]
-        buckle.verts = [(x, y - (l2l / 2 + link_count * 6.0 + 3.0), z_ + 2.5)
-                        for x, y, z_ in buckle.verts]
+        for fraction in (0.58, 0.68, 0.78):
+            theta = _wrist_strap_theta(geometry, fraction)
+            width_axis, tangent, normal = _wrist_strap_frame(geometry, theta)
+            point = _wrist_strap_point(geometry, theta)
+            centre = tuple(point[axis] + normal[axis] * (thickness / 2.0 + 0.01)
+                           for axis in range(3))
+            hole = M.disc(0.34, 0.0, 0.08, segments=_seg(14, quality))
+            _place_on_frame(hole, centre, width_axis, tangent, normal)
+            _styled(hole, "strap_hole", "#14171c", "strap", "rubber", "matte")
+            parts.append(hole)
+
+        theta = _wrist_strap_theta(geometry, 0.93)
+        width_axis, tangent, normal = _wrist_strap_frame(geometry, theta)
+        point = _wrist_strap_point(geometry, theta)
+        centre = tuple(point[axis] + normal[axis] * (thickness / 2.0 + 0.30)
+                       for axis in range(3))
+        buckle = M.tube(2.0, 2.7, 0.0, 0.55, segments=_seg(24, quality))
+        _place_on_frame(buckle, centre, width_axis, tangent, normal)
         _styled(buckle, "buckle", "#c9ced6", "strap", "steel", "polished")
         parts.append(buckle)
     return parts

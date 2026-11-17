@@ -19,6 +19,7 @@ import threading
 from .. import llm as llm_module
 from ..components import resolve_component
 from ..llm import LLMConfig, LLMError, LLMReply
+from ..revision import RevisionConflict
 from ..schema import Spec
 from .context import AgentCancelled, AgentTimeout, RunControl
 from .evaluator import (
@@ -171,12 +172,27 @@ class AgentOrchestrator:
                 final_text = "The run exceeded its time budget. No changes were committed."
                 self._emit(TimelineEvent(kind="timeout", title="Run timed out",
                                          detail=str(exc), status="error"))
+            except RevisionConflict as exc:
+                executor.rollback()
+                state.status = "conflict"
+                state.error = str(exc)
+                final_text = "The design changed while the agent was working; no changes were committed."
+                self._emit(TimelineEvent(kind="conflict", title="Stale agent run rejected",
+                                         detail=str(exc), status="error"))
 
             # Common finalisation for any path that left work in the executor.
-            if state.status not in ("cancelled", "timeout"):
-                final_text = self._finalize(request, state, executor, intent,
-                                            before_checks, locks_before,
-                                            options, final_text)
+            if state.status not in ("cancelled", "timeout", "conflict"):
+                try:
+                    final_text = self._finalize(request, state, executor, intent,
+                                                before_checks, locks_before,
+                                                options, final_text)
+                except RevisionConflict as exc:
+                    executor.rollback()
+                    state.status = "conflict"
+                    state.error = str(exc)
+                    final_text = "The design changed before the agent could commit; no changes were committed."
+                    self._emit(TimelineEvent(kind="conflict", title="Stale commit rejected",
+                                             detail=str(exc), status="error"))
 
             state.after_checksum = self.studio.spec.get("derived.checksum") or ""
             state.finished_at = round(__import__("time").time(), 3)
@@ -699,7 +715,16 @@ def apply_variant(session, variant: dict, *, mode: str = "autonomous",
             state.status = "awaiting_approval"
             staged = True
         elif changes_out:
-            executor.commit("Selected alternative")
+            try:
+                executor.commit("Selected alternative")
+            except RevisionConflict as exc:
+                executor.rollback()
+                state.status = "conflict"
+                state.error = str(exc)
+                state.final_message = (
+                    "The design changed before the alternative could be applied; "
+                    "nothing was committed.")
+                return AgentRunResult(state=state, response=state.final_message, applied=0)
             session.checkpoint(request, "agent")
             committed = True
             state.status = "complete"

@@ -130,6 +130,7 @@ class ConversationStore:
                     session_id TEXT PRIMARY KEY,
                     spec TEXT NOT NULL,
                     checksum TEXT NOT NULL DEFAULT '',
+                    revision INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS design_refs (
@@ -153,6 +154,11 @@ class ConversationStore:
                 );
                 """
             )
+            columns = {row[1] for row in
+                       self._conn.execute("PRAGMA table_info(designs)")}
+            if "revision" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE designs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0")
             self._conn.commit()
 
     def close(self) -> None:
@@ -390,14 +396,15 @@ class ConversationStore:
     # -- designs ----------------------------------------------------------
     def save_design(self, session_id: str, spec: dict,
                     checksum: str = "", label: str = "",
-                    conversation_id: str | None = None) -> None:
+                    conversation_id: str | None = None,
+                    revision: int = 0) -> None:
         with self._cursor() as cur:
             cur.execute(
-                "INSERT INTO designs (session_id,spec,checksum,updated_at) "
-                "VALUES (?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
+                "INSERT INTO designs (session_id,spec,checksum,revision,updated_at) "
+                "VALUES (?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET "
                 "spec=excluded.spec, checksum=excluded.checksum, "
-                "updated_at=excluded.updated_at",
-                (session_id, _json(spec), checksum or "", _now()),
+                "revision=excluded.revision, updated_at=excluded.updated_at",
+                (session_id, _json(spec), checksum or "", int(revision or 0), _now()),
             )
             if conversation_id:
                 cur.execute(

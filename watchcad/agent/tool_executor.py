@@ -169,6 +169,10 @@ class ToolExecutor:
     calls: list[ToolResult] = field(default_factory=list, init=False)
     read_count: int = field(default=0, init=False)
     write_count: int = field(default=0, init=False)
+    base_revision: int | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        self.base_revision = getattr(self.studio, "revision", None)
 
     # -- state ------------------------------------------------------------
     def _target(self):
@@ -314,12 +318,13 @@ class ToolExecutor:
         if not changes:
             return {"applied": 0, "changes": [], "checksum": None}
         shadow = self.working
-        self.studio.spec = shadow.spec.copy()
-        self.studio.last_build = None
-        self.studio.rebuild()
+        result = self.studio.commit(
+            shadow.spec.copy(), expected_revision=self.base_revision,
+            label=label, component=self.focus or "agent")
         return {"applied": len([c for c in changes if c["path"] != "locks"]),
                 "changes": changes,
-                "checksum": self.studio.solved.get("derived.checksum"),
+                "revision": result.get("revision"),
+                "checksum": result.get("checksum"),
                 "summary": dict(self.studio.summary or {})}
 
     def rollback(self) -> None:

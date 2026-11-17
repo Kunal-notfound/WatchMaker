@@ -47,6 +47,7 @@ const DESIGN = {
   selectedCandidate: null,
   pendingApply: null,
   previewId: "",
+  previewToken: 0,
   capabilities: {},
   capabilityKey: "",
   providerKey: false,
@@ -78,6 +79,15 @@ let sceneToken = 0;
 let sceneTimer = 0;
 let lastSceneSig = "";
 let toastTimer = 0;
+let appliedRevision = 0;
+let renderedRevision = 0;
+const REVISIONED_POSTS = new Set([
+  "/api/set", "/api/patch", "/api/lock", "/api/spec", "/api/reset",
+  "/api/prompt", "/api/build", "/api/optimise/preview", "/api/agent/variant",
+  "/api/agent/undo", "/api/agent/redo", "/api/movements/propose",
+  "/api/chat/approve", "/api/chat/reject", "/api/agent/approve",
+  "/api/agent/reject", "/api/chat", "/api/agent/run",
+]);
 
 const esc = (value) => String(value)
   .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
@@ -202,24 +212,61 @@ function currentSession() {
   }
 }
 
+function rememberSession(id) {
+  if (!id) return;
+  const previous = AGENT.sessionId ? String(AGENT.sessionId) : "";
+  const next = String(id);
+  if (previous && previous !== next) {
+    // A different design session has its own monotonic revision sequence.
+    appliedRevision = 0;
+    renderedRevision = 0;
+  }
+  AGENT.sessionId = id;
+  try {
+    window.localStorage?.setItem("watchcad.session", next);
+  } catch { /* private mode: keep the in-memory value */ }
+}
+
 function withSession(url) {
   const separator = String(url).includes("?") ? "&" : "?";
   return `${url}${separator}session=${encodeURIComponent(currentSession())}`;
 }
 
 async function api(path, body) {
-  const options = body === undefined ? { headers: {} } : {
+  let payload = body;
+  if (payload !== undefined && REVISIONED_POSTS.has(path)
+      && payload.expected_revision === undefined) {
+    const revision = appliedRevision || Number(STATE?.revision || 0);
+    if (revision > 0) payload = { ...payload, expected_revision: revision };
+  }
+  const options = payload === undefined ? { headers: {} } : {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   };
   options.headers = options.headers || {};
   options.headers["X-WatchCAD-Session"] = currentSession();
   const response = await fetch(path, options);
   let data = {};
   try { data = await response.json(); } catch { /* empty response */ }
+  try {
+    Object.defineProperty(data, "__headers", {
+      value: response.headers, enumerable: false, configurable: true,
+    });
+  } catch { /* non-extensible payload */ }
   if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
   return data;
+}
+
+function responseRevision(payload, name = "X-Design-Revision") {
+  const raw = payload?.__headers?.get?.(name);
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function revisionedUrl(path, revision) {
+  if (!revision) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}revision=${revision}`;
 }
 
 function toast(message, bad = false) {
@@ -359,6 +406,7 @@ async function boot() {
     const [schema, state] = await Promise.all([api("/api/schema"), api("/api/state")]);
     SCHEMA = schema;
     STATE = state;
+    appliedRevision = Number(state.revision || 0) || appliedRevision;
     IDEAS = Object.fromEntries((schema.ideas || []).map((item) => [item.id, item.prompt]));
     renderExamples();
     await initChat();
@@ -386,11 +434,15 @@ function renderAll() {
 }
 
 function applyState(state, options = {}) {
-  if (!state || !state.spec) return;
+  if (!state || !state.spec) return false;
+  if (state.session?.session_id) rememberSession(state.session.session_id);
+  const revision = Number(state.revision || responseRevision(state) || 0);
+  if (revision && revision < appliedRevision) return false;
   const previous = STATE && STATE.spec && STATE.spec.data.derived
     ? STATE.spec.data.derived.checksum : "";
+  const previousRevision = appliedRevision;
   STATE = state;
-  if (state.session) AGENT.sessionId = state.session.session_id || AGENT.sessionId;
+  if (revision) appliedRevision = revision;
   const checksum = state.spec?.data?.derived?.checksum || "";
   renderHeader();
   renderFacts();
@@ -402,8 +454,16 @@ function applyState(state, options = {}) {
   renderOptimisation();
   renderCritic();
   renderMovement();
-  if (options.scene !== false && checksum !== previous) scheduleScene();
+  if (options.scene !== false
+      && (checksum !== previous || revision !== previousRevision)) scheduleScene();
   renderSessionChip();
+  if (state.render) {
+    viewerEvent("watchcad:render-status", state.render);
+    if (state.render.status === "failed" && state.render.error) {
+      toast(`render failed: ${String(state.render.error).slice(0, 140)}`, true);
+    }
+  }
+  return true;
 }
 
 /* ---------------------------------------------------------- workspaces */
@@ -805,6 +865,7 @@ async function previewCandidate(id) {
     toast("rerun optimisation after the design changed", true);
     return;
   }
+  const token = ++DESIGN.previewToken;
   setLoading(true, `building 3D preview of ${candidate.label}`);
   try {
     const payload = await api("/api/optimise/preview", {
@@ -812,11 +873,18 @@ async function previewCandidate(id) {
       baseline_checksum: result.baseline_checksum,
       label: candidate.label,
     });
+    if (token !== DESIGN.previewToken) return;
+    const received = Number(payload.revision || responseRevision(payload) || 0);
+    if (received && received !== appliedRevision) {
+      toast("the design changed; preview discarded", true);
+      return;
+    }
     DESIGN.previewId = payload.preview;
     const button = $("#btnClearPreview");
     if (button) button.hidden = false;
     viewerEvent("watchcad:model-url", {
       url: `/api/model.glb?preview=${encodeURIComponent(payload.preview)}`,
+      revision: appliedRevision,
     });
     toast(`previewing ${candidate.label}; the live design is unchanged`);
   } catch (error) {
@@ -827,10 +895,11 @@ async function previewCandidate(id) {
 }
 
 function clearCandidatePreview() {
+  DESIGN.previewToken += 1;
   DESIGN.previewId = "";
   const button = $("#btnClearPreview");
   if (button) button.hidden = true;
-  viewerEvent("watchcad:model-url", { url: "" });
+  viewerEvent("watchcad:model-url", { url: "", revision: appliedRevision });
 }
 
 function armCandidateApply(id) {
@@ -1650,6 +1719,7 @@ function applyConversationPayload(data) {
   const conversation = data.conversation || {};
   CHAT.conversationId = conversation.id || CHAT.conversationId;
   rememberConversation(conversation);
+  if (data.session?.session_id) rememberSession(data.session.session_id);
   if (data.snapshot) applyState(data.snapshot);
   CHAT.messages = messagesFromRows(data.messages);
   if (!CHAT.messages.length) {
@@ -1830,6 +1900,10 @@ function handleChatEvent(event) {
 }
 
 async function streamChatTurn(body, onEvent) {
+  const revision = appliedRevision || Number(STATE?.revision || 0);
+  if (revision && body.expected_revision === undefined) {
+    body = { ...body, expected_revision: revision };
+  }
   const response = await fetch("/api/chat", {
     method: "POST",
     headers: {
@@ -1896,12 +1970,12 @@ function applyChatResult(payload, before) {
   AGENT.engine = payload.engine || AGENT.engine;
   AGENT.error = payload.error || null;
   if (payload.timeline) AGENT.events = payload.timeline;
+  if (payload.session?.session_id) rememberSession(payload.session.session_id);
   if (payload.snapshot) applyState(payload.snapshot);
   if (payload.conversation) {
     CHAT.conversationId = payload.conversation.id || CHAT.conversationId;
     rememberConversation(payload.conversation);
   }
-  if (payload.session?.session_id) AGENT.sessionId = payload.session.session_id;
   if ((payload.changes || []).length && before) CHAT.prevSpec = before;
   renderChat();
   renderAgent();
@@ -2268,6 +2342,10 @@ function parseSseFrame(frame, dispatch) {
 }
 
 async function streamAgent(body, onEvent) {
+  const revision = appliedRevision || Number(STATE?.revision || 0);
+  if (revision && body.expected_revision === undefined) {
+    body = { ...body, expected_revision: revision };
+  }
   const response = await fetch("/api/agent/run", {
     method: "POST",
     headers: {
@@ -2350,7 +2428,6 @@ function applyAgentResult(result) {
     snapshot.session = result.session || snapshot.session;
     applyState(snapshot);
   }
-  if (result.session) AGENT.sessionId = result.session.session_id || AGENT.sessionId;
   AGENT.engine = result.engine || AGENT.engine;
   AGENT.pending = result.pending || null;
   if (!AGENT.pending && result.status === "awaiting_approval" && result.pending_token) {
@@ -2523,6 +2600,7 @@ async function approveAgent(approve) {
       CHAT.pending = null;
       AGENT.pending = null;
       CHAT.messages = messagesFromRows(data.messages);
+      if (data.session?.session_id) rememberSession(data.session.session_id);
       if (data.snapshot) applyState(data.snapshot);
       renderChat();
       renderAgent();
@@ -3656,7 +3734,8 @@ function bindViewerBridge() {
     if (message) toast(`3D view unavailable: ${message}`, true);
     requestRender();
   });
-  window.addEventListener("watchcad:viewer-model", () => {
+  window.addEventListener("watchcad:viewer-model", (event) => {
+    renderedRevision = Number(event.detail?.revision || 0) || renderedRevision;
     // A rebuilt GLB resets the module's local explode/visibility state, so
     // replay the app's authoritative viewer state.
     viewerEvent("watchcad:visibility", {
@@ -3665,6 +3744,15 @@ function bindViewerBridge() {
     });
     viewerEvent("watchcad:explode", { value: V.explode });
   });
+  window.addEventListener("watchcad:viewer-stale", (event) => {
+    const detail = event.detail || {};
+    setStatusText(`stale model ignored (revision ${detail.received || "?"})`);
+  });
+}
+
+function setStatusText(text) {
+  const node = $("#viewerInfo");
+  if (node) node.textContent = text;
 }
 
 const V = {
@@ -3885,14 +3973,20 @@ function requestRender(fast = false) {
 
 async function loadScene(initial = false) {
   const token = ++sceneToken;
+  const requestedRevision = appliedRevision || Number(STATE?.revision || 0);
   try {
     if (initial) setLoading(true, "loading the mesh");
-    const payload = await api("/api/scene");
+    const payload = await api(revisionedUrl("/api/scene", requestedRevision));
     if (token !== sceneToken) return;
+    const received = Number(payload.revision || responseRevision(payload) || 0);
+    if (requestedRevision && received && received !== requestedRevision) return;
     lastSceneSig = sceneSignature(STATE);
     prepareMesh(payload);
     renderGroupToggles(payload.tree || {});
-    viewerEvent("watchcad:scene-changed", { checksum: sceneSignature(STATE) });
+    viewerEvent("watchcad:scene-changed", {
+      checksum: sceneSignature(STATE),
+      revision: received || requestedRevision,
+    });
     requestRender();
   } catch (error) {
     toast(`mesh load failed: ${error.message}`, true);

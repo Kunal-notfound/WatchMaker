@@ -20,6 +20,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from ..revision import RevisionConflict
 from .models import AgentMessage, DesignMemory, new_id
 
 
@@ -240,6 +241,7 @@ class Session:
 
     def restore(self, version_id_or_index: str | int) -> VersionSnapshot:
         with self._lock:
+            expected = self.studio.revision
             target = None
             for snapshot in self.versions:
                 if str(snapshot.version_id) == str(version_id_or_index) \
@@ -248,7 +250,7 @@ class Session:
                     break
             if target is None:
                 raise KeyError(f"unknown version {version_id_or_index}")
-            self._restore_spec(target.spec)
+            self._restore_spec(target.spec, expected_revision=expected)
             # Keep history linear at the restored point, but allow redo.
             index = self.versions.index(target)
             if index != len(self.versions) - 1:
@@ -260,28 +262,43 @@ class Session:
         with self._lock:
             if len(self.versions) < 2:
                 return None
+            expected = self.studio.revision
+            versions = list(self.versions)
+            redo_stack = list(self.redo_stack)
             current = self.versions.pop()
             self.redo_stack.append(current)
             target = self.versions[-1]
-            self._restore_spec(target.spec)
+            try:
+                self._restore_spec(target.spec, expected_revision=expected)
+            except Exception:
+                self.versions = versions
+                self.redo_stack = redo_stack
+                raise
             return target
 
     def redo(self) -> VersionSnapshot | None:
         with self._lock:
             if not self.redo_stack:
                 return None
+            expected = self.studio.revision
+            versions = list(self.versions)
+            redo_stack = list(self.redo_stack)
             target = self.redo_stack.pop()
             self.versions.append(target)
-            self._restore_spec(target.spec)
+            try:
+                self._restore_spec(target.spec, expected_revision=expected)
+            except Exception:
+                self.versions = versions
+                self.redo_stack = redo_stack
+                raise
             return target
 
-    def _restore_spec(self, payload: dict) -> None:
+    def _restore_spec(self, payload: dict, *, expected_revision=None) -> None:
         from ..schema import Spec
 
         spec = Spec.from_dict(copy.deepcopy(payload))
-        self.studio.spec = spec
-        self.studio.last_build = None
-        self.studio.rebuild()
+        self.studio.commit(spec, expected_revision=expected_revision,
+                           label="Restored a saved version", component="history")
 
     def history(self, limit: int = 20) -> list[dict]:
         with self._lock:
@@ -301,6 +318,8 @@ class Session:
             token = new_id("approve")
             self.pending = {
                 "token": token,
+                "base_revision": self.studio.revision,
+                "checksum": str(self.studio.solved.get("derived.checksum") or ""),
                 "request": request,
                 "mode": mode,
                 "spec": _clean_spec(spec),
@@ -319,12 +338,22 @@ class Session:
             if self.pending.get("token") != token:
                 raise ValueError("approval token does not match the pending change")
             pending = self.pending
-            self.pending = None
             from ..schema import Spec
 
-            self.studio.spec = Spec.from_dict(copy.deepcopy(pending["spec"]))
-            self.studio.last_build = None
-            self.studio.rebuild()
+            spec = Spec.from_dict(copy.deepcopy(pending["spec"]))
+            try:
+                self.studio.commit(
+                    spec, expected_revision=pending.get("base_revision"),
+                    label="Approved: " + pending["request"][:80],
+                    component="approval")
+            except RevisionConflict:
+                self.pending = None
+                raise
+            except Exception:
+                # A generation failure leaves the last valid model untouched and
+                # keeps the staged change available for a later retry.
+                raise
+            self.pending = None
             self.take_checkpoint("Approved: " + pending["request"][:80], "agent")
             self.memory.applied_changes.append({
                 "request": pending["request"], "ops": pending["ops"], "at": now(),

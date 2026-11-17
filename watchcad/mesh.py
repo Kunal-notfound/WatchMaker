@@ -9,14 +9,22 @@ volume/mass estimates.  All units are millimetres, Z is the watch axis.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import math
 import struct
 from dataclasses import dataclass, field
 
 from . import materials as material_lib
+from .revision import RenderGenerationError
 
 Vec = tuple[float, float, float]
+
+CREASE_ANGLE_DEG = 35.0
+
+
+class MeshValidationError(RenderGenerationError):
+    """Raised when a generated mesh is structurally invalid."""
 
 
 @dataclass
@@ -28,6 +36,7 @@ class Mesh:
     material: str = "steel"
     role: str = "part"
     meta: dict = field(default_factory=dict)
+    normals: list[Vec] | None = None
 
     # -- transforms -------------------------------------------------------
     def translated(self, dx=0.0, dy=0.0, dz=0.0) -> "Mesh":
@@ -46,7 +55,8 @@ class Mesh:
 
     def copy(self) -> "Mesh":
         return Mesh(self.name, list(self.verts), list(self.faces), self.color,
-                    self.material, self.role, dict(self.meta))
+                    self.material, self.role, dict(self.meta),
+                    None if self.normals is None else list(self.normals))
 
     # -- queries ----------------------------------------------------------
     def bounds(self) -> dict:
@@ -103,8 +113,20 @@ def _ring(profile: list[tuple[float, float]], segments: int, closed: bool) -> Me
             b = seg * n + j
             c = nxt * n + j
             d = nxt * n + i
-            faces.append((a, b, c))
-            faces.append((a, c, d))
+            # A profile point on the axis is the same position for every
+            # segment.  Emit only the non-degenerate triangle(s) so the mesh
+            # has no zero-area faces at disc caps and axis tips.
+            at_axis_a = abs(profile[i][0]) <= 1e-12
+            at_axis_b = abs(profile[j][0]) <= 1e-12
+            if at_axis_a and at_axis_b:
+                continue
+            if at_axis_a:
+                faces.append((a, b, c))
+            elif at_axis_b:
+                faces.append((a, c, d))
+            else:
+                faces.append((a, b, c))
+                faces.append((a, c, d))
     return ensure_outward(Mesh("revolved", verts, faces))
 
 
@@ -337,6 +359,114 @@ def sweep_ribbon(path: list[tuple[float, float]], width: float, z0: float, z1: f
     return ensure_outward(Mesh(name, verts, faces))
 
 
+def rounded_rect_profile(width: float, height: float, radius: float,
+                         corner_segments: int = 3) -> list[tuple[float, float]]:
+    """Counter-clockwise rounded rectangle centred on the origin.
+
+    The profile is used as a closed cross-section by :func:`sweep_sections`.
+    It is convex, so a centroid fan always triangulates the end caps without
+    self-intersection or zero-area triangles.
+    """
+    width = max(0.05, float(width))
+    height = max(0.05, float(height))
+    radius = max(0.0, min(float(radius), width * 0.49, height * 0.49))
+    steps = max(1, int(corner_segments))
+    hx, hy = width / 2.0, height / 2.0
+    corners = [
+        (hx - radius, hy - radius, 0.0),
+        (-hx + radius, hy - radius, 90.0),
+        (-hx + radius, -hy + radius, 180.0),
+        (hx - radius, -hy + radius, 270.0),
+    ]
+    poly: list[tuple[float, float]] = []
+    for cx, cy, start in corners:
+        for index in range(steps + 1):
+            angle = math.radians(start + 90.0 * index / steps)
+            poly.append((cx + radius * math.cos(angle),
+                         cy + radius * math.sin(angle)))
+    return poly
+
+
+def section_frame(path: list[Vec], index: int,
+                  axis_hint: Vec = (1.0, 0.0, 0.0)) -> tuple[Vec, Vec, Vec]:
+    """Return ``(width_axis, tangent, normal_axis)`` for a swept path point."""
+    prev = path[max(0, index - 1)]
+    nxt = path[min(len(path) - 1, index + 1)]
+    tangent = (nxt[0] - prev[0], nxt[1] - prev[1], nxt[2] - prev[2])
+    length = math.sqrt(sum(component * component for component in tangent))
+    if length <= 1e-9:
+        raise ValueError("sweep path has a zero-length tangent")
+    t = tuple(component / length for component in tangent)
+    dot = sum(axis_hint[i] * t[i] for i in range(3))
+    primary = tuple(axis_hint[i] - dot * t[i] for i in range(3))
+    plen = math.sqrt(sum(component * component for component in primary))
+    if plen <= 1e-9:
+        fallback = (0.0, 1.0, 0.0) if abs(t[1]) < 0.9 else (1.0, 0.0, 0.0)
+        dot = sum(fallback[i] * t[i] for i in range(3))
+        primary = tuple(fallback[i] - dot * t[i] for i in range(3))
+        plen = math.sqrt(sum(component * component for component in primary))
+    primary = tuple(component / plen for component in primary)
+    secondary = (
+        primary[1] * t[2] - primary[2] * t[1],
+        primary[2] * t[0] - primary[0] * t[2],
+        primary[0] * t[1] - primary[1] * t[0],
+    )
+    return primary, t, secondary  # type: ignore[return-value]
+
+
+def sweep_sections(path: list[Vec], sections: list[tuple[float, float, float]],
+                   name: str = "sweep", *, axis_hint: Vec = (1.0, 0.0, 0.0),
+                   corner_segments: int = 3) -> Mesh:
+    """Sweep a changing rounded-rectangle section along a 3-D centre-line.
+
+    Unlike :func:`sweep_ribbon` this produces a closed solid with rounded sides
+    and real end caps.  ``axis_hint`` chooses the width direction and is
+    projected onto the plane normal to the path tangent, so a strap can follow
+    a wrist arc while its width stays across the wrist.  ``sections`` entries
+    are ``(width, height, corner_radius)`` in the local width/normal plane.
+
+    This is a presentation-grade swept solid: it has no boolean union with the
+    case and no manufacturing fillets, but it is watertight enough for export
+    and its centre-line and cross-sections are driven by the solved spec.
+    """
+    if len(path) < 2 or len(sections) != len(path):
+        return Mesh(name)
+    steps = max(1, int(corner_segments))
+    profile = rounded_rect_profile(sections[0][0], sections[0][1],
+                                   sections[0][2], steps)
+    ring = len(profile)
+    verts: list[Vec] = []
+    for index, centre in enumerate(path):
+        primary, _, secondary = section_frame(path, index, axis_hint)
+        profile = rounded_rect_profile(sections[index][0], sections[index][1],
+                                       sections[index][2], steps)
+        for u, v in profile:
+            verts.append(tuple(centre[axis] + primary[axis] * u
+                               + secondary[axis] * v for axis in range(3)))
+
+    faces: list[tuple[int, int, int]] = []
+    for index in range(len(path) - 1):
+        for j in range(ring):
+            a = index * ring + j
+            b = index * ring + (j + 1) % ring
+            c = (index + 1) * ring + (j + 1) % ring
+            d = (index + 1) * ring + j
+            faces += [(a, b, c), (a, c, d)]
+
+    first_centre = len(verts)
+    verts.append(tuple(sum(verts[j][axis] for j in range(ring)) / ring
+                       for axis in range(3)))
+    last_ring = (len(path) - 1) * ring
+    last_centre = len(verts)
+    verts.append(tuple(sum(verts[last_ring + j][axis] for j in range(ring))
+                       / ring for axis in range(3)))
+    for j in range(ring):
+        nxt = (j + 1) % ring
+        faces.append((first_centre, nxt, j))
+        faces.append((last_centre, last_ring + j, last_ring + nxt))
+    return ensure_outward(Mesh(name, verts, faces))
+
+
 def polygon_area(poly: list[tuple[float, float]]) -> float:
     area = 0.0
     n = len(poly)
@@ -438,6 +568,148 @@ def vertex_normals(m: Mesh) -> list[Vec]:
     return out
 
 
+def _face_normal_raw(m: Mesh, face: tuple[int, int, int]) -> tuple[float, float, float]:
+    a, b, c = (m.verts[i] for i in face)
+    ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
+    return (uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx)
+
+
+def _unit(vector: tuple[float, float, float]) -> Vec:
+    length = math.sqrt(sum(component * component for component in vector))
+    if not math.isfinite(length) or length <= 1e-12:
+        return (0.0, 0.0, 1.0)
+    return tuple(component / length for component in vector)  # type: ignore[return-value]
+
+
+def split_creases(m: Mesh, angle_deg: float = CREASE_ANGLE_DEG) -> Mesh:
+    """Return a copy with duplicated vertices where faces meet at a crease.
+
+    Smooth groups are grown from the average normal of each cluster, so a
+    curved surface stays smooth while a machined 90-degree rim is split.  The
+    returned mesh carries explicit per-vertex ``normals`` for glTF export.
+    """
+    if not m.faces or not m.verts:
+        return Mesh(m.name, list(m.verts), list(m.faces), m.color, m.material,
+                    m.role, dict(m.meta), vertex_normals(m))
+    limit = math.cos(math.radians(max(1.0, min(89.0, angle_deg))))
+    raw = [_face_normal_raw(m, face) for face in m.faces]
+    incident: dict[int, list[int]] = {}
+    for face_index, face in enumerate(m.faces):
+        for vertex in face:
+            incident.setdefault(vertex, []).append(face_index)
+
+    # cluster normal for each original vertex / smooth group
+    cluster_normals: dict[tuple[int, int], Vec] = {}
+    face_cluster: dict[tuple[int, int], int] = {}
+    for vertex, faces in incident.items():
+        remaining = list(faces)
+        group = 0
+        while remaining:
+            seed = remaining.pop(0)
+            members = [seed]
+            total = list(raw[seed])
+            while True:
+                mean = _unit(tuple(component for component in total))
+                moved = False
+                for face_index in list(remaining):
+                    normal = _unit(raw[face_index])
+                    if sum(normal[i] * mean[i] for i in range(3)) >= limit:
+                        remaining.remove(face_index)
+                        members.append(face_index)
+                        for i in range(3):
+                            total[i] += raw[face_index][i]
+                        moved = True
+                if not moved:
+                    break
+            for face_index in members:
+                face_cluster[(vertex, face_index)] = group
+            cluster_normals[(vertex, group)] = _unit(tuple(total))
+            group += 1
+
+    new_verts = list(m.verts)
+    normals: list[Vec] = [(0.0, 0.0, 1.0) for _ in m.verts]
+    copies: dict[tuple[int, int], int] = {}
+    new_faces: list[tuple[int, int, int]] = []
+    for face_index, face in enumerate(m.faces):
+        remapped = []
+        for vertex in face:
+            group = face_cluster.get((vertex, face_index), 0)
+            key = (vertex, group)
+            if group == 0:
+                target = vertex
+            elif key in copies:
+                target = copies[key]
+            else:
+                target = len(new_verts)
+                copies[key] = target
+                new_verts.append(m.verts[vertex])
+                normals.append((0.0, 0.0, 1.0))
+            normals[target] = cluster_normals.get(key, _unit(raw[face_index]))
+            remapped.append(target)
+        new_faces.append(tuple(remapped))  # type: ignore[arg-type]
+    return Mesh(m.name, new_verts, new_faces, m.color, m.material, m.role,
+                dict(m.meta), normals)
+
+
+def validate_mesh(m: Mesh) -> list[dict]:
+    """Report structural defects without mutating the mesh."""
+    issues: list[dict] = []
+
+    def add(kind: str, detail: str, **fields) -> None:
+        row = {"mesh": m.name, "kind": kind, "detail": detail}
+        row.update(fields)
+        issues.append(row)
+
+    for index, vertex in enumerate(m.verts):
+        if len(vertex) != 3 or not all(math.isfinite(float(c)) for c in vertex):
+            add("invalid_vertex", "vertex has non-finite coordinates", index=index)
+    seen_faces: set[tuple[int, ...]] = set()
+    for index, face in enumerate(m.faces):
+        if len(face) != 3:
+            add("invalid_face", "face is not a triangle", index=index)
+            continue
+        for vertex in face:
+            if not isinstance(vertex, int) or vertex < 0 or vertex >= len(m.verts):
+                add("invalid_index", "face references a missing vertex",
+                    face=index, index=vertex)
+        key = tuple(sorted(face))
+        if key in seen_faces:
+            add("duplicate_face", "duplicate triangle", face=index)
+        seen_faces.add(key)
+        if all(0 <= i < len(m.verts) for i in face):
+            normal = _face_normal_raw(m, face)
+            if math.sqrt(sum(c * c for c in normal)) <= 1e-9:
+                add("zero_area", "degenerate triangle has zero area", face=index)
+    if m.normals is not None:
+        if len(m.normals) != len(m.verts):
+            add("normal_count", "normal count does not match vertex count")
+        for index, normal in enumerate(m.normals):
+            if len(normal) != 3 or not all(math.isfinite(float(c)) for c in normal):
+                add("invalid_normal", "normal has non-finite components", index=index)
+                continue
+            length = math.sqrt(sum(c * c for c in normal))
+            if abs(length - 1.0) > 1e-3:
+                add("invalid_normal", "normal is not unit length", index=index,
+                    length=round(length, 4))
+    uvs = _uv_coords(m)
+    for index, pair in enumerate(uvs):
+        if len(pair) != 2 or not all(math.isfinite(float(c)) for c in pair):
+            add("invalid_uv", "UV has non-finite coordinates", index=index)
+        elif any(c < -1e-6 or c > 1.0 + 1e-6 for c in pair):
+            add("invalid_uv", "UV is outside the unit range", index=index)
+    if m.faces and m.verts and _signed_volume(m) <= 0:
+        add("inverted_winding", "mesh signed volume is not outward-facing")
+    return issues
+
+
+def validate_meshes(meshes: list[Mesh]) -> list[dict]:
+    issues: list[dict] = []
+    for mesh in meshes:
+        issues.extend(validate_mesh(mesh))
+    return issues
+
+
 def to_obj(meshes: list[Mesh]) -> str:
     lines = ["# watchcad assembly"]
     offset = 1
@@ -497,14 +769,20 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
         return len(views) - 1
 
     for m in meshes:
-        pos = [c for v in m.verts for c in v]
+        issues = validate_mesh(m)
+        if issues:
+            raise MeshValidationError(
+                f"{m.name}: " + "; ".join(
+                    f"{row['kind']} ({row['detail']})" for row in issues[:4]))
+        export = split_creases(m)
+        pos = [c for v in export.verts for c in v]
         pos_bytes = struct.pack(f"<{len(pos)}f", *pos)
-        normals = vertex_normals(m)
+        normals = export.normals or vertex_normals(export)
         nrm = [c for v in normals for c in v]
         nrm_bytes = struct.pack(f"<{len(nrm)}f", *nrm)
-        idx = [i for f in m.faces for i in f]
+        idx = [i for f in export.faces for i in f]
         idx_bytes = struct.pack(f"<{len(idx)}I", *idx)
-        uvs = _uv_coords(m)
+        uvs = _uv_coords(export)
         uv = [c for pair in uvs for c in pair]
         uv_bytes = struct.pack(f"<{len(uv)}f", *uv)
         pv = add_view(pos_bytes, 34962)
@@ -512,8 +790,8 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
         iv = add_view(idx_bytes, 34963)
         uvv = add_view(uv_bytes, 34962)
 
-        xs, ys, zs = m.verts and ([v[0] for v in m.verts], [v[1] for v in m.verts], [v[2] for v in m.verts]) or ([0], [0], [0])
-        accessors.append({"bufferView": pv, "componentType": 5126, "count": len(m.verts),
+        xs, ys, zs = export.verts and ([v[0] for v in export.verts], [v[1] for v in export.verts], [v[2] for v in export.verts]) or ([0], [0], [0])
+        accessors.append({"bufferView": pv, "componentType": 5126, "count": len(export.verts),
                           "type": "VEC3", "min": [min(xs), min(ys), min(zs)],
                           "max": [max(xs), max(ys), max(zs)]})
         pos_acc = len(accessors) - 1
@@ -541,6 +819,11 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
                 "material_key": surface["material_key"],
                 "finish": surface["finish"],
                 "texture": surface["texture"],
+                "texture_seed": hashlib.sha256(
+                    "|".join(str(part) for part in (
+                        m.name, m.role, m.material, surface["material_key"],
+                        surface["finish"], surface["texture"])).encode()
+                ).hexdigest()[:16],
                 "provenance": surface["provenance"],
             },
         }

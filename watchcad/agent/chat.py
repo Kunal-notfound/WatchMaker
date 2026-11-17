@@ -27,6 +27,7 @@ from .. import llm as llm_module
 from ..llm import LLMConfig, LLMError, LLMNotConfigured, LLMReply, user_content
 from ..components import component_context, resolve_component
 from ..nlp import describe
+from ..revision import RevisionConflict
 from ..schema import FIELDS, Spec
 from ..store import ConversationStore, transcript_text
 from .context import AgentCancelled, AgentTimeout, RunControl
@@ -596,14 +597,22 @@ class ConversationRuntime:
                         and not ({c["path"] for c in changes if c["path"] != "locks"}
                                  & set(self.studio.spec.locks)))
                 if safe or mode == "autonomous":
-                    commit = executor.commit("Conversational design change")
-                    committed = bool(commit.get("applied"))
-                    result.status = "complete"
-                    self.session.checkpoint("Chat: " + request[:70], "agent")
-                    self._timeline_event("commit", "Changes committed",
-                                         f"{commit.get('applied', 0)} field(s); "
-                                         f"checksum {str(commit.get('checksum'))[:8]}",
-                                         status="ok", data={"changes": changes})
+                    try:
+                        commit = executor.commit("Conversational design change")
+                    except RevisionConflict as exc:
+                        executor.rollback()
+                        result.status = "conflict"
+                        result.error = str(exc)
+                        self._timeline_event("conflict", "Stale chat change rejected",
+                                             str(exc), status="error")
+                    else:
+                        committed = bool(commit.get("applied"))
+                        result.status = "complete"
+                        self.session.checkpoint("Chat: " + request[:70], "agent")
+                        self._timeline_event("commit", "Changes committed",
+                                             f"{commit.get('applied', 0)} field(s); "
+                                             f"checksum {str(commit.get('checksum'))[:8]}",
+                                             status="ok", data={"changes": changes})
                 else:
                     executor.rollback()
                     result.status = "rolled_back"
@@ -657,6 +666,9 @@ class ConversationRuntime:
         elif result.status == "awaiting_approval" or staged:
             bits.append(f"I staged {len(changes)} validated change(s) for your "
                         "approval. The live design is unchanged until you approve.")
+        elif result.status == "conflict":
+            bits.append("The design changed while I was working, so the staged "
+                        "change was rejected. The live design is unchanged.")
         elif result.status == "rolled_back":
             bits.append("I rolled the change back because it made verification "
                         "worse. The live design is unchanged.")

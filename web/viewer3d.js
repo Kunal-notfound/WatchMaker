@@ -34,6 +34,12 @@ const BACKGROUNDS = {
   blueprint: { color: 0x0d2137, css: "", note: "blueprint" },
 };
 
+function envIntensity(role) {
+  const scale = Number(QUALITY[S.quality]?.env ?? 1);
+  const base = role === "dial" ? 0.7 : role === "crystal" ? 1.25 : 1.05;
+  return base * scale;
+}
+
 const S = {
   renderer: null,
   scene: null,
@@ -55,6 +61,9 @@ const S = {
   view: "three",
   frame: 0,
   token: 0,
+  expectedRevision: 0,
+  loadedRevision: 0,
+  loadedGeneration: 0,
   loading: false,
   disposed: false,
   shadowPlane: null,
@@ -161,9 +170,10 @@ function init() {
 
   document.body.classList.add("webgl3d");
   bindEvents();
+  S.controls.addEventListener("change", () => requestRender());
   resize();
   placeCamera("three", true);
-  animate();
+  requestRender(true);
 
   window.WatchCAD3D = {
     available: true,
@@ -177,7 +187,13 @@ function init() {
     selectPart: (name) => selectByName(name),
     clearSelection: () => selectByName(null),
     setQuality: (name) => setQuality(name),
-    setModelUrl: (url) => { S.modelUrl = String(url || ""); load(); },
+    setModelUrl: (url, meta) => {
+      S.modelUrl = String(url || "");
+      S.expectedRevision = Number(meta?.revision || 0);
+      load();
+    },
+    get loadedRevision() { return S.loadedRevision; },
+    get loadedGeneration() { return S.loadedGeneration; },
     getQuality: () => S.quality,
     setBackground: (name) => setBackground(name),
     getBackground: () => S.background,
@@ -211,11 +227,23 @@ function bindEvents() {
     });
   });
   window.addEventListener("resize", () => resize());
+  window.addEventListener("pagehide", () => disposeAll());
 
-  window.addEventListener("watchcad:scene-changed", () => { S.modelUrl = ""; load(); });
+  window.addEventListener("watchcad:scene-changed", (event) => {
+    S.modelUrl = "";
+    S.expectedRevision = Number(event.detail?.revision || 0);
+    load();
+  });
   window.addEventListener("watchcad:model-url", (event) => {
     S.modelUrl = String(event.detail?.url || "");
+    S.expectedRevision = Number(event.detail?.revision || 0);
     load();
+  });
+  window.addEventListener("watchcad:render-status", (event) => {
+    const status = event.detail || {};
+    if (status.status === "failed" && status.error) {
+      setStatus(`render failed: ${String(status.error).slice(0, 120)}`);
+    }
   });
   window.addEventListener("watchcad:view", (event) => placeCamera(event.detail?.name, true));
   window.addEventListener("watchcad:explode", (event) => setExplode(Number(event.detail?.value) || 0));
@@ -243,22 +271,37 @@ function resize() {
   requestRender(true);
 }
 
-function animate() {
-  if (S.disposed) return;
-  S.frame = requestAnimationFrame(animate);
-  const moved = S.controls.update();
+/* Rendering is on demand: a frame is requested only while the camera is
+   moving or a scene mutation marked the viewport dirty.  When both settle no
+   animation frame is scheduled, so an idle tab costs nothing. */
+function scheduleFrame() {
+  if (S.disposed || S.frame || !S.renderer) return;
+  S.frame = requestAnimationFrame(renderFrame);
+}
+
+function renderFrame() {
+  S.frame = 0;
+  if (S.disposed || !S.renderer) return;
+  const moved = Boolean(S.controls.update());
   if (moved || S.dirty) {
     S.dirty = false;
     S.renderer.render(S.scene, S.camera);
   }
+  if (moved || S.dirty) scheduleFrame();
+}
+
+function renderNow() {
+  if (S.disposed || !S.renderer) return;
+  S.controls.update();
+  S.dirty = false;
+  S.renderer.render(S.scene, S.camera);
 }
 
 function requestRender(force = false) {
+  if (S.disposed) return;
   S.dirty = true;
-  if (force && S.renderer) {
-    S.controls.update();
-    S.renderer.render(S.scene, S.camera);
-  }
+  if (force) renderNow();
+  else scheduleFrame();
 }
 
 function placeCamera(name, apply) {
@@ -304,15 +347,32 @@ async function load() {
   if (S.loading) { S.pending = true; return; }
   S.loading = true;
   const token = ++S.token;
+  const expectedRevision = S.expectedRevision;
   setStatus("loading 3D model…");
   try {
-    const url = S.modelUrl
+    const base = S.modelUrl
       || `/api/model.glb?quality=${encodeURIComponent(S.quality)}`;
+    const url = expectedRevision && !/[?&]revision=/.test(base)
+      ? `${base}${base.includes("?") ? "&" : "?"}revision=${expectedRevision}`
+      : base;
     const response = await fetch(url, {
       headers: { "X-WatchCAD-Session": sessionId() },
       cache: "no-store",
     });
+    if (token !== S.token) return;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const headerRevision = Number(response.headers?.get?.("X-Design-Revision") || 0);
+    const generation = Number(response.headers?.get?.("X-Model-Generation") || 0);
+    const preview = response.headers?.get?.("X-Model-Preview") === "true";
+    if (expectedRevision && headerRevision && headerRevision !== expectedRevision) {
+      emit("watchcad:viewer-stale", {
+        expected: expectedRevision, received: headerRevision,
+      });
+      return;
+    }
+    if (generation && generation <= S.loadedGeneration && !preview) return;
+
     const buffer = await response.arrayBuffer();
     if (token !== S.token) return;
 
@@ -320,11 +380,20 @@ async function load() {
       S.loader.parse(buffer, "", resolve, reject);
     });
     if (token !== S.token) return;
-    install(gltf);
-    await loadGroups();
-    setStatus(`${S.parts.length} parts · PBR / IBL`);
-    emit("watchcad:viewer-model", { parts: S.parts.length });
+    install(gltf, { preserveCamera: Boolean(S.root) });
+    await loadGroups(expectedRevision, token);
+    if (token !== S.token) return;
+    S.loadedRevision = headerRevision || S.loadedRevision;
+    S.loadedGeneration = generation || S.loadedGeneration + 1;
+    setStatus(`${S.parts.length} parts · PBR / IBL · r${S.loadedRevision}`);
+    emit("watchcad:viewer-model", {
+      parts: S.parts.length,
+      revision: S.loadedRevision,
+      generation: S.loadedGeneration,
+      preview,
+    });
   } catch (error) {
+    if (token !== S.token) return;
     console.warn("3D model load failed", error);
     setStatus(`3D model failed: ${error.message || error}`);
     emit("watchcad:viewer-error", { message: String(error?.message || error) });
@@ -334,10 +403,12 @@ async function load() {
   }
 }
 
-function install(gltf) {
+function install(gltf, options = {}) {
+  const preserveCamera = Boolean(options.preserveCamera && S.root);
   if (S.root) {
     S.scene.remove(S.root);
     disposeObject(S.root);
+    S.root = null;
   }
   const root = gltf.scene || gltf.scenes?.[0];
   if (!root) throw new Error("glTF contained no scene");
@@ -349,8 +420,11 @@ function install(gltf) {
   root.traverse((child) => {
     if (!child.isMesh) return;
     const role = child.userData?.role || child.parent?.userData?.role || "part";
+    const sourceMaterials = Array.isArray(child.material)
+      ? child.material : [child.material];
     const material = makeMaterial(child.material, role);
     child.material = material;
+    for (const source of sourceMaterials) source?.dispose?.();
     child.castShadow = role !== "crystal";
     child.receiveShadow = true;
     child.userData.role = role;
@@ -381,7 +455,8 @@ function install(gltf) {
   aimKeyLight();
   applyVisibility();
   applyExplode();
-  placeCamera(S.view, true);
+  if (preserveCamera) requestRender(true);
+  else placeCamera(S.view, true);
 }
 
 function makeMaterial(source, role) {
@@ -408,7 +483,7 @@ function makeMaterial(source, role) {
       clearcoatRoughness: 0.03,
       side: THREE.DoubleSide,
       depthWrite: false,
-      envMapIntensity: 1.25,
+      envMapIntensity: envIntensity(role),
     });
   }
 
@@ -418,11 +493,12 @@ function makeMaterial(source, role) {
     roughness: Math.min(1, Math.max(0.02, roughness)),
     opacity: Math.min(1, Math.max(0.05, opacity)),
     transparent: opacity < 0.999,
-    envMapIntensity: role === "dial" ? 0.7 : 1.05,
+    envMapIntensity: envIntensity(role),
   });
   const kind = String(extras.texture || "none");
+  const seed = textureSeed(extras, role, kind);
   if (kind !== "none" && S.quality !== "low") {
-    material.bumpMap = patternTexture(kind, QUALITY[S.quality]?.texture || 256);
+    material.bumpMap = patternTexture(kind, QUALITY[S.quality]?.texture || 256, seed);
     material.bumpScale = kind === "grain" ? 0.035 : kind === "weave" ? 0.05
       : role === "dial" ? 0.02 : 0.012;
     material.needsUpdate = true;
@@ -431,17 +507,48 @@ function makeMaterial(source, role) {
   return material;
 }
 
+/* Deterministic noise helpers.  A texture is keyed by the component/material
+   identity exported in glTF extras, so the same design always produces the
+   same surface and a material change produces a different one. */
+function hashSeed(text) {
+  let hash = 2166136261;
+  for (let i = 0; i < String(text).length; i += 1) {
+    hash ^= String(text).charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function seededRandom(seed) {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6D2B79F5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function textureSeed(extras, role, kind) {
+  const identity = extras.texture_seed || [
+    role, kind, extras.material_key, extras.watch_material, extras.finish,
+  ].filter(Boolean).join("|");
+  return hashSeed(identity || "watchcad");
+}
+
 /* Procedural finish textures.  There are no downloaded image maps: the pattern
    is generated on a canvas from the material/finish metadata the server put in
    the glTF extras.  This is a visual approximation of brushed, radial, grain,
    weave and guilloché finishes — not a measured surface. */
-function patternTexture(kind, size) {
-  const key = `${kind}:${size}`;
+function patternTexture(kind, size, seed = 1) {
+  const key = `${kind}:${size}:${seed}`;
   if (S.textureCache.has(key)) return S.textureCache.get(key);
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
+  const random = seededRandom(hashSeed(`${seed}:${kind}:${size}`));
   ctx.fillStyle = "#808080";
   ctx.fillRect(0, 0, size, size);
   ctx.strokeStyle = "rgba(255,255,255,0.55)";
@@ -477,13 +584,13 @@ function patternTexture(kind, size) {
   } else if (kind === "grain") {
     const pixels = ctx.getImageData(0, 0, size, size);
     for (let i = 0; i < pixels.data.length; i += 4) {
-      const v = 128 + (Math.random() - 0.5) * 110;
+      const v = 128 + (random() - 0.5) * 110;
       pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = v;
     }
     ctx.putImageData(pixels, 0, 0);
   } else { // brushed
     for (let y = 0; y < size; y += 2) {
-      const v = 150 + Math.round((Math.random() - 0.5) * 70);
+      const v = 150 + Math.round((random() - 0.5) * 70);
       ctx.strokeStyle = `rgb(${v},${v},${v})`;
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -509,7 +616,9 @@ function applyQualityMaterials() {
     const kind = String(extras.texture || "none");
     if (material?.isMeshStandardMaterial) {
       material.bumpMap = kind !== "none" && S.quality !== "low"
-        ? patternTexture(kind, QUALITY[S.quality]?.texture || 256) : null;
+        ? patternTexture(kind, QUALITY[S.quality]?.texture || 256,
+          textureSeed(extras, part.userData?.role || "part", kind)) : null;
+      material.envMapIntensity = envIntensity(part.userData?.role || "part");
       material.needsUpdate = true;
     }
   }
@@ -587,14 +696,20 @@ function aimKeyLight() {
   cam.updateProjectionMatrix();
 }
 
-async function loadGroups() {
+async function loadGroups(expectedRevision = 0, token = 0) {
   try {
-    const response = await fetch(`/api/scene?quality=${encodeURIComponent(S.quality)}`, {
+    const base = `/api/scene?quality=${encodeURIComponent(S.quality)}`;
+    const url = expectedRevision ? `${base}&revision=${expectedRevision}` : base;
+    const response = await fetch(url, {
       headers: { "X-WatchCAD-Session": sessionId() },
       cache: "no-store",
     });
+    if (token && token !== S.token) return;
     if (!response.ok) return;
+    const received = Number(response.headers?.get?.("X-Design-Revision") || 0);
+    if (expectedRevision && received && received !== expectedRevision) return;
     const payload = await response.json();
+    if (token && token !== S.token) return;
     S.tree = payload.tree || {};
     S.groups.clear();
     for (const [group, names] of Object.entries(S.tree)) {
@@ -704,6 +819,20 @@ function disposeObject(object) {
     const materials = Array.isArray(child.material) ? child.material : [child.material];
     for (const material of materials) material?.dispose?.();
   });
+}
+
+function disposeAll() {
+  if (S.disposed) return;
+  S.disposed = true;
+  S.token += 1;
+  if (S.frame && window.cancelAnimationFrame) window.cancelAnimationFrame(S.frame);
+  S.frame = 0;
+  if (S.root) disposeObject(S.root);
+  for (const texture of S.textureCache.values()) texture?.dispose?.();
+  S.textureCache.clear();
+  S.keyLight?.shadow?.map?.dispose?.();
+  S.env?.dispose?.();
+  S.renderer?.dispose?.();
 }
 
 if (init()) {
