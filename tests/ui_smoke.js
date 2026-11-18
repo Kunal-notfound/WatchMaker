@@ -61,6 +61,7 @@ class El {
   closest() { return null; }
   contains() { return false; }
   matches() { return false; }
+  focus() { this.focused = true; }
   click() {
     for (const fn of this.listeners.click || []) fn({ target: this, preventDefault() {} });
   }
@@ -121,6 +122,7 @@ const eventLog = [];
 const watchedEvents = [
   "watchcad:scene-changed", "watchcad:model-url", "watchcad:viewer-model",
   "watchcad:viewer-stale", "watchcad:viewer-error", "watchcad:session-changed",
+  "watchcad:visibility", "watchcad:zoom",
 ];
 for (const type of watchedEvents) {
   window.addEventListener(type, (event) => {
@@ -238,8 +240,15 @@ const source = fs.readFileSync(appPath, "utf8")
     runOptimisation, applyCandidate, onGlobalClick, renderOptimisation,
     previewCandidate, armCandidateApply, clearCandidatePreview,
     refreshCritic, setComponentFocus, renderCritic, applyCriticFix,
+    setWorkspace, setDock, onGlobalKeydown, setTreeExpanded,
+    selectComponent, setComponentVisibility, isolateComponent,
+    toggleComponentLock, renderComponentTree, renderVerificationDock,
+    openMovementModal, openHistoryModal, openCompareModal,
+    createSnapshot, loadVersions, restoreVersion,
     get CRITIC() { return CRITIC; },
     get AGENT() { return AGENT; }, get DESIGN() { return DESIGN; },
+    get TREE() { return TREE; }, get WORKSPACE() { return WORKSPACE; },
+    get MOVEMENT() { return MOVEMENT; },
     get selected() { return V.selected; },
     get appliedRevision() { return appliedRevision; },
     get renderedRevision() { return renderedRevision; },
@@ -288,6 +297,73 @@ const waitFor = async (fn, label, timeout = 15000) => {
     `applied and rendered revisions agree (${t.appliedRevision})`);
   check(!eventLog.some((entry) => entry.type === "watchcad:viewer-stale"),
     "no stale model was accepted during boot");
+
+  console.log("component tree");
+  check(t.TREE.components.length >= 10,
+    `component registry loaded (${t.TREE.components.length} components)`);
+  let treeHtml = el("componentTree").innerHTML;
+  check(treeHtml.includes('data-tree-select="case"')
+    && treeHtml.includes('data-tree-visibility="case"')
+    && treeHtml.includes('data-tree-isolate="case"')
+    && treeHtml.includes('data-tree-lock="case"'),
+  "component rows expose select, visibility, isolate and lock actions");
+  t.setTreeExpanded(true);
+  treeHtml = el("componentTree").innerHTML;
+  check(treeHtml.includes('data-tree-part="hour_hand"')
+    && treeHtml.includes('data-tree-part-visibility="hour_hand"'),
+  "expanded components expose selectable and hideable parts");
+  t.TREE.query = "hour_hand";
+  t.renderComponentTree();
+  treeHtml = el("componentTree").innerHTML;
+  check(treeHtml.includes('data-tree-select="hands"')
+    && !treeHtml.includes('data-tree-select="case"'),
+  "component search filters by part name");
+  t.TREE.query = "";
+  t.renderComponentTree();
+
+  const hands = t.TREE.components.find((item) => item.id === "hands");
+  await t.selectComponent("hands");
+  check(t.V.selectedComponent === "hands"
+    && t.V.highlightParts.has("hour_hand"),
+  "selecting a component highlights its real scene parts");
+  check(el("assistantFocus").hidden === false
+    && el("assistantFocusName").textContent === "Hands",
+  "component selection scopes the assistant");
+  const visibilityEvents = eventLog.filter(
+    (entry) => entry.type === "watchcad:visibility");
+  check(visibilityEvents.length > 0
+    && visibilityEvents[visibilityEvents.length - 1].detail.highlight.includes("hour_hand"),
+  "component highlight is replayed through the visibility bridge");
+  t.isolateComponent(hands);
+  check(t.V.isolateParts instanceof Set && t.V.isolateParts.has("hour_hand")
+    && !t.V.isolateParts.has("dial"),
+  "component isolation is part-level and excludes other components");
+  t.isolateComponent(hands);
+  check(t.V.isolateParts === null, "component isolation toggles back off");
+  t.setComponentVisibility(hands, false);
+  check(hands.parts.every((part) => t.V.hiddenParts.has(part)),
+    "component visibility hides every owned part");
+  t.setComponentVisibility(hands, true);
+  check(hands.parts.every((part) => !t.V.hiddenParts.has(part)),
+    "component visibility restores every owned part");
+  const locksBefore = (t.STATE.spec.locks || []).slice();
+  await t.toggleComponentLock("dial");
+  check(t.STATE.spec.locks.includes("dial.diameter_mm")
+    && t.STATE.spec.locks.includes("dial.thickness_mm"),
+  "component lock writes the authoritative dimension fields");
+  await t.toggleComponentLock("dial");
+  check(JSON.stringify(t.STATE.spec.locks) === JSON.stringify(locksBefore),
+    "component lock toggles back to the original state");
+  await t.setComponentFocus(null);
+
+  console.log("verification dock");
+  const dockHtml = el("verificationDock").innerHTML;
+  for (const field of ["Confidence", "Component", "Reported", "Constraint",
+    "Basis", "Corrective action"]) {
+    check(dockHtml.includes(field), `verification reports ${field.toLowerCase()}`);
+  }
+  check(dockHtml.includes("PASS") && dockHtml.includes("NEEDS TEST"),
+    "verdicts are labelled in text, not by colour alone");
 
   console.log("fields");
   const form = el("specForm").innerHTML;
@@ -401,6 +477,44 @@ const waitFor = async (fn, label, timeout = 15000) => {
   check(!collapsed("leftPanel") && !collapsed("rightPanel"),
     "both sidebars reopen for the remaining checks");
 
+  console.log("workspaces and dock");
+  const workspaceClick = (name) => ({
+    target: {
+      closest(selector) {
+        return selector === "button[data-workspace]"
+          ? { dataset: { workspace: name } } : null;
+      },
+    },
+  });
+  t.onGlobalClick(workspaceClick("optimise"));
+  check(el("workspaceLabel").textContent === "Optimisation Lab"
+    && el("workspaceHint").textContent.includes("nothing applies"),
+  "optimisation workspace has its own contextual header");
+  check(stored.get("watchcad.workspace") === "optimise",
+    "workspace choice persists");
+  t.onGlobalClick(workspaceClick("engineering"));
+  check(el("workspaceLabel").textContent === "Engineering Studio"
+    && el("engineeringToolStatus").textContent.includes("solver-backed"),
+  "engineering workspace exposes solver-backed status");
+  t.onGlobalClick(workspaceClick("design"));
+  check(el("workspaceLabel").textContent === "Design Studio",
+    "design workspace restores its contextual header");
+
+  t.onGlobalClick(fakeClick({ "[data-dock]": { dataset: { dock: "timeline" } } }));
+  check(t.WORKSPACE.dock === "timeline"
+    && el("timelineDock").classList.contains("active")
+    && stored.get("watchcad.dock") === "timeline",
+  "bottom dock tabs switch and persist");
+  t.onGlobalClick(fakeClick({ "[data-dock-toggle]": { dataset: {} } }));
+  check(el("bottomDock").classList.contains("collapsed"),
+    "bottom dock collapses without hiding the viewport");
+  t.onGlobalClick(fakeClick({ "[data-dock-toggle]": { dataset: {} } }));
+  check(!el("bottomDock").classList.contains("collapsed"),
+    "bottom dock expands again");
+  t.onGlobalClick(fakeClick({ "[data-dock]": { dataset: { dock: "verification" } } }));
+  check(el("verificationDock").classList.contains("active"),
+    "verification dock is restored for the remaining checks");
+
   console.log("zoom");
   const distance = t.V.dist;
   t.zoomBy(0.8);
@@ -411,6 +525,31 @@ const waitFor = async (fn, label, timeout = 15000) => {
   check(t.V.dist < distance * 0.15, `zoom reaches a much closer range (${t.V.dist.toFixed(2)})`);
   check(t.V.dist <= t.V.focusRadius * 0.06 + 1e-6, "zoom clamps at the near limit");
   t.setView("reset");
+
+  console.log("keyboard shortcuts");
+  const keyEvent = (key, options = {}) => ({
+    key,
+    target: { closest: () => null },
+    preventDefault() { this.defaultPrevented = true; },
+    ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
+    ...options,
+  });
+  t.onGlobalKeydown(keyEvent("2"));
+  check(el("workspaceLabel").textContent === "Engineering Studio",
+    "key 2 opens the engineering workspace");
+  t.onGlobalKeydown(keyEvent("/"));
+  check(el("componentSearch").focused === true,
+    "slash focuses the component search");
+  const keyDistance = t.V.dist;
+  t.onGlobalKeydown(keyEvent("+"));
+  check(t.V.dist < keyDistance, "plus zooms in");
+  t.onGlobalKeydown(keyEvent("-"));
+  check(Math.abs(t.V.dist - keyDistance) < 1e-6, "minus zooms out");
+  await t.setComponentFocus({ name: "crown", role: "case", group: "Case" });
+  t.onGlobalKeydown(keyEvent("Escape"));
+  check(t.CRITIC.focus === null && el("focusChip").hidden,
+    "escape clears the component scope and assistant focus");
+  t.onGlobalKeydown(keyEvent("1"));
 
   console.log("copilot");
   check(t.CHAT.messages.length >= 1, "copilot has an opening message");
@@ -634,6 +773,49 @@ const waitFor = async (fn, label, timeout = 15000) => {
     check(el("optimiseStatus").innerHTML.includes("Design changed"),
       "stale lab results warn after applying");
   }
+
+  console.log("comparison and history dialogs");
+  t.openCompareModal();
+  const compareLabel = winner?.label || opt?.candidates?.[0]?.label || "";
+  check(el("compareModal").hidden === false
+    && el("candidateCompare").innerHTML.includes("compare-table")
+    && el("candidateCompare").innerHTML.includes(compareLabel),
+  "candidate comparison shows real solved candidates side by side");
+  check(el("candidateCompare").innerHTML.includes("data-preview-candidate")
+    && el("candidateCompare").innerHTML.includes("data-apply-candidate"),
+  "comparison keeps preview and explicit apply actions separate");
+  el("compareModal").hidden = true;
+
+  t.openMovementModal();
+  await waitFor(() => Boolean(t.MOVEMENT.catalog)
+    && el("movementList").innerHTML.length > 0, "movement catalogue");
+  check(el("movementModal").hidden === false
+    && el("movementList").innerHTML.includes("data-movement"),
+  "movement catalogue is loaded from the manufacturer data source");
+  el("movementModal").hidden = true;
+
+  const snapshotRevision = t.appliedRevision;
+  const restoredColour = t.STATE.spec.data.dial.color;
+  el("snapshotLabel").value = "Smoke snapshot";
+  await t.createSnapshot();
+  check(t.appliedRevision === snapshotRevision,
+    "creating a snapshot does not create a new design revision");
+  const snapshot = t.WORKSPACE.versions.find(
+    (version) => version.label === "Smoke snapshot");
+  check(Boolean(snapshot) && snapshot.kind === "snapshot",
+    "snapshot is recorded in the version list");
+  await t.setField("dial.color", "green");
+  const beforeRestore = t.appliedRevision;
+  await t.restoreVersion(snapshot.id);
+  check(t.appliedRevision === beforeRestore + 1,
+    "restoring a version commits one new revision");
+  check(t.STATE.spec.data.dial.color === restoredColour,
+    "restore returns the saved writable specification");
+  check(t.STATE.spec.data.meta.version > 2
+    && el("restoreConfirm").hidden === true,
+  "restore increments the version counter and clears its confirmation");
+  await waitFor(() => t.renderedRevision === t.appliedRevision,
+    "viewer renders the restored revision");
 
   console.log("providers");
   const sid = t.currentSession();

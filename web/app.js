@@ -59,6 +59,23 @@ const CRITIC = {
   loading: false,
   error: "",
 };
+const TREE = {
+  components: [],
+  checkOwners: new Map(),
+  query: "",
+  selected: null,
+  expanded: new Set(),
+  loading: true,
+  error: "",
+};
+const WORKSPACE = {
+  dock: "verification",
+  dockCollapsed: false,
+  versions: [],
+  historyVersion: null,
+  restoreId: null,
+  compare: new Set(),
+};
 const MOVEMENT = {
   catalog: null,
   list: [],
@@ -84,7 +101,8 @@ let renderedRevision = 0;
 const REVISIONED_POSTS = new Set([
   "/api/set", "/api/patch", "/api/lock", "/api/spec", "/api/reset",
   "/api/prompt", "/api/build", "/api/optimise/preview", "/api/agent/variant",
-  "/api/agent/undo", "/api/agent/redo", "/api/movements/propose",
+  "/api/agent/undo", "/api/agent/redo", "/api/agent/snapshot", "/api/agent/restore",
+  "/api/movements/propose",
   "/api/chat/approve", "/api/chat/reject", "/api/agent/approve",
   "/api/agent/reject", "/api/chat", "/api/agent/run",
 ]);
@@ -230,8 +248,10 @@ function rememberSession(id) {
     // A preview token belongs to the session that created it.
     DESIGN.previewToken += 1;
     DESIGN.previewId = "";
-    const clear = $("#btnClearPreview");
-    if (clear) clear.hidden = true;
+    for (const id of ["btnClearPreview", "btnClearPreviewToolbar"]) {
+      const clear = $(`#${id}`);
+      if (clear) clear.hidden = true;
+    }
   }
   AGENT.sessionId = id;
   try {
@@ -337,7 +357,7 @@ async function boot() {
   $("#btnStop").addEventListener("click", stopRun);
   $("#btnUndo").addEventListener("click", undoTurn);
   $("#btnRedo").addEventListener("click", redoTurn);
-  $("#btnHistory").addEventListener("click", toggleAgentHistory);
+  $("#btnHistory").addEventListener("click", openHistoryModal);
   $("#btnChats").addEventListener("click", toggleChatHistory);
   $("#btnNewChat").addEventListener("click", newChat);
   $("#btnSettings").addEventListener("click", toggleSettings);
@@ -349,6 +369,11 @@ async function boot() {
   $("#providerModal").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) closeProviders();
   });
+  for (const id of ["movementModal", "historyModal", "compareModal"]) {
+    $(`#${id}`)?.addEventListener?.("click", (event) => {
+      if (event.target === event.currentTarget) hideModal(id);
+    });
+  }
   $("#btnVariations").addEventListener("click", generateVariations);
   $("#btnDesignPrompt").addEventListener("click", describeFromReference);
   $("#btnDesignRef").addEventListener("click", () => $("#designReference").click());
@@ -368,12 +393,22 @@ async function boot() {
     });
   });
   $("#btnClearPreview")?.addEventListener("click", clearCandidatePreview);
+  $("#btnClearPreviewToolbar")?.addEventListener("click", clearCandidatePreview);
+  $("#btnExpandTree")?.addEventListener("click", () => setTreeExpanded(true));
+  $("#btnCollapseTree")?.addEventListener("click", () => setTreeExpanded(false));
+  $("#componentSearch")?.addEventListener("input", (event) => {
+    TREE.query = String(event.target.value || "").trim().toLowerCase();
+    renderComponentTree();
+  });
+  $("#btnSnapshot")?.addEventListener("click", createSnapshot);
+  $("#btnRefreshVersions")?.addEventListener("click", loadVersions);
   $("#btnMovementSearch").addEventListener("click", loadMovementList);
   $("#movementSearch").addEventListener("keydown", (event) => {
     if (event.key === "Enter") { event.preventDefault(); loadMovementList(); }
   });
   $("#movementMaker").addEventListener("change", loadMovementList);
   $("#movementType").addEventListener("change", loadMovementList);
+  $("#movementMaxThickness")?.addEventListener("change", loadMovementList);
   $("#movementUnknown").addEventListener("change", loadMovementList);
   $("#btnAttach").addEventListener("click", () => $("#chatImages").click());
   $("#chatImages").addEventListener("change", attachImages);
@@ -420,8 +455,10 @@ async function boot() {
     });
   }
   document.addEventListener("click", onGlobalClick);
+  document.addEventListener("keydown", onGlobalKeydown);
   setupViewer();
   restorePanels();
+  restoreDock();
   bindViewerBridge();
   try {
     setWorkspace(window.localStorage?.getItem("watchcad.workspace") || "design");
@@ -434,7 +471,10 @@ async function boot() {
   } catch { /* private mode or a non-browser harness */ }
 
   try {
-    const [schema, state] = await Promise.all([api("/api/schema"), api("/api/state")]);
+    const [schema, state, components] = await Promise.all([
+      api("/api/schema"), api("/api/state"),
+      api("/api/components").catch(() => ({ components: [] })),
+    ]);
     SCHEMA = schema;
     STATE = state;
     // /api/state identifies the session that produced this snapshot.  Record it
@@ -443,6 +483,7 @@ async function boot() {
     rememberSession(state.session?.session_id || currentSession());
     appliedRevision = Number(state.revision || 0) || appliedRevision;
     IDEAS = Object.fromEntries((schema.ideas || []).map((item) => [item.id, item.prompt]));
+    setComponents(components);
     renderExamples();
     await initChat();
     renderAll();
@@ -466,6 +507,10 @@ function renderAll() {
   renderOptimisation();
   renderCritic();
   renderMovement();
+  renderComponentTree();
+  renderVerificationDock();
+  renderTimelineDock();
+  renderComparisonDock();
 }
 
 function applyState(state, options = {}) {
@@ -489,6 +534,8 @@ function applyState(state, options = {}) {
   renderOptimisation();
   renderCritic();
   renderMovement();
+  renderComponentTree();
+  renderVerificationDock();
   if (options.scene !== false
       && (checksum !== previous || revision !== previousRevision)) scheduleScene();
   renderSessionChip();
@@ -502,14 +549,35 @@ function applyState(state, options = {}) {
 }
 
 /* ---------------------------------------------------------- workspaces */
+const WORKSPACE_COPY = {
+  design: {
+    label: "Design Studio",
+    hint: "Shape the design; every edit is solved and rebuilt.",
+  },
+  engineering: {
+    label: "Engineering Studio",
+    hint: "Inspect the canonical mesh, constraints and movement fit.",
+  },
+  optimise: {
+    label: "Optimisation Lab",
+    hint: "Compare deterministic candidates; nothing applies without confirmation.",
+  },
+};
+
 function setWorkspace(name) {
   const next = ["design", "engineering", "optimise"].includes(name) ? name : "design";
   if (document.body?.dataset) document.body.dataset.workspace = next;
   $$("#workspaces button").forEach((button) =>
     button.classList.toggle("active", button.dataset.workspace === next));
+  const copy = WORKSPACE_COPY[next];
+  const label = $("#workspaceLabel");
+  const hint = $("#workspaceHint");
+  if (label) label.textContent = copy.label;
+  if (hint) hint.textContent = copy.hint;
   try { window.localStorage?.setItem("watchcad.workspace", next); } catch { /* ignore */ }
   if (next === "design") renderDesignPanel();
-  if (next === "optimise") renderOptimisation();
+  if (next === "optimise") { renderOptimisation(); renderComparisonDock(); }
+  if (next === "engineering") renderVerificationDock();
   ensureViewerSize();
   requestRender();
 }
@@ -857,6 +925,8 @@ function renderOptimisation() {
   renderScatter(result, candidates);
   const selected = candidates.find((item) => item.id === DESIGN.selectedCandidate);
   renderCandidateDetail(selected, result);
+  renderCandidateCompare();
+  renderComparisonDock();
 }
 
 async function runOptimisation() {
@@ -915,8 +985,10 @@ async function previewCandidate(id) {
       return;
     }
     DESIGN.previewId = payload.preview;
-    const button = $("#btnClearPreview");
-    if (button) button.hidden = false;
+    for (const id of ["btnClearPreview", "btnClearPreviewToolbar"]) {
+      const button = $(`#${id}`);
+      if (button) button.hidden = false;
+    }
     viewerEvent("watchcad:model-url", {
       url: `/api/model.glb?preview=${encodeURIComponent(payload.preview)}`,
       session: currentSession(),
@@ -938,8 +1010,10 @@ async function previewCandidate(id) {
 function clearCandidatePreview() {
   DESIGN.previewToken += 1;
   DESIGN.previewId = "";
-  const button = $("#btnClearPreview");
-  if (button) button.hidden = true;
+  for (const id of ["btnClearPreview", "btnClearPreviewToolbar"]) {
+    const button = $(`#${id}`);
+    if (button) button.hidden = true;
+  }
   viewerEvent("watchcad:model-url", { url: "", ...livePreviewMeta() });
 }
 
@@ -986,6 +1060,194 @@ async function applyCandidate(id) {
   } finally {
     setLoading(false);
   }
+}
+
+/* ------------------------------------------------------- studio dialogs */
+function hideModal(id) {
+  const modal = $(`#${id}`);
+  if (modal) modal.hidden = true;
+}
+
+function showModal(id) {
+  const modal = $(`#${id}`);
+  if (modal) modal.hidden = false;
+}
+
+function openMovementModal() {
+  showModal("movementModal");
+  if (!MOVEMENT.catalog) loadMovementCatalog();
+  else renderMovement();
+}
+
+async function openHistoryModal() {
+  showModal("historyModal");
+  await loadVersions();
+}
+
+function openCompareModal() {
+  showModal("compareModal");
+  if (!WORKSPACE.compare.size && DESIGN.optimisation?.winner) {
+    WORKSPACE.compare.add(DESIGN.optimisation.winner);
+  }
+  renderCandidateCompare();
+}
+
+async function loadVersions() {
+  try {
+    const data = await api("/api/agent/history");
+    WORKSPACE.versions = data.history || [];
+    if (STATE?.session?.versions) STATE.session.versions = WORKSPACE.versions;
+    renderVersionList();
+    renderTimelineDock();
+    if (WORKSPACE.historyVersion) await selectVersion(WORKSPACE.historyVersion);
+    return WORKSPACE.versions;
+  } catch (error) {
+    const list = $("#versionList");
+    if (list) list.innerHTML = `<div class="empty-note">History unavailable: ${esc(error.message)}</div>`;
+    return [];
+  }
+}
+
+function renderVersionList() {
+  const holder = $("#versionList");
+  if (!holder) return;
+  if (!WORKSPACE.versions.length) {
+    holder.innerHTML = `<div class="empty-note">No versions yet. Create a snapshot to capture this design.</div>`;
+    return;
+  }
+  holder.innerHTML = WORKSPACE.versions.slice().reverse().map((version) =>
+    `<div class="version-row ${WORKSPACE.historyVersion === version.id ? "selected" : ""}">
+      <span class="version-copy"><b>${esc(version.label || `Version ${version.index ?? ""}`)}</b>
+        <small>${esc(version.kind || "change")} · ${esc(formatVersionTime(version.at))} · ${esc(String(version.checksum || "").slice(0, 12))}</small></span>
+      <span class="version-actions">
+        <button class="btn small" data-version-compare="${esc(version.id)}">Compare</button>
+        <button class="btn small" data-version-restore="${esc(version.id)}">Restore</button>
+      </span>
+    </div>`).join("");
+  renderVersionCompare();
+}
+
+async function selectVersion(id) {
+  WORKSPACE.historyVersion = id;
+  renderVersionList();
+  const holder = $("#versionCompare");
+  if (!holder) return;
+  holder.innerHTML = `<div class="empty-note">Loading version…</div>`;
+  try {
+    const version = await api(`/api/agent/version?id=${encodeURIComponent(id)}`);
+    renderVersionDiff(version);
+  } catch (error) {
+    holder.innerHTML = `<div class="empty-note">Cannot load version: ${esc(error.message)}</div>`;
+  }
+}
+
+function flattenSpec(value, prefix = "", out = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    out[prefix] = value;
+    return out;
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "derived") continue;
+    const path = prefix ? `${prefix}.${key}` : key;
+    if (child && typeof child === "object" && !Array.isArray(child)) flattenSpec(child, path, out);
+    else out[path] = child;
+  }
+  return out;
+}
+
+function renderVersionDiff(version) {
+  const holder = $("#versionCompare");
+  if (!holder) return;
+  const before = flattenSpec(version.spec || {});
+  const after = flattenSpec(STATE?.spec?.data || {});
+  const paths = [...new Set([...Object.keys(before), ...Object.keys(after)])].filter((path) =>
+    JSON.stringify(before[path]) !== JSON.stringify(after[path])).slice(0, 60);
+  const rows = paths.map((path) => `<div class="diff-line">
+      <span>${esc(path)}</span><span class="from">${esc(metric(before[path]))}</span>
+      <span class="to">${esc(metric(after[path]))}</span></div>`).join("")
+    || `<div class="empty-note">This version matches the current writable specification.</div>`;
+  holder.innerHTML = `<div class="design-head"><h3>${esc(version.label || `Version ${version.index}`)}</h3>
+      <span class="provenance">${esc(version.kind || "change")}</span></div>
+    <p class="design-note">Left: saved version · middle: version value · right: current design. Comparing does not change the live specification.</p>
+    ${rows}`;
+}
+
+function armVersionRestore(id) {
+  const version = WORKSPACE.versions.find((item) => item.id === id);
+  if (!version) return;
+  WORKSPACE.restoreId = id;
+  const holder = $("#restoreConfirm");
+  if (!holder) return;
+  holder.hidden = false;
+  holder.innerHTML = `<b>Restore “${esc(version.label || `Version ${version.index}`)}”?</b>
+    This commits the saved design as a new revision and increments the version counter. The current design remains in history.
+    <div class="modal-actions">
+      <button class="btn small primary" data-confirm-restore="${esc(id)}">Confirm restore</button>
+      <button class="btn small ghost" data-cancel-restore="1">Cancel</button>
+    </div>`;
+}
+
+async function createSnapshot() {
+  const label = $("#snapshotLabel")?.value?.trim() || "Manual snapshot";
+  try {
+    const payload = await api("/api/agent/snapshot", { label });
+    applyState(payload, { scene: false });
+    await loadVersions();
+    toast(`snapshot created: ${label}`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function restoreVersion(id) {
+  try {
+    const payload = await api("/api/agent/restore", { id });
+    if (!applyState(payload)) {
+      toast("the design changed while restoring; refresh history and try again", true);
+      return;
+    }
+    WORKSPACE.restoreId = null;
+    const confirm = $("#restoreConfirm");
+    if (confirm) confirm.hidden = true;
+    await loadVersions();
+    toast("version restored as a new revision; Undo is available");
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function renderCandidateCompare() {
+  const holder = $("#candidateCompare");
+  if (!holder) return;
+  const result = DESIGN.optimisation;
+  if (!result) {
+    holder.innerHTML = `<div class="empty-note">Run the optimiser first.</div>`;
+    return;
+  }
+  const candidates = result.candidates || [];
+  const selected = [...WORKSPACE.compare].filter((id) =>
+    id === "baseline" || candidates.some((item) => item.id === id));
+  const chosen = comparisonRows();
+  const axes = result.axes || [];
+  const chooser = [`<label class="movement-check"><input type="checkbox" data-compare-toggle="baseline"
+    ${selected.includes("baseline") ? "checked" : ""}> baseline</label>`,
+  ...candidates.map((item) => `<label class="movement-check"><input type="checkbox"
+    data-compare-toggle="${esc(item.id)}" ${selected.includes(item.id) ? "checked" : ""}> ${esc(item.label || item.id)}</label>`)].join("");
+  const table = chosen.length ? `<table class="compare-table">
+      <thead><tr><th>Design</th>${axes.map((name) =>
+        `<th>${esc(optMeta(name, result).label || name)}</th>`).join("")}<th>Mass</th><th>Cost</th><th>Verdict</th><th>Action</th></tr></thead>
+      <tbody>${chosen.map((row) => `<tr>
+        <td><b>${esc(row.label || "Baseline")}</b></td>
+        ${axes.map((name) => `<td>${metric(row.objective_values?.[name])}</td>`).join("")}
+        <td>${metric(row.metrics?.mass_g)} g</td>
+        <td>$${metric(row.metrics?.estimated_unit_cost_usd)}</td>
+        <td>${row.feasible === false ? "constraint failure" : "constraints pass"}</td>
+        <td>${row.id && row.id !== "baseline"
+          ? `<button class="btn small" data-preview-candidate="${esc(row.id)}">Preview</button>
+             <button class="btn small" data-apply-candidate="${esc(row.id)}">Apply…</button>` : "current design"}</td>
+      </tr>`).join("")}</tbody></table>` : `<div class="empty-note">Select at least one design.</div>`;
+  holder.innerHTML = `<div class="movement-filter-row">${chooser}</div>${table}
+    <p class="design-note">Preview builds a revision-scoped GLB without changing the live design. Applying opens a separate confirmation and a new undoable revision.</p>`;
 }
 
 /* ------------------------------------------------------ movement database */
@@ -1563,6 +1825,38 @@ function renderHeader() {
   const checksum = spec.derived?.checksum || "";
   if (checksum) chips.push(`<span class="chip" title="spec checksum">${esc(checksum.slice(0, 10))}</span>`);
   $("#summaryBar").innerHTML = chips.join("");
+
+  const project = $("#projectName");
+  if (project) project.textContent = name;
+  const saving = appliedRevision > renderedRevision;
+  const save = $("#saveStatus");
+  if (save) {
+    save.textContent = saving ? "syncing geometry" : "saved";
+    save.classList.toggle("dirty", saving);
+  }
+  const header = $("#headerStatus");
+  if (header) {
+    header.textContent = `revision ${appliedRevision || state.revision || 0} · version ${spec.meta?.version ?? 1} · ${checksum.slice(0, 12) || "no checksum"}`;
+  }
+  const undo = $("#btnUndo");
+  const redo = $("#btnRedo");
+  if (undo) undo.disabled = !Boolean(STATE.session?.can_undo);
+  if (redo) redo.disabled = !Boolean(STATE.session?.can_redo);
+  const ai = $("#globalAiStatus");
+  if (ai) {
+    const provider = CHAT.engine || AGENT.engine || "local rules";
+    ai.textContent = provider.length > 22 ? `${provider.slice(0, 21)}…` : provider;
+    ai.classList.toggle("ready", provider !== "local rules");
+    ai.title = provider === "local rules"
+      ? "Local deterministic engine is always available"
+      : provider;
+  }
+  const engineering = $("#engineeringToolStatus");
+  if (engineering) engineering.textContent = s.fail
+    ? `${s.fail} failing check${s.fail === 1 ? "" : "s"} · solver-backed`
+    : "all checks pass · solver-backed";
+  const designStatus = $("#designToolStatus");
+  if (designStatus) designStatus.textContent = `mesh revision ${appliedRevision || state.revision || 0}`;
 }
 
 function renderFacts() {
@@ -3100,6 +3394,203 @@ async function setField(path, value, force = false) {
   }
 }
 
+function setComponents(payload) {
+  TREE.components = Array.isArray(payload?.components) ? payload.components : [];
+  TREE.checkOwners = new Map();
+  for (const component of TREE.components) {
+    for (const check of component.checks || []) TREE.checkOwners.set(check, component);
+  }
+  TREE.error = "";
+  TREE.loading = false;
+  renderComponentTree();
+}
+
+function checksForComponent(component) {
+  const ids = new Set(component?.checks || []);
+  return (STATE?.checks || []).filter((check) => ids.has(check.id));
+}
+
+function componentDomId(id) {
+  return `tree-component-${String(id).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
+function treeMatches(component) {
+  if (!TREE.query) return true;
+  const query = TREE.query;
+  const haystack = [
+    component.id, component.label, component.group, component.description,
+    ...(component.aliases || []), ...(component.parts || []),
+  ].join(" ").toLowerCase();
+  return haystack.includes(query);
+}
+
+function setTreeExpanded(expand) {
+  if (expand) TREE.expanded = new Set(TREE.components.map((component) => component.id));
+  else TREE.expanded = new Set();
+  renderComponentTree();
+}
+
+function setComponentVisibility(component, visible) {
+  const parts = partsForComponent(component);
+  for (const part of parts) {
+    if (visible) V.hiddenParts.delete(part);
+    else V.hiddenParts.add(part);
+  }
+  V.isolateParts = null;
+  emitVisibilityState();
+  renderComponentTree();
+  renderGroupToggles(V.tree);
+  requestRender();
+}
+
+function isolateComponent(component) {
+  const parts = partsForComponent(component);
+  if (V.isolateParts && V.isolateParts.size === parts.length
+    && parts.every((part) => V.isolateParts.has(part))) {
+    V.isolateParts = null;
+  } else {
+    V.isolateParts = new Set(parts);
+  }
+  emitVisibilityState();
+  renderComponentTree();
+  renderGroupToggles(V.tree);
+  requestRender();
+}
+
+function lockLabel(component) {
+  const locks = new Set(STATE?.spec?.locks || []);
+  const fields = component.dimension_fields || [];
+  const locked = fields.filter((path) => locks.has(path)).length;
+  if (!fields.length) return "";
+  return locked ? `${locked}/${fields.length} locked` : "";
+}
+
+function renderComponentTree() {
+  const holder = $("#componentTree");
+  if (!holder) return;
+  if (TREE.loading) {
+    holder.innerHTML = `<div class="empty-note">Loading the component registry…</div>`;
+    return;
+  }
+  if (!TREE.components.length) {
+    holder.innerHTML = `<div class="empty-note">No component registry available.</div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const component of TREE.components) {
+    if (!treeMatches(component)) continue;
+    const group = component.group || "Other";
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group).push(component);
+  }
+  if (!groups.size) {
+    holder.innerHTML = `<div class="empty-note">No components match “${esc(TREE.query)}”.</div>`;
+    return;
+  }
+  let html = "";
+  for (const [group, components] of groups.entries()) {
+    html += `<div class="tree-group"><div class="tree-row group-row">
+      <span class="tree-label">${esc(group)}</span>
+      <span class="tree-count">${components.length}</span>
+    </div>`;
+    for (const component of components) {
+      const selected = V.selectedComponent === component.id || CRITIC.focus?.name === component.id;
+      const parts = partsForComponent(component);
+      const hidden = parts.length && parts.every((part) => V.hiddenParts.has(part));
+      const partlyHidden = parts.length && parts.some((part) => V.hiddenParts.has(part)) && !hidden;
+      const isolated = V.isolateParts && parts.length
+        && parts.every((part) => V.isolateParts.has(part));
+      const checks = checksForComponent(component);
+      const failed = checks.filter((check) => check.passed === false).length;
+      const expanded = TREE.expanded.has(component.id) || Boolean(TREE.query);
+      const state = hidden ? "off" : partlyHidden || (V.isolateParts && !isolated) ? "dim" : "";
+      const lockText = lockLabel(component);
+      const lockFields = component.dimension_fields?.length
+        ? component.dimension_fields : component.fields || [];
+      const lockButton = lockFields.length
+        ? `<button class="tree-action tree-lock ${lockText.startsWith(lockFields.length) ? "active" : ""}" data-tree-lock="${esc(component.id)}" title="${lockText || `Lock ${component.label} dimensions`}" aria-label="${lockText || `Lock ${component.label} dimensions`}">🔒</button>`
+        : "";
+      html += `<div class="tree-row component-row ${selected ? "selected" : ""} ${state}">
+        <button class="tree-toggle" data-tree-expand="${esc(component.id)}" aria-label="${expanded ? "Collapse" : "Expand"} ${esc(component.label)}">${expanded ? "−" : "+"}</button>
+        <button class="tree-action ${hidden ? "" : "active"}" data-tree-visibility="${esc(component.id)}" title="${hidden ? "Show component" : "Hide component"}" aria-label="${hidden ? "Show" : "Hide"} ${esc(component.label)}">●</button>
+        <button class="tree-action ${isolated ? "active" : ""}" data-tree-isolate="${esc(component.id)}" title="Isolate this component" aria-label="Isolate ${esc(component.label)}">◎</button>
+        <button class="tree-label" data-tree-select="${esc(component.id)}" id="${componentDomId(component.id)}">${esc(component.label)}</button>
+        ${failed ? `<span class="tree-count" title="${failed} failing check(s)">${failed}!</span>` : ""}
+        ${lockButton}
+      </div>`;
+      if (expanded) {
+        for (const part of parts) {
+          const partHidden = V.hiddenParts.has(part);
+          const partIsolated = V.isolateParts && V.isolateParts.has(part);
+          html += `<div class="tree-row part-row ${partHidden ? "off" : (V.isolateParts && !partIsolated ? "dim" : "")}">
+            <span class="tree-toggle" aria-hidden="true">•</span>
+            <button class="tree-action ${partHidden ? "" : "active"}" data-tree-part-visibility="${esc(part)}" title="${partHidden ? "Show part" : "Hide part"}">●</button>
+            <button class="tree-label" data-tree-part="${esc(part)}" title="Select ${esc(part)}">${esc(part)}</button>
+          </div>`;
+        }
+      }
+    }
+    html += `</div>`;
+  }
+  holder.innerHTML = html;
+  const status = $("#componentTreeStatus");
+  if (status) {
+    if (TREE.query) status.textContent = `${groups.size} group(s) match “${TREE.query}”.`;
+    else status.textContent = "Select a component to focus the assistant and highlight its parts.";
+  }
+}
+
+function selectComponent(id) {
+  const component = componentById(id);
+  if (!component) return;
+  TREE.selected = id;
+  const parts = partsForComponent(component);
+  for (const part of parts) V.hiddenParts.delete(part);
+  emitVisibilityState();
+  setComponentFocus({ id: component.id, name: component.label, component: component.id });
+  renderComponentTree();
+  requestRender();
+}
+
+function selectPartByName(name) {
+  const index = (V.mesh?.ranges || []).findIndex((range) => range.name === name);
+  const range = index >= 0 ? V.mesh.ranges[index] : null;
+  if (range && !isRangeVisible(range)) return;
+  if (index >= 0) {
+    V.selected = index;
+    V.hover = index;
+    updatePartHud();
+    updateViewerCursor();
+    viewerEvent("watchcad:select-part", {
+      name: range.name, role: range.role, group: range.group,
+    });
+  } else {
+    setComponentFocus({ name });
+  }
+  requestRender(false);
+}
+
+async function toggleComponentLock(id) {
+  const component = componentById(id);
+  const fields = component?.dimension_fields?.length
+    ? component.dimension_fields : component?.fields || [];
+  if (!component || !fields.length) {
+    toast("this component has no writable dimension to lock", true);
+    return;
+  }
+  const locks = new Set(STATE?.spec?.locks || []);
+  const target = !fields.every((path) => locks.has(path));
+  try {
+    for (const path of fields) {
+      const state = await api("/api/lock", { path, locked: target });
+      applyState(state, { scene: false });
+    }
+    toast(`${component.label}: ${target ? "locked" : "unlocked"} ${fields.length} field(s)`);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function syncFormValues() {
   if (!STATE) return;
   const spec = STATE.spec.data;
@@ -3196,11 +3687,131 @@ async function applyFix(index) {
   await setField(check.fix.path, check.fix.value);
 }
 
+/* ------------------------------------------------------------ bottom dock */
+function verdictParts(check) {
+  if (check.passed === false) return { label: "FAIL", tone: "fail", confidence: "failed" };
+  if (check.verdict === "estimated") return { label: "PASS", tone: "warning", confidence: "estimated" };
+  if (check.verdict === "needs_test") return { label: "NEEDS TEST", tone: "warning", confidence: "needs test" };
+  return { label: "PASS", tone: "pass", confidence: check.verdict || "calculated" };
+}
+
+function renderVerificationDock() {
+  const holder = $("#verificationDock");
+  if (!holder || !STATE) return;
+  const checks = STATE.checks || [];
+  const summary = STATE.summary || {};
+  const failing = checks.filter((check) => check.passed === false);
+  const chips = `<span class="chip ${failing.length ? "bad" : "good"}"><b>${failing.length}</b> failing</span>
+    <span class="chip warn"><b>${summary.needs_test || 0}</b> need bench test</span>
+    <span class="chip info"><b>${summary.estimated || 0}</b> estimated</span>`;
+  const rows = checks.map((check, index) => {
+    const verdict = verdictParts(check);
+    const owner = TREE.checkOwners.get(check.id)?.label || check.layer || "Whole design";
+    const action = check.fix?.path
+      ? `<button class="btn small" data-fix="${index}">Apply corrective action</button>`
+      : check.fix?.message
+        ? `<button class="btn small" data-message="${index}">Show guidance</button>`
+        : "No automatic correction";
+    return `<article class="verification-row ${verdict.tone}">
+      <div class="verification-head"><b>${esc(check.title || check.id)}</b>
+        <span class="verdict-label ${verdict.tone}">${esc(verdict.label)}</span></div>
+      <div class="verification-fields">
+        <span>Confidence</span><b>${esc(verdict.confidence)}</b>
+        <span>Component</span><b>${esc(owner)}</b>
+        <span>Reported</span><b>${esc(check.detail || "—")}</b>
+        <span>Constraint</span><b>${esc(check.fix?.message || "No automatic fix; see the calculation basis")}</b>
+        <span>Basis</span><b>${esc(check.layer || "spec")} · ${esc(check.id)} · ${esc(check.verdict || "calculated")}</b>
+        <span>Corrective action</span><b>${action}</b>
+      </div>
+    </article>`;
+  }).join("");
+  holder.innerHTML = `<div class="dock-summary">${chips}</div>
+    <div class="verification-grid">${rows || `<div class="empty-note">No verification checks are available.</div>`}</div>`;
+}
+
+function formatVersionTime(stamp) {
+  const value = Number(stamp);
+  if (!Number.isFinite(value) || !value) return "—";
+  try { return new Date(value * 1000).toLocaleString(); } catch { return String(value); }
+}
+
+function renderTimelineDock() {
+  const holder = $("#timelineDock");
+  if (!holder) return;
+  const versions = (STATE?.session?.versions || WORKSPACE.versions || []).slice(-8).reverse();
+  holder.innerHTML = versions.length
+    ? versions.map((version) => `<div class="dock-row">
+        <span><b>${esc(version.label || `Version ${version.index ?? ""}`)}</b>
+          <small>${esc(version.kind || "change")} · ${esc(formatVersionTime(version.at))} · ${esc(String(version.checksum || "").slice(0, 10))}</small></span>
+        <span class="dock-actions"><button class="btn small" data-tool="history">Review</button></span>
+      </div>`).join("")
+    : `<div class="empty-note">No saved versions yet. Create a snapshot from History.</div>`;
+}
+
+function comparisonRows() {
+  const result = DESIGN.optimisation;
+  if (!result) return [];
+  const ids = [...WORKSPACE.compare];
+  if (!ids.length && result.winner) ids.push(result.winner);
+  if (!ids.length) ids.push("baseline");
+  return ids.map((id) => id === "baseline"
+    ? result.baseline : (result.candidates || []).find((item) => item.id === id)).filter(Boolean);
+}
+
+function renderComparisonDock() {
+  const holder = $("#comparisonDock");
+  if (!holder) return;
+  const result = DESIGN.optimisation;
+  if (!result) {
+    holder.innerHTML = `<div class="empty-note">Run the optimiser to compare real solved candidates against the baseline.</div>`;
+    return;
+  }
+  const axes = result.axes || [];
+  const rows = comparisonRows();
+  const body = rows.map((row) => `<tr>
+      <td><b>${esc(row.label || "Baseline")}</b></td>
+      ${axes.map((name) => `<td>${metric(row.objective_values?.[name])}</td>`).join("")}
+      <td>${metric(row.metrics?.mass_g)} g</td>
+      <td>${metric(row.verification?.fail ?? row.failing_checks, 0)}</td>
+      <td>${row.feasible === false ? "constraint failure" : "constraints pass"}</td>
+    </tr>`).join("");
+  holder.innerHTML = `<table class="compare-table">
+      <thead><tr><th>Design</th>${axes.map((name) =>
+        `<th>${esc(optMeta(name, result).label || name)}</th>`).join("")}<th>Mass</th><th>Fails</th><th>Status</th></tr></thead>
+      <tbody>${body}</tbody>
+    </table>
+    <div class="dock-row"><span>Preview and apply actions remain explicit.</span>
+      <span class="dock-actions"><button class="btn small" data-tool="compare-candidates">Compare candidates</button></span></div>`;
+}
+
+function setDock(name, collapsed = WORKSPACE.dockCollapsed) {
+  if (["verification", "timeline", "comparison"].includes(name)) WORKSPACE.dock = name;
+  WORKSPACE.dockCollapsed = Boolean(collapsed);
+  const dock = $("#bottomDock");
+  if (dock) dock.classList.toggle("collapsed", WORKSPACE.dockCollapsed);
+  $$("#dockTabs button").forEach((button) =>
+    button.classList.toggle("active", button.dataset.dock === WORKSPACE.dock));
+  for (const [key, id] of [["verification", "verificationDock"],
+    ["timeline", "timelineDock"], ["comparison", "comparisonDock"]]) {
+    const panel = $(`#${id}`);
+    if (panel) panel.classList.toggle("active", key === WORKSPACE.dock);
+  }
+  try { window.localStorage?.setItem("watchcad.dock", WORKSPACE.dock); } catch { /* ignore */ }
+  if (WORKSPACE.dockCollapsed) ensureViewerSize();
+  requestRender();
+}
+
+function restoreDock() {
+  let saved = "";
+  try { saved = window.localStorage?.getItem("watchcad.dock") || ""; } catch { /* ignore */ }
+  setDock(saved || "verification", false);
+}
+
 /* --------------------------------------------------------------- critic */
 function componentLabel(value) {
   if (!value) return "Whole design";
   if (typeof value === "string") return value;
-  return value.label || value.component || value.name || value.id || "Selected component";
+  return value.label || value.name || value.component || value.id || "Selected component";
 }
 
 function componentSelection(value) {
@@ -3219,9 +3830,43 @@ function componentQuery(detail) {
   return detail.name || detail.component || detail.id || "";
 }
 
+function componentById(id) {
+  return TREE.components.find((component) => component.id === id) || null;
+}
+
+function componentForDetail(detail) {
+  if (!detail) return null;
+  const id = detail.id || detail.component;
+  if (id) {
+    const exact = componentById(id);
+    if (exact) return exact;
+  }
+  const name = String(detail.name || detail.part || "").toLowerCase();
+  if (!name) return null;
+  return TREE.components.find((component) =>
+    (component.parts || []).some((part) => String(part).toLowerCase() === name)
+    || (component.aliases || []).some((alias) => String(alias).toLowerCase() === name)) || null;
+}
+
+function partsForComponent(component) {
+  const names = new Set(Object.values(V.tree || {}).flat());
+  const parts = Array.isArray(component?.parts) ? component.parts.slice() : [];
+  return names.size ? parts.filter((name) => names.has(name)) : parts;
+}
+
+function setPartHighlight(names) {
+  V.highlightParts = new Set(names || []);
+  emitVisibilityState();
+  requestRender();
+}
+
 async function setComponentFocus(detail) {
   CRITIC.focus = componentSelection(detail);
+  const component = componentForDetail(detail);
+  V.selectedComponent = component ? component.id : null;
+  setPartHighlight(component ? partsForComponent(component) : []);
   renderFocusChip();
+  renderComponentTree();
   if (!CRITIC.focus) {
     CRITIC.context = null;
     CRITIC.report = null;
@@ -3255,12 +3900,19 @@ async function refreshCritic() {
 
 function renderFocusChip() {
   const chip = $("#focusChip");
-  if (!chip) return;
+  const assistant = $("#assistantFocus");
   const focus = CRITIC.focus;
-  if (!focus) { chip.hidden = true; return; }
-  const name = $("#focusName");
-  if (name) name.textContent = componentLabel(focus);
-  chip.hidden = false;
+  const label = componentLabel(focus);
+  if (chip) {
+    chip.hidden = !focus;
+    const name = $("#focusName");
+    if (name) name.textContent = label;
+  }
+  if (assistant) {
+    assistant.hidden = !focus;
+    const name = $("#assistantFocusName");
+    if (name) name.textContent = label;
+  }
 }
 
 function renderCritic() {
@@ -3574,11 +4226,154 @@ function restorePanels() {
   setPanelClosed("right", panelPreference("right") === "closed");
 }
 
+function onGlobalKeydown(event) {
+  if (!event || event.defaultPrevented) return;
+  const editable = typeof event.target?.closest === "function"
+    ? event.target.closest("input, textarea, select, [contenteditable='true']") : null;
+  const key = String(event.key || "");
+  const mod = Boolean(event.ctrlKey || event.metaKey);
+
+  if (key === "Escape") {
+    for (const id of ["movementModal", "historyModal", "compareModal"]) {
+      if ($(`#${id}`)?.hidden === false) {
+        hideModal(id);
+        event.preventDefault();
+        return;
+      }
+    }
+    if (CHAT.settingsOpen) { toggleSettings(); event.preventDefault(); return; }
+    if ($("#chatSidebar")?.hidden === false) { toggleChatHistory(); event.preventDefault(); return; }
+    if (CRITIC.focus || V.selected !== null) {
+      clearPartSelection();
+      event.preventDefault();
+    }
+    return;
+  }
+  if (editable) return;
+
+  if (mod && key.toLowerCase() === "z") {
+    event.preventDefault();
+    if (event.shiftKey) redoTurn(); else undoTurn();
+    return;
+  }
+  if (mod && key.toLowerCase() === "y") {
+    event.preventDefault();
+    redoTurn();
+    return;
+  }
+  if (mod || event.altKey) return;
+
+  if (key === "/") {
+    event.preventDefault();
+    const search = $("#componentSearch");
+    setPanelClosed("left", false);
+    search?.focus?.();
+    return;
+  }
+  if (key === "1" || key === "2" || key === "3") {
+    event.preventDefault();
+    setWorkspace(["design", "engineering", "optimise"][Number(key) - 1]);
+    return;
+  }
+  if (key.toLowerCase() === "h") {
+    event.preventDefault();
+    openHistoryModal();
+    return;
+  }
+  if (key === "+" || key === "=") {
+    event.preventDefault();
+    zoomBy(0.8);
+    return;
+  }
+  if (key === "-" || key === "_") {
+    event.preventDefault();
+    zoomBy(1.25);
+  }
+}
+
 function onGlobalClick(event) {
+  if (!event?.target?.closest) return;
   // Scope this to buttons: <body> carries data-workspace, so a bare
   // [data-workspace] match would hijack every click in the document.
   const workspace = event.target.closest("button[data-workspace]");
   if (workspace) { setWorkspace(workspace.dataset.workspace); return; }
+
+  const tool = event.target.closest("[data-tool]");
+  if (tool) {
+    const action = tool.dataset.tool;
+    if (action === "history") openHistoryModal();
+    else if (action === "movement-dialog") openMovementModal();
+    else if (action === "compare-candidates") openCompareModal();
+    else if (action === "optimise") runOptimisation();
+    else if (action === "clear-preview") clearCandidatePreview();
+    else if (action === "variations") generateVariations();
+    else if (action === "add-reference") $("#designReference")?.click?.();
+    return;
+  }
+  if (event.target.closest("[data-close-movement]")) { hideModal("movementModal"); return; }
+  if (event.target.closest("[data-close-history]")) { hideModal("historyModal"); return; }
+  if (event.target.closest("[data-close-compare]")) { hideModal("compareModal"); return; }
+  const dockTab = event.target.closest("[data-dock]");
+  if (dockTab) { setDock(dockTab.dataset.dock); return; }
+  if (event.target.closest("[data-dock-toggle]")) {
+    setDock(WORKSPACE.dock, !WORKSPACE.dockCollapsed);
+    return;
+  }
+
+  const treeExpand = event.target.closest("[data-tree-expand]");
+  if (treeExpand) {
+    const id = treeExpand.dataset.treeExpand;
+    if (TREE.expanded.has(id)) TREE.expanded.delete(id); else TREE.expanded.add(id);
+    renderComponentTree();
+    return;
+  }
+  const treeSelect = event.target.closest("[data-tree-select]");
+  if (treeSelect) { selectComponent(treeSelect.dataset.treeSelect); return; }
+  const treePart = event.target.closest("[data-tree-part]");
+  if (treePart) { selectPartByName(treePart.dataset.treePart); return; }
+  const treeVisibility = event.target.closest("[data-tree-visibility]");
+  if (treeVisibility) {
+    const component = componentById(treeVisibility.dataset.treeVisibility);
+    const parts = partsForComponent(component);
+    const hidden = parts.length && parts.every((part) => V.hiddenParts.has(part));
+    setComponentVisibility(component, hidden);
+    return;
+  }
+  const treePartVisibility = event.target.closest("[data-tree-part-visibility]");
+  if (treePartVisibility) {
+    const part = treePartVisibility.dataset.treePartVisibility;
+    if (V.hiddenParts.has(part)) V.hiddenParts.delete(part); else V.hiddenParts.add(part);
+    emitVisibilityState();
+    renderComponentTree();
+    requestRender();
+    return;
+  }
+  const treeIsolate = event.target.closest("[data-tree-isolate]");
+  if (treeIsolate) { isolateComponent(componentById(treeIsolate.dataset.treeIsolate)); return; }
+  const treeLock = event.target.closest("[data-tree-lock]");
+  if (treeLock) { toggleComponentLock(treeLock.dataset.treeLock); return; }
+
+  const versionCompare = event.target.closest("[data-version-compare]");
+  if (versionCompare) { selectVersion(versionCompare.dataset.versionCompare); return; }
+  const versionRestore = event.target.closest("[data-version-restore]");
+  if (versionRestore) { armVersionRestore(versionRestore.dataset.versionRestore); return; }
+  const confirmRestore = event.target.closest("[data-confirm-restore]");
+  if (confirmRestore) { restoreVersion(confirmRestore.dataset.confirmRestore); return; }
+  if (event.target.closest("[data-cancel-restore]")) {
+    WORKSPACE.restoreId = null;
+    const confirm = $("#restoreConfirm");
+    if (confirm) confirm.hidden = true;
+    return;
+  }
+  const compareToggle = event.target.closest("[data-compare-toggle]");
+  if (compareToggle) {
+    const id = compareToggle.dataset.compareToggle;
+    if (WORKSPACE.compare.has(id)) WORKSPACE.compare.delete(id); else WORKSPACE.compare.add(id);
+    renderCandidateCompare();
+    renderComparisonDock();
+    return;
+  }
+
   const dialSwatch = event.target.closest("[data-dial-color]");
   if (dialSwatch) { setField("dial.color", dialSwatch.dataset.dialColor); return; }
   const confirmCandidate = event.target.closest("[data-confirm-candidate]");
@@ -3715,10 +4510,7 @@ function onGlobalClick(event) {
     renderGroupToggles(V.tree);
     keepSelectionVisible();
     updateLayerInfo();
-    viewerEvent("watchcad:visibility", {
-      hidden: [...V.hidden],
-      isolate: V.isolate ? [...V.isolate] : null,
-    });
+    emitVisibilityState();
     requestRender();
   }
 }
@@ -3743,6 +4535,16 @@ function viewerEvent(name, detail) {
       window.dispatchEvent(new CustomEvent(name, { detail }));
     }
   } catch { /* non-browser harness */ }
+}
+
+function emitVisibilityState() {
+  viewerEvent("watchcad:visibility", {
+    hidden: [...V.hidden],
+    isolate: V.isolate ? [...V.isolate] : null,
+    parts_hidden: [...V.hiddenParts],
+    parts_isolate: V.isolateParts ? [...V.isolateParts] : null,
+    highlight: [...V.highlightParts],
+  });
 }
 
 function bindViewerBridge() {
@@ -3779,11 +4581,9 @@ function bindViewerBridge() {
     renderedRevision = Number(event.detail?.revision || 0) || renderedRevision;
     // A rebuilt GLB resets the module's local explode/visibility state, so
     // replay the app's authoritative viewer state.
-    viewerEvent("watchcad:visibility", {
-      hidden: [...V.hidden],
-      isolate: V.isolate ? [...V.isolate] : null,
-    });
+    emitVisibilityState();
     viewerEvent("watchcad:explode", { value: V.explode });
+    renderHeader();
   });
   window.addEventListener("watchcad:viewer-stale", (event) => {
     const detail = event.detail || {};
@@ -3808,9 +4608,13 @@ const V = {
   explode: 0,
   layerGap: 2,
   isolate: null,
+  isolateParts: null,
   tree: {},
   ready: false,
   hidden: new Set(),
+  hiddenParts: new Set(),
+  highlightParts: new Set(),
+  selectedComponent: null,
   selected: null,
   hover: null,
   hoverTimer: 0,
@@ -3945,6 +4749,13 @@ function isVisible(group) {
   return !V.isolate || V.isolate.has(group);
 }
 
+function isRangeVisible(range) {
+  if (!range || !isVisible(range.group)) return false;
+  if (V.hiddenParts.has(range.name)) return false;
+  if (V.isolateParts && !V.isolateParts.has(range.name)) return false;
+  return true;
+}
+
 function visibleBounds() {
   const mesh = V.mesh;
   if (!mesh) return null;
@@ -3952,7 +4763,7 @@ function visibleBounds() {
   const max = [-Infinity, -Infinity, -Infinity];
   let any = false;
   for (const range of mesh.ranges) {
-    if (!isVisible(range.group) || !range.box) continue;
+    if (!isRangeVisible(range) || !range.box) continue;
     const box = range.box;
     const shift = (mesh.bandZ[range.band] - mesh.midBand) * V.explode * mesh.layerGap;
     min[0] = Math.min(min[0], box[0]); max[0] = Math.max(max[0], box[1]);
@@ -3995,7 +4806,7 @@ function updateLayerInfo() {
   const bands = new Set();
   let parts = 0;
   for (const range of mesh.ranges) {
-    if (!isVisible(range.group)) continue;
+    if (!isRangeVisible(range)) continue;
     bands.add(range.band);
     parts += 1;
   }
@@ -4159,6 +4970,7 @@ function prepareMesh(payload) {
   const colors = new Array(triangles);
   const hoverColors = new Array(triangles);
   const selectedColors = new Array(triangles);
+  const highlightColors = new Array(triangles);
   const alphas = new Float32Array(triangles);
   const centroids = new Float32Array(triangles * 3);
   const normals = new Float32Array(triangles * 3);
@@ -4195,6 +5007,7 @@ function prepareMesh(payload) {
       });
       colors[t] = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
       hoverColors[t] = tintRgb(rgb, [232, 184, 94], 0.22);
+      highlightColors[t] = tintRgb(rgb, [185, 210, 240], 0.30);
       selectedColors[t] = tintRgb(rgb, [240, 192, 106], 0.46);
       alphas[t] = 1;
     }
@@ -4203,7 +5016,7 @@ function prepareMesh(payload) {
   const bandCount = Math.max(1, bands.length);
   const layerGap = Math.min(6, Math.max(0.8, (V.radius * 1.8) / Math.max(1, bandCount - 1)));
   V.mesh = {
-    pos, tris, triangles, ranges, colors, hoverColors, selectedColors, alphas,
+    pos, tris, triangles, ranges, colors, hoverColors, selectedColors, highlightColors, alphas,
     centroids, normals, depths,
     vertBand: new Uint16Array(vertBandList), triBand: new Uint16Array(triBandList),
     triRange: new Uint16Array(triRangeList),
@@ -4278,10 +5091,7 @@ function setView(name) {
   keepSelectionVisible();
   updateLayerInfo();
   viewerEvent("watchcad:view", { name });
-  viewerEvent("watchcad:visibility", {
-    hidden: [...V.hidden],
-    isolate: V.isolate ? [...V.isolate] : null,
-  });
+  emitVisibilityState();
   viewerEvent("watchcad:explode", { value: V.explode });
   requestRender();
 }
@@ -4349,7 +5159,7 @@ function render3d() {
   const tris = mesh.tris;
   const normal = mesh.normals;
   for (const range of mesh.ranges) {
-    if (!isVisible(range.group)) continue;
+    if (!isRangeVisible(range)) continue;
     const shift = bandShift[range.band];
     for (let t = range.start; t < range.start + range.count; t += 1) {
       // backface cull: outward normal must point toward the camera
@@ -4382,7 +5192,12 @@ function render3d() {
     const part = mesh.triRange[t];
     const selected = V.selected !== null && part === V.selected;
     const hovered = !selected && V.hover !== null && part === V.hover;
-    const color = selected ? mesh.selectedColors[t] : hovered ? mesh.hoverColors[t] : mesh.colors[t];
+    const range = mesh.ranges[part];
+    const highlighted = !selected && !hovered && range
+      && V.highlightParts.has(range.name);
+    const color = selected ? mesh.selectedColors[t]
+      : hovered ? mesh.hoverColors[t]
+        : highlighted ? mesh.highlightColors[t] : mesh.colors[t];
     ctx.fillStyle = color;
     ctx.fill();
     if (selected) {
@@ -4432,7 +5247,7 @@ function pickAt(clientX, clientY) {
   let bestDepth = Infinity;
 
   for (const range of mesh.ranges) {
-    if (!isVisible(range.group)) continue;
+    if (!isRangeVisible(range)) continue;
     const shift = projection.bandShift[range.band];
     for (let t = range.start; t < range.start + range.count; t += 1) {
       const i0 = tris[t * 3], i1 = tris[t * 3 + 1], i2 = tris[t * 3 + 2];
@@ -4497,7 +5312,7 @@ function clearPartSelection() {
 function keepSelectionVisible() {
   if (V.selected === null) return;
   const range = V.mesh?.ranges?.[V.selected];
-  if (range && isVisible(range.group)) return;
+  if (range && isRangeVisible(range)) return;
   V.selected = null;
   updatePartHud();
   updateViewerCursor();

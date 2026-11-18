@@ -3,213 +3,259 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>watchcad — AI watch design studio</title>
+  <title>WatchCAD — AI watch design, engineering and optimisation studio</title>
   <link rel="stylesheet" href="/style.css">
 </head>
 <body data-workspace="design">
   <header class="topbar">
     <div class="brand">
-      <div class="mark">W</div>
-      <div>
+      <div class="mark" aria-hidden="true">W</div>
+      <div class="brand-copy">
         <h1>WATCHCAD</h1>
-        <p>AI watch design studio</p>
+        <p>design · engineering · optimisation</p>
       </div>
     </div>
+
+    <div class="project-block" aria-live="polite">
+      <span class="eyebrow">Current design</span>
+      <div class="project-line">
+        <b id="projectName">Untitled</b>
+        <span id="saveStatus" class="save-state">saved</span>
+      </div>
+      <span id="headerStatus" class="header-status">connecting…</span>
+    </div>
+
     <nav class="workspaces" id="workspaces" aria-label="Workspaces">
-      <button data-workspace="design" class="active">Design Studio</button>
-      <button data-workspace="engineering">Engineering Studio</button>
-      <button data-workspace="optimise">Optimisation Lab</button>
+      <button data-workspace="design" class="active" title="Design Studio (1)">Design Studio</button>
+      <button data-workspace="engineering" title="Engineering Studio (2)">Engineering Studio</button>
+      <button data-workspace="optimise" title="Optimisation Lab (3)">Optimisation Lab</button>
     </nav>
+
     <div id="summaryBar" class="summary"></div>
+
     <div class="top-actions">
-      <button id="btnProviders" class="btn ghost" title="Bring your own AI provider key">AI provider</button>
-      <button id="btnSave" class="btn ghost" title="download the spec JSON">Save spec</button>
-      <button id="btnLoad" class="btn ghost" title="load a spec JSON">Load</button>
+      <button id="btnUndo" class="btn ghost icon-action" title="Undo the last committed design change (Ctrl+Z)" disabled>Undo</button>
+      <button id="btnRedo" class="btn ghost icon-action" title="Redo a restored design change (Ctrl+Shift+Z)" disabled>Redo</button>
+      <button id="btnHistory" class="btn ghost icon-action" title="Versions, snapshots and restore (H)">History</button>
+      <span class="top-divider" aria-hidden="true"></span>
+      <button id="btnProviders" class="btn ghost" title="Bring your own AI provider key">AI status</button>
+      <span id="globalAiStatus" class="ai-status" title="Local deterministic engine is always available">local rules</span>
+      <button id="btnSettings" class="btn ghost icon-action" title="Model and research settings">Settings</button>
+      <span class="top-divider" aria-hidden="true"></span>
+      <button id="btnSave" class="btn ghost" title="Download the spec JSON">Save</button>
+      <button id="btnLoad" class="btn ghost" title="Load a spec JSON">Load</button>
       <input id="fileLoad" type="file" accept="application/json,.json" hidden>
-      <button id="btnNew" class="btn ghost" title="start from the default spec">New</button>
+      <button id="btnNew" class="btn ghost" title="Start from the default spec">New</button>
       <button id="btnBuildTop" class="btn primary">Build package</button>
     </div>
   </header>
 
+  <div class="context-toolbar" id="contextToolbar" aria-label="Workspace tools">
+    <div class="context-context">
+      <span class="eyebrow" id="workspaceLabel">Design Studio</span>
+      <span id="workspaceHint">Shape the design; every edit is solved and rebuilt.</span>
+    </div>
+
+    <div class="context-actions" data-context="design">
+      <button class="btn small" data-tool="add-reference" title="Attach a reference image">Reference</button>
+      <button class="btn small" data-tool="variations" title="Generate deterministic design alternatives">Alternatives</button>
+      <button class="btn small" data-workspace="engineering" title="Open the verification workspace">Open CAD tools</button>
+      <span class="context-status" id="designToolStatus">Geometry from /api/model.glb</span>
+    </div>
+
+    <div class="context-actions" data-context="engineering">
+      <button class="btn small" data-view="three" title="Three-quarter view">3/4</button>
+      <button class="btn small" data-view="dial" title="Dial view">Dial</button>
+      <button class="btn small" data-view="crown" title="Crown view">Crown</button>
+      <button class="btn small" data-view="gears" title="Movement view">Gears</button>
+      <button class="btn small" data-view="layers" title="Exploded layer view">Layers</button>
+      <button class="btn small" data-view="reset" title="Fit the visible parts">Fit</button>
+      <span class="context-separator" aria-hidden="true"></span>
+      <button class="btn small" data-tool="movement-dialog" title="Search the manufacturer movement catalogue">Movement catalogue</button>
+      <span class="context-status" id="engineeringToolStatus">Verification is solver-backed</span>
+    </div>
+
+    <div class="context-actions" data-context="optimise">
+      <button class="btn small primary" data-tool="optimise" title="Run the deterministic optimiser">Run optimisation</button>
+      <button class="btn small" data-tool="compare-candidates" title="Compare multiple candidates side by side">Compare candidates</button>
+      <button class="btn small" data-tool="clear-preview" title="Return to the current design" hidden id="btnClearPreviewToolbar">Return to design</button>
+      <span class="context-status" id="optimiseToolStatus">Not run yet</span>
+    </div>
+  </div>
+
   <main class="layout" id="layout">
-    <aside class="left" id="leftPanel">
+    <aside class="left" id="leftPanel" aria-label="Design and engineering controls">
       <div class="sidebar-inner">
-      <section class="panel design-panel" id="designPanel">
-        <div class="design-head">
-          <h2>Design Studio</h2>
-          <span class="design-verified" title="Every change goes through the solver and verifier">solver-backed</span>
-        </div>
-        <p class="design-intro">Shape the watch visually. Every control writes the shared specification, then the deterministic solver rebuilds the mesh.</p>
-        <div class="design-grid">
-          <label>Case material <select id="designCaseMaterial" data-design-path="case.material"></select></label>
-          <label>Case finish <select id="designCaseFinish" data-design-path="case.finish"></select></label>
-          <label>Dial finish <select id="designDialFinish" data-design-path="dial.finish"></select></label>
-          <label>Crystal <select id="designCrystal" data-design-path="case.crystal"></select></label>
-          <label>Hands <select id="designHands" data-design-path="hands.material"></select></label>
-          <label>Indices <select id="designIndices" data-design-path="dial.index_style"></select></label>
-        </div>
-        <div class="design-color">
-          <span>Dial colour</span>
-          <div id="designSwatches" class="swatches"></div>
-          <label class="custom-color" title="Pick any dial colour">
-            <input id="designDialColor" type="color" value="#101418">
-            <span>custom</span>
-          </label>
-        </div>
-        <div class="design-section-head">
-          <span>Reference images</span>
-          <button id="btnDesignRef" class="btn small ghost">Add</button>
-          <input id="designReference" type="file" accept="image/*" multiple hidden>
-        </div>
-        <div id="designRefStrip" class="design-ref-strip" hidden></div>
-        <div class="design-actions">
-          <button id="btnDesignPrompt" class="btn small" title="Write a prompt that uses the attached reference images">Describe a match</button>
-          <button id="btnVariations" class="btn small primary">Generate alternatives</button>
-          <button class="btn small ghost" data-workspace="engineering">Open CAD tools</button>
-        </div>
-        <div id="designVariations" class="design-variations"></div>
-        <p class="design-note">Rendered from <code>/api/model.glb</code> · mass, checks and tolerances are calculated, not generated.</p>
-      </section>
-
-      <section class="panel optimise-panel" id="optimisePanel">
-        <div class="design-head">
-          <h2>Optimisation Lab</h2>
-          <span class="design-verified" title="Candidates are solved and verified, not predicted by a model">deterministic</span>
-        </div>
-        <p class="design-intro">Compare real, deterministic specification changes on a Pareto frontier. Each candidate is solved, meshed and verified. Hard constraints are reported separately from objectives; the finite probe field makes no global-optimality claim.</p>
-        <div class="design-grid">
-          <label>Objective
-            <select id="optimiseObjective">
-              <option value="weight">Minimum weight</option>
-              <option value="cost">Minimum estimated unit cost</option>
-              <option value="manufacturability">Manufacturability</option>
-              <option value="tolerance">Maximum stack margin</option>
-              <option value="assembly">Assembly simplicity</option>
-            </select>
-          </label>
-          <label>Candidate budget
-            <select id="optimiseBudget">
-              <option value="6">6 candidates</option>
-              <option value="9" selected>9 candidates</option>
-              <option value="12">12 candidates</option>
-            </select>
-          </label>
-          <label>Scatter X axis
-            <select id="optimiseAxisX"></select>
-          </label>
-          <label>Scatter Y axis
-            <select id="optimiseAxisY"></select>
-          </label>
-        </div>
-        <div class="design-actions">
-          <button id="btnOptimise" class="btn small primary">Run optimisation</button>
-          <button id="btnClearPreview" class="btn small" hidden>Return to current design</button>
-        </div>
-        <div id="optimiseStatus" class="optimise-status">Not run yet. The current design is the baseline.</div>
-        <div class="optimise-viz">
-          <svg id="optimiseScatter" viewBox="0 0 360 250" role="img"
-               aria-label="Pareto frontier scatter plot"></svg>
-          <div id="optimiseLegend" class="optimise-legend"></div>
-        </div>
-        <div id="candidateList" class="candidate-list"></div>
-        <div id="candidateDetail" class="candidate-detail"></div>
-        <p class="design-note">Labels: <b>calculated</b> from geometry and the BOM; <b>estimated</b> where a cost or process assumption is involved. Nothing here is physically measured. The winner is a recommendation from a finite probe set, not a proven optimum.</p>
-      </section>
-
-      <div id="engineeringPanel" class="workspace-panel">
-      <section class="panel">
-        <h2>Model</h2>
-        <dl id="facts" class="facts"></dl>
-        <div id="why" class="why"></div>
-        <div class="view-actions">
-          <button class="btn small" data-view="three">3/4 view</button>
-          <button class="btn small" data-view="dial">Dial</button>
-          <button class="btn small" data-view="crown">Crown</button>
-          <button class="btn small" data-view="gears">Gears</button>
-          <button class="btn small" data-view="layers">Layers</button>
-          <button class="btn small" data-view="reset">Fit</button>
-        </div>
-        <div class="view-actions render-presets">
-          <label>Render
-            <select id="renderQuality" title="Geometry detail and texture budget">
-              <option value="low">Low · integrated GPU</option>
-              <option value="medium">Medium · interactive</option>
-              <option value="high">High · presentation</option>
-            </select>
-          </label>
-          <label>Backdrop
-            <select id="renderBackground" title="Camera background preset">
-              <option value="studio">Studio</option>
-              <option value="light">Light</option>
-              <option value="dark">Dark</option>
-              <option value="blueprint">Blueprint</option>
-            </select>
-          </label>
-        </div>
-      </section>
-
-      <nav class="tabs">
-        <button data-tab="spec" class="active">Spec</button>
-        <button data-tab="checks">Checks <span id="checkCount"></span></button>
-        <button data-tab="critic">Critic</button>
-        <button data-tab="movement">Movement</button>
-        <button data-tab="package">Package</button>
-        <button class="tab-close" data-close="left" title="Close the specs sidebar" aria-label="Close specs sidebar">×</button>
-      </nav>
-
-      <div id="tab-spec" class="tab-panel active">
-        <div id="specForm"></div>
-      </div>
-
-      <div id="tab-checks" class="tab-panel">
-        <div id="checkSummary" class="check-summary"></div>
-        <div id="checkFilters" class="filters"></div>
-        <div id="checkList"></div>
-      </div>
-
-      <div id="tab-critic" class="tab-panel">
-        <div id="criticSummary" class="critic-summary"></div>
-        <div id="criticFocus" class="component-card"></div>
-        <div id="criticAxes" class="critic-axes"></div>
-        <div id="criticNotes" class="critic-notes"></div>
-      </div>
-
-      <div id="tab-package" class="tab-panel">
-        <div id="packageBody"></div>
-      </div>
-
-      <div id="tab-movement" class="tab-panel">
-        <p class="movement-intro">Manufacturer-published calibres only. A blank value means the retained source does not publish it, not zero. Fit results are deterministic checks, not a manufacturing release.</p>
-        <div class="movement-filters">
-          <input id="movementSearch" type="search" placeholder="maker or calibre" aria-label="Search movements">
-          <div class="movement-filter-row">
-            <select id="movementMaker" aria-label="Filter by manufacturer"><option value="">All makers</option></select>
-            <select id="movementType" aria-label="Filter by movement type">
-              <option value="">All types</option>
-              <option value="automatic">Automatic</option>
-              <option value="manual">Manual</option>
-              <option value="quartz">Quartz</option>
-            </select>
+        <section class="panel component-panel" id="componentPanel">
+          <div class="section-head">
+            <div>
+              <span class="eyebrow">Shared model</span>
+              <h2>Component tree</h2>
+            </div>
+            <div class="section-actions">
+              <button id="btnExpandTree" class="btn small ghost" title="Expand every component">Expand</button>
+              <button id="btnCollapseTree" class="btn small ghost" title="Collapse every component">Collapse</button>
+            </div>
           </div>
-          <div class="movement-filter-row">
-            <label>Ø min <input id="movementMinDiameter" type="number" step="0.1" min="0" placeholder="mm"></label>
-            <label>Ø max <input id="movementMaxDiameter" type="number" step="0.1" min="0" placeholder="mm"></label>
-            <label>H max <input id="movementMaxThickness" type="number" step="0.1" min="0" placeholder="mm"></label>
+          <label class="tree-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="componentSearch" type="search" placeholder="Search components or parts ( / )" aria-label="Search components and parts">
+          </label>
+          <div id="componentTree" class="component-tree" aria-live="polite">
+            <div class="empty-note">Loading the component registry…</div>
           </div>
-          <div class="movement-filter-row">
-            <button id="btnMovementSearch" class="btn small">Search</button>
-            <label class="movement-check"><input id="movementUnknown" type="checkbox"> include unknown dimensions</label>
+          <div id="componentTreeStatus" class="tree-status">Select a component to focus the assistant and highlight its parts.</div>
+        </section>
+
+        <section class="panel design-panel" id="designPanel">
+          <div class="design-head">
+            <h2>Design Studio</h2>
+            <span class="design-verified" title="Every change goes through the solver and verifier">solver-backed</span>
+          </div>
+          <p class="design-intro">Shape the watch visually. Every control writes the shared specification, then the deterministic solver rebuilds the mesh.</p>
+          <div class="design-grid">
+            <label>Case material <select id="designCaseMaterial" data-design-path="case.material"></select></label>
+            <label>Case finish <select id="designCaseFinish" data-design-path="case.finish"></select></label>
+            <label>Dial finish <select id="designDialFinish" data-design-path="dial.finish"></select></label>
+            <label>Crystal <select id="designCrystal" data-design-path="case.crystal"></select></label>
+            <label>Hands <select id="designHands" data-design-path="hands.material"></select></label>
+            <label>Indices <select id="designIndices" data-design-path="dial.index_style"></select></label>
+          </div>
+          <div class="design-color">
+            <span>Dial colour</span>
+            <div id="designSwatches" class="swatches"></div>
+            <label class="custom-color" title="Pick any dial colour">
+              <input id="designDialColor" type="color" value="#101418">
+              <span>custom</span>
+            </label>
+          </div>
+          <div class="design-section-head">
+            <span>Reference images</span>
+            <button id="btnDesignRef" class="btn small ghost">Add</button>
+            <input id="designReference" type="file" accept="image/*" multiple hidden>
+          </div>
+          <div id="designRefStrip" class="design-ref-strip" hidden></div>
+          <div class="design-actions">
+            <button id="btnDesignPrompt" class="btn small" title="Write a prompt that uses the attached reference images">Describe a match</button>
+            <button id="btnVariations" class="btn small primary">Generate alternatives</button>
+            <button class="btn small ghost" data-workspace="engineering">Open CAD tools</button>
+          </div>
+          <div id="designVariations" class="design-variations"></div>
+          <p class="design-note">Rendered from <code>/api/model.glb</code> · mass, checks and tolerances are calculated, not generated.</p>
+        </section>
+
+        <section class="panel optimise-panel" id="optimisePanel">
+          <div class="design-head">
+            <h2>Optimisation Lab</h2>
+            <span class="design-verified" title="Candidates are solved and verified, not predicted by a model">deterministic</span>
+          </div>
+          <p class="design-intro">Compare real, deterministic specification changes on a Pareto frontier. Each candidate is solved, meshed and verified. Hard constraints are reported separately from objectives; the finite probe field makes no global-optimality claim.</p>
+          <div class="design-grid">
+            <label>Objective
+              <select id="optimiseObjective">
+                <option value="weight">Minimum weight</option>
+                <option value="cost">Minimum estimated unit cost</option>
+                <option value="manufacturability">Manufacturability</option>
+                <option value="tolerance">Maximum stack margin</option>
+                <option value="assembly">Assembly simplicity</option>
+              </select>
+            </label>
+            <label>Candidate budget
+              <select id="optimiseBudget">
+                <option value="6">6 candidates</option>
+                <option value="9" selected>9 candidates</option>
+                <option value="12">12 candidates</option>
+              </select>
+            </label>
+            <label>Scatter X axis
+              <select id="optimiseAxisX"></select>
+            </label>
+            <label>Scatter Y axis
+              <select id="optimiseAxisY"></select>
+            </label>
+          </div>
+          <div class="design-actions">
+            <button id="btnOptimise" class="btn small primary">Run optimisation</button>
+            <button id="btnClearPreview" class="btn small" hidden>Return to current design</button>
+          </div>
+          <div id="optimiseStatus" class="optimise-status">Not run yet. The current design is the baseline.</div>
+          <div class="optimise-viz">
+            <svg id="optimiseScatter" viewBox="0 0 360 250" role="img"
+                 aria-label="Pareto frontier scatter plot"></svg>
+            <div id="optimiseLegend" class="optimise-legend"></div>
+          </div>
+          <div id="candidateList" class="candidate-list"></div>
+          <div id="candidateDetail" class="candidate-detail"></div>
+          <p class="design-note">Labels: <b>calculated</b> from geometry and the BOM; <b>estimated</b> where a cost or process assumption is involved. Nothing here is physically measured. The winner is a recommendation from a finite probe set, not a proven optimum.</p>
+        </section>
+
+        <div id="engineeringPanel" class="workspace-panel">
+          <section class="panel">
+            <h2>Model</h2>
+            <dl id="facts" class="facts"></dl>
+            <div id="why" class="why"></div>
+            <div class="view-actions">
+              <button class="btn small" data-view="three">3/4 view</button>
+              <button class="btn small" data-view="dial">Dial</button>
+              <button class="btn small" data-view="crown">Crown</button>
+              <button class="btn small" data-view="gears">Gears</button>
+              <button class="btn small" data-view="layers">Layers</button>
+              <button class="btn small" data-view="reset">Fit</button>
+            </div>
+            <div class="view-actions render-presets">
+              <label>Render
+                <select id="renderQuality" title="Geometry detail and texture budget">
+                  <option value="low">Low · integrated GPU</option>
+                  <option value="medium">Medium · interactive</option>
+                  <option value="high">High · presentation</option>
+                </select>
+              </label>
+              <label>Backdrop
+                <select id="renderBackground" title="Camera background preset">
+                  <option value="studio">Studio</option>
+                  <option value="light">Light</option>
+                  <option value="dark">Dark</option>
+                  <option value="blueprint">Blueprint</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <nav class="tabs">
+            <button data-tab="spec" class="active">Spec</button>
+            <button data-tab="checks">Checks <span id="checkCount"></span></button>
+            <button data-tab="critic">Critic</button>
+            <button data-tool="movement-dialog">Movement</button>
+            <button data-tab="package">Package</button>
+            <button class="tab-close" data-close="left" title="Close the controls sidebar" aria-label="Close controls sidebar">×</button>
+          </nav>
+
+          <div id="tab-spec" class="tab-panel active">
+            <div id="specForm"></div>
+          </div>
+
+          <div id="tab-checks" class="tab-panel">
+            <div id="checkSummary" class="check-summary"></div>
+            <div id="checkFilters" class="filters"></div>
+            <div id="checkList"></div>
+          </div>
+
+          <div id="tab-critic" class="tab-panel">
+            <div id="criticSummary" class="critic-summary"></div>
+            <div id="criticFocus" class="component-card"></div>
+            <div id="criticAxes" class="critic-axes"></div>
+            <div id="criticNotes" class="critic-notes"></div>
+          </div>
+
+          <div id="tab-package" class="tab-panel">
+            <div id="packageBody"></div>
           </div>
         </div>
-        <div id="movementList" class="movement-list"></div>
-        <div id="movementDetail" class="movement-detail"></div>
-      </div>
-      </div>
       </div>
     </aside>
 
-    <section class="viewport">
-      <div class="viewer-badge">deterministic mesh · mm</div>
+    <section class="viewport" aria-label="Watch viewport">
+      <div class="viewer-badge">canonical mesh · millimetres</div>
       <div id="partHud" class="part-hud" hidden>
         <span class="part-swatch"></span>
         <div class="part-copy">
@@ -242,108 +288,206 @@
       </div>
       <div class="viewer-hud">
         <span id="viewerInfo">loading model…</span>
-        <span class="hint">drag orbit · wheel zoom to cursor · shift-drag pan · click a part</span>
+        <span class="hint">drag orbit · wheel zoom at pointer · shift-drag pan · click a part</span>
       </div>
+
+      <section class="bottom-dock" id="bottomDock" aria-label="Engineering dock">
+        <header class="dock-head">
+          <nav class="dock-tabs" id="dockTabs">
+            <button data-dock="verification" class="active">Verification</button>
+            <button data-dock="timeline">Recent changes</button>
+            <button data-dock="comparison">Comparison</button>
+          </nav>
+          <button class="dock-toggle" data-dock-toggle title="Collapse or expand the bottom dock" aria-label="Toggle bottom dock">⌄</button>
+        </header>
+        <div class="dock-body">
+          <div id="verificationDock" class="dock-panel active"></div>
+          <div id="timelineDock" class="dock-panel"></div>
+          <div id="comparisonDock" class="dock-panel"></div>
+        </div>
+      </section>
+
       <div id="loading" class="loading"><div><div class="spinner"></div>solving geometry</div></div>
     </section>
 
-    <aside class="right chat-host" id="rightPanel">
+    <aside class="right chat-host" id="rightPanel" aria-label="AI assistant">
       <div class="sidebar-inner">
-      <section class="panel copilot chat-panel">
-        <div class="panel-head">
-          <button id="btnChats" class="btn small ghost icon-btn" title="Show conversation history">Chats</button>
-          <h2>Design assistant</h2>
-          <span id="engineChip" class="engine-chip" title="Local rules are always available. A configured model adds conversational reasoning and tool selection.">local rules</span>
-          <span id="sessionChip" class="session-chip" title="This conversation has its own design session">default</span>
-          <button class="panel-close" data-close="right" title="Close the assistant sidebar" aria-label="Close assistant sidebar">×</button>
-        </div>
-
-        <div id="chatSidebar" class="chat-sidebar" hidden>
-          <div class="chat-sidebar-head">
-            <input id="conversationSearch" type="search" placeholder="Search chats…" aria-label="Search conversations">
-            <button id="btnNewChat" class="btn small" title="Start a new conversation from the current design">New chat</button>
+        <section class="panel copilot chat-panel">
+          <div class="panel-head">
+            <button id="btnChats" class="btn small ghost icon-btn" title="Show conversation history">Chats</button>
+            <h2>Design assistant</h2>
+            <span id="engineChip" class="engine-chip" title="Local rules are always available. A configured model adds conversational reasoning and tool selection.">local rules</span>
+            <span id="sessionChip" class="session-chip" title="This conversation has its own design session">default</span>
+            <button class="panel-close" data-close="right" title="Close the assistant sidebar" aria-label="Close assistant sidebar">×</button>
           </div>
-          <div id="conversationList" class="conversation-list"></div>
-        </div>
 
-        <div class="chat-toolbar">
-          <label class="autonomy" title="Suggest only: show changes. Require approval: stage changes. Safe: apply only verified improvements. Autonomous: apply verified changes.">
-            <span>Mode</span>
-            <select id="autonomy">
-              <option value="suggest">Suggest only</option>
-              <option value="approval">Require approval</option>
-              <option value="safe">Safe changes</option>
-              <option value="autonomous">Autonomous</option>
-            </select>
-          </label>
-          <button id="btnStop" class="btn small danger" hidden title="Stop the running assistant; nothing unverified is committed">Stop</button>
-          <button id="btnUndo" class="btn small" title="Restore the previous design version">Undo</button>
-          <button id="btnRedo" class="btn small" title="Restore the next design version">Redo</button>
-          <button id="btnHistory" class="btn small" title="Show design history and memory">History</button>
-          <button id="btnSettings" class="btn small" title="Model and research settings">Settings</button>
-        </div>
-
-        <div id="settingsBox" class="settings-box" hidden>
-          <div class="settings-grid">
-            <label>Provider <input id="setProvider" placeholder="openai-compatible"></label>
-            <label>Endpoint <input id="setUrl" placeholder="https://…/v1"></label>
-            <label>Model <input id="setModel" placeholder="gpt-4o-mini"></label>
-            <label>Vision model <input id="setVision" placeholder="optional"></label>
-            <label>Search endpoint <input id="setSearchUrl" placeholder="optional JSON search URL"></label>
+          <div id="chatSidebar" class="chat-sidebar" hidden>
+            <div class="chat-sidebar-head">
+              <input id="conversationSearch" type="search" placeholder="Search chats…" aria-label="Search conversations">
+              <button id="btnNewChat" class="btn small" title="Start a new conversation from the current design">New chat</button>
+            </div>
+            <div id="conversationList" class="conversation-list"></div>
           </div>
-          <div class="settings-foot">
-            <span id="settingsHint">Endpoints and models are non-secret. Use AI provider for session keys.</span>
-            <button class="btn small" id="btnProviderSettings">AI provider</button>
-            <button class="btn small primary" data-settings-save="1">Save settings</button>
-          </div>
-        </div>
 
-        <div id="chatStatus" class="chat-status" hidden></div>
-        <div id="agentStatus" class="agent-status" hidden></div>
-        <div id="agentApproval" class="agent-approval" hidden></div>
-
-        <details id="agentTimelineBox" class="agent-box">
-          <summary><span>Execution timeline</span><b id="agentIterations"></b></summary>
-          <div id="agentTimeline" class="agent-timeline"></div>
-        </details>
-
-        <details id="agentDiffBox" class="agent-box">
-          <summary><span>Spec diff</span><b id="agentChangeCount"></b></summary>
-          <div id="agentDiff" class="agent-diff"></div>
-        </details>
-
-        <details id="agentVariantsBox" class="agent-box" hidden>
-          <summary><span>Design alternatives</span><b id="agentVariantCount"></b></summary>
-          <div id="agentVariants" class="agent-variants"></div>
-        </details>
-
-        <div id="agentHistory" class="agent-history" hidden></div>
-
-        <div id="chatLog" class="chat-log"></div>
-        <div id="attachmentStrip" class="attachment-strip" hidden></div>
-        <div class="composer">
-          <textarea id="prompt" placeholder="Ask anything — design, materials, movements, trade-offs — or ask for a validated change…"></textarea>
-          <div class="composer-actions">
-            <button id="btnAttach" class="btn small ghost" title="Attach a reference photo or sketch">Image</button>
-            <input id="chatImages" type="file" accept="image/*" multiple hidden>
-            <label class="checkline" title="Use the configured language model. Without one, the deterministic local engine still answers CAD requests.">
-              <input type="checkbox" id="useLlm"> Use model
+          <div class="chat-toolbar">
+            <label class="autonomy" title="Suggest only: show changes. Require approval: stage changes. Safe: apply only verified improvements. Autonomous: apply verified changes.">
+              <span>Mode</span>
+              <select id="autonomy">
+                <option value="suggest">Suggest only</option>
+                <option value="approval">Require approval</option>
+                <option value="safe">Safe changes</option>
+                <option value="autonomous">Autonomous</option>
+              </select>
             </label>
-            <button id="btnParse" class="btn primary">Send</button>
+            <button id="btnStop" class="btn small danger" hidden title="Stop the running assistant; nothing unverified is committed">Stop</button>
+            <button class="btn small ghost" data-tool="history" title="Open version history (H)">Versions</button>
           </div>
-        </div>
-        <div id="examples" class="examples"></div>
-      </section>
+
+          <div id="assistantFocus" class="assistant-focus" hidden>
+            <span>Scoped to</span><b id="assistantFocusName">—</b>
+            <button data-focus-clear title="Remove the component scope">clear</button>
+          </div>
+
+          <div id="settingsBox" class="settings-box" hidden>
+            <div class="settings-grid">
+              <label>Provider <input id="setProvider" placeholder="openai-compatible"></label>
+              <label>Endpoint <input id="setUrl" placeholder="https://…/v1"></label>
+              <label>Model <input id="setModel" placeholder="gpt-4o-mini"></label>
+              <label>Vision model <input id="setVision" placeholder="optional"></label>
+              <label>Search endpoint <input id="setSearchUrl" placeholder="optional JSON search URL"></label>
+            </div>
+            <div class="settings-foot">
+              <span id="settingsHint">Endpoints and models are non-secret. Use AI provider for session keys.</span>
+              <button class="btn small" id="btnProviderSettings">AI provider</button>
+              <button class="btn small primary" data-settings-save="1">Save settings</button>
+            </div>
+          </div>
+
+          <div id="chatStatus" class="chat-status" hidden></div>
+          <div id="agentStatus" class="agent-status" hidden></div>
+          <div id="agentApproval" class="agent-approval" hidden></div>
+
+          <details id="agentTimelineBox" class="agent-box">
+            <summary><span>Execution timeline</span><b id="agentIterations"></b></summary>
+            <div id="agentTimeline" class="agent-timeline"></div>
+          </details>
+
+          <details id="agentDiffBox" class="agent-box">
+            <summary><span>Spec diff</span><b id="agentChangeCount"></b></summary>
+            <div id="agentDiff" class="agent-diff"></div>
+          </details>
+
+          <details id="agentVariantsBox" class="agent-box" hidden>
+            <summary><span>Design alternatives</span><b id="agentVariantCount"></b></summary>
+            <div id="agentVariants" class="agent-variants"></div>
+          </details>
+
+          <div id="agentHistory" class="agent-history" hidden></div>
+
+          <div id="chatLog" class="chat-log"></div>
+          <div id="attachmentStrip" class="attachment-strip" hidden></div>
+          <div class="composer">
+            <textarea id="prompt" placeholder="Ask anything — design, materials, movements, trade-offs — or ask for a validated change…"></textarea>
+            <div class="composer-actions">
+              <button id="btnAttach" class="btn small ghost" title="Attach a reference photo or sketch">Image</button>
+              <input id="chatImages" type="file" accept="image/*" multiple hidden>
+              <label class="checkline" title="Use the configured language model. Without one, the deterministic local engine still answers CAD requests.">
+                <input type="checkbox" id="useLlm"> Use model
+              </label>
+              <button id="btnParse" class="btn primary">Send</button>
+            </div>
+          </div>
+          <div id="examples" class="examples"></div>
+        </section>
       </div>
     </aside>
   </main>
 
   <button class="panel-rail rail-left" id="railSpecs" data-panel-toggle="left"
-    title="Hide or show the specs sidebar" aria-label="Toggle specs sidebar"
-    aria-expanded="true">Specs</button>
+    title="Hide or show the controls sidebar" aria-label="Toggle controls sidebar"
+    aria-expanded="true">Controls</button>
   <button class="panel-rail rail-right" id="railCopilot" data-panel-toggle="right"
     title="Hide or show the AI agent sidebar" aria-label="Toggle AI agent sidebar"
     aria-expanded="true">AI agent</button>
+
+  <div id="movementModal" class="modal" hidden>
+    <div class="modal-card wide-card" role="dialog" aria-modal="true" aria-labelledby="movementTitle">
+      <header class="modal-head">
+        <div>
+          <h2 id="movementTitle">Movement catalogue</h2>
+          <p>Manufacturer-published calibres only. A blank value means the retained source does not publish it, not zero. Fit results are deterministic checks, not a manufacturing release.</p>
+        </div>
+        <button class="modal-close" data-close-movement aria-label="Close movement catalogue">×</button>
+      </header>
+      <div class="movement-filters">
+        <input id="movementSearch" type="search" placeholder="maker or calibre" aria-label="Search movements">
+        <div class="movement-filter-row">
+          <select id="movementMaker" aria-label="Filter by manufacturer"><option value="">All makers</option></select>
+          <select id="movementType" aria-label="Filter by movement type">
+            <option value="">All types</option>
+            <option value="automatic">Automatic</option>
+            <option value="manual">Manual</option>
+            <option value="quartz">Quartz</option>
+          </select>
+        </div>
+        <div class="movement-filter-row">
+          <label>Ø min <input id="movementMinDiameter" type="number" step="0.1" min="0" placeholder="mm"></label>
+          <label>Ø max <input id="movementMaxDiameter" type="number" step="0.1" min="0" placeholder="mm"></label>
+          <label>H max <input id="movementMaxThickness" type="number" step="0.1" min="0" placeholder="mm"></label>
+        </div>
+        <div class="movement-filter-row">
+          <button id="btnMovementSearch" class="btn small">Search</button>
+          <label class="movement-check"><input id="movementUnknown" type="checkbox"> include unknown dimensions</label>
+        </div>
+      </div>
+      <div id="movementList" class="movement-list"></div>
+      <div id="movementDetail" class="movement-detail"></div>
+      <div class="modal-actions">
+        <button class="btn small ghost" data-close-movement>Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="historyModal" class="modal" hidden>
+    <div class="modal-card wide-card" role="dialog" aria-modal="true" aria-labelledby="historyTitle">
+      <header class="modal-head">
+        <div>
+          <h2 id="historyTitle">Design history</h2>
+          <p>Snapshots capture the current design without changing it. Restoring commits the selected version as a new revision; compare before you decide.</p>
+        </div>
+        <button class="modal-close" data-close-history aria-label="Close design history">×</button>
+      </header>
+      <div class="history-toolbar">
+        <input id="snapshotLabel" type="text" placeholder="Snapshot label (optional)" aria-label="Snapshot label">
+        <button id="btnSnapshot" class="btn small primary">Create snapshot</button>
+        <button id="btnRefreshVersions" class="btn small ghost">Refresh</button>
+      </div>
+      <div class="history-grid">
+        <div id="versionList" class="version-list"><div class="empty-note">Loading versions…</div></div>
+        <div id="versionCompare" class="version-compare"><div class="empty-note">Select a version to compare it with the current design.</div></div>
+      </div>
+      <div id="restoreConfirm" class="restore-confirm" hidden></div>
+      <div class="modal-actions">
+        <button class="btn small ghost" data-close-history>Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="compareModal" class="modal" hidden>
+    <div class="modal-card wide-card" role="dialog" aria-modal="true" aria-labelledby="compareTitle">
+      <header class="modal-head">
+        <div>
+          <h2 id="compareTitle">Compare optimisation candidates</h2>
+          <p>Select candidates to compare their real solved and verified metrics. Previewing never changes the live design; applying requires a separate confirmation.</p>
+        </div>
+        <button class="modal-close" data-close-compare aria-label="Close candidate comparison">×</button>
+      </header>
+      <div id="candidateCompare" class="candidate-compare"><div class="empty-note">Run the optimiser first.</div></div>
+      <div class="modal-actions">
+        <button class="btn small ghost" data-close-compare>Close</button>
+      </div>
+    </div>
+  </div>
 
   <div id="providerModal" class="modal" hidden>
     <div class="modal-card provider-card" role="dialog" aria-modal="true" aria-labelledby="providerTitle">

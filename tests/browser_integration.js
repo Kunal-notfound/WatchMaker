@@ -207,6 +207,56 @@ class Bidi {
   };
   const part = (snapshot, name) =>
     (snapshot?.parts || []).find((item) => item.name === name);
+  const near = (actual, expected, epsilon = 1e-4) =>
+    Number.isFinite(actual) && Number.isFinite(expected)
+    && Math.abs(actual - expected) <= epsilon;
+  const vectorNear = (actual, expected, epsilon = 1e-4) =>
+    Array.isArray(actual) && Array.isArray(expected) && actual.length === expected.length
+    && actual.every((value, index) => near(value, expected[index], epsilon));
+  const meshState = (name) => evalJson(`JSON.stringify((() => {
+    const mesh = window.WatchCAD3D.scene.getObjectByName(${JSON.stringify(name)});
+    if (!mesh) return null;
+    return {
+      visible: Boolean(mesh.visible),
+      emissive: mesh.material?.emissive?.getHexString?.() || "",
+      color: mesh.material?.color?.getHexString?.() || "",
+    };
+  })())`);
+  const clickSelector = async (selector, label = selector) => {
+    const clicked = await evaluate(`(() => {
+      const node = document.querySelector(${JSON.stringify(selector)});
+      if (!node) return false;
+      node.click();
+      return true;
+    })()`);
+    check(clicked === true, `clicked ${label}`);
+    return clicked === true;
+  };
+  const probeWheel = (deltaY) => evalJson(`JSON.stringify((() => {
+    const canvas = document.getElementById("viewer3d");
+    const rect = canvas.getBoundingClientRect();
+    // Firefox exposes WheelEvent client coordinates as integers, so sample the
+    // same rounded pointer that the viewer's real event handler will receive.
+    const x = Math.round(rect.left + rect.width * 0.72);
+    const y = Math.round(rect.top + rect.height * 0.38);
+    const beforeCamera = window.WatchCAD3D.cameraState();
+    const world = window.WatchCAD3D.pointerPoint(x, y);
+    const beforeProjected = world ? window.WatchCAD3D.projectPoint(world) : null;
+    const event = new WheelEvent("wheel", {
+      deltaY: ${deltaY}, deltaMode: 0,
+      clientX: x, clientY: y, bubbles: true, cancelable: true,
+    });
+    const notCancelled = canvas.dispatchEvent(event);
+    const afterCamera = window.WatchCAD3D.cameraState();
+    const afterWorld = window.WatchCAD3D.pointerPoint(x, y);
+    const afterProjected = world ? window.WatchCAD3D.projectPoint(world) : null;
+    return {
+      x, y, notCancelled, defaultPrevented: event.defaultPrevented,
+      wheelZoom: window.WatchCAD3D.wheelZoom,
+      beforeCamera, afterCamera, world, afterWorld,
+      beforeProjected, afterProjected,
+    };
+  })())`);
 
   try {
     scratch = fs.mkdtempSync(path.join("/tmp/opencode", "watchcad-browser-"));
@@ -506,6 +556,141 @@ class Bidi {
       "redo restores the newer design");
     check(redone.revision > undone.revision,
       "redo is installed as a new committed model revision");
+
+    section("11. real wheel zoom is pointer-anchored");
+    const projectedNear = (projected, probe, epsilon = 1.5) =>
+      Boolean(projected) && near(projected.x, probe.x, epsilon)
+      && near(projected.y, probe.y, epsilon);
+    const zoomIn = await probeWheel(-180);
+    check(zoomIn.wheelZoom === "pointer" && zoomIn.defaultPrevented === true
+      && zoomIn.notCancelled === false,
+    "a real wheel event is consumed by the pointer-zoom handler");
+    check(Boolean(zoomIn.world && zoomIn.afterWorld
+      && zoomIn.beforeCamera && zoomIn.afterCamera),
+    "camera and pointer projection hooks expose the live WebGL camera");
+    check(zoomIn.afterCamera.distance < zoomIn.beforeCamera.distance,
+      `wheel up zooms in (${zoomIn.beforeCamera.distance.toFixed(3)} → ${zoomIn.afterCamera.distance.toFixed(3)})`);
+
+    const normalized = (vector) => {
+      const length = Math.hypot(...vector) || 1;
+      return vector.map((value) => value / length);
+    };
+    const beforeOffset = zoomIn.beforeCamera.position
+      .map((value, index) => value - zoomIn.beforeCamera.target[index]);
+    const afterOffset = zoomIn.afterCamera.position
+      .map((value, index) => value - zoomIn.afterCamera.target[index]);
+    const zoomInTargetShift = zoomIn.afterCamera.target
+      .map((value, index) => value - zoomIn.beforeCamera.target[index]);
+    check(Math.hypot(...zoomInTargetShift) > 1e-3,
+      "off-centre zoom moves the orbit target instead of orbiting around it");
+    check(vectorNear(normalized(beforeOffset), normalized(afterOffset), 1e-6),
+      "zoom changes distance without changing the camera orbit direction");
+    check(vectorNear(zoomIn.world, zoomIn.afterWorld, 1e-3),
+      "the world point under the pointer is unchanged by zoom");
+    check(projectedNear(zoomIn.beforeProjected, zoomIn)
+      && projectedNear(zoomIn.afterProjected, zoomIn),
+    "the anchored point stays under the pointer on screen");
+
+    const zoomOut = await probeWheel(180);
+    check(zoomOut.afterCamera.distance > zoomOut.beforeCamera.distance,
+      `wheel down zooms out (${zoomOut.beforeCamera.distance.toFixed(3)} → ${zoomOut.afterCamera.distance.toFixed(3)})`);
+    check(vectorNear(zoomOut.world, zoomOut.afterWorld, 1e-3)
+      && projectedNear(zoomOut.afterProjected, zoomOut),
+    "the second zoom gesture remains anchored at the same pointer");
+    check(near(zoomOut.afterCamera.distance, zoomIn.beforeCamera.distance, 1e-3)
+      && vectorNear(zoomOut.afterCamera.target, zoomIn.beforeCamera.target, 1e-3),
+    "an equal zoom out restores the original distance and orbit target");
+
+    section("12. component tree drives real part visibility and highlight");
+    await evaluate("window.WatchCAD3D.clearSelection()");
+    const baseHand = await meshState("hour_hand");
+    check(Boolean(baseHand), "the real GLB exposes hour_hand as a named mesh");
+    await clickSelector("#btnExpandTree", "expand component tree");
+    await waitForBoolean(
+      `Boolean(document.querySelector('[data-tree-part-visibility="hour_hand"]'))`,
+      "expanded hands parts");
+
+    await clickSelector('[data-tree-part-visibility="hour_hand"]', "hide hour_hand");
+    await waitForBoolean(`(() => {
+      const m = window.WatchCAD3D.modelSnapshot();
+      return m.visibility.partsHidden.includes("hour_hand")
+        && m.parts.find((item) => item.name === "hour_hand")?.visible === false;
+    })()`, "hidden hour_hand reaches the viewer");
+    const hiddenHand = await meshState("hour_hand");
+    check((await model()).visibility.partsHidden.includes("hour_hand")
+      && hiddenHand?.visible === false,
+    "part-level hide removes the actual Three.js mesh from the scene");
+
+    await clickSelector('[data-tree-part-visibility="hour_hand"]', "show hour_hand");
+    await waitForBoolean(`(() => {
+      const m = window.WatchCAD3D.modelSnapshot();
+      return !m.visibility.partsHidden.includes("hour_hand")
+        && m.parts.find((item) => item.name === "hour_hand")?.visible === true;
+    })()`, "shown hour_hand reaches the viewer");
+
+    await clickSelector('[data-tree-select="hands"]', "select Hands component");
+    await waitForBoolean(
+      `window.WatchCAD3D.modelSnapshot().visibility.highlight.includes("hour_hand")`,
+      "component highlight reaches the viewer");
+    const focusChip = await evalJson(`JSON.stringify({
+      hidden: document.getElementById("assistantFocus").hidden,
+      name: document.getElementById("assistantFocusName").textContent,
+    })`);
+    const highlightedHand = await meshState("hour_hand");
+    check(focusChip.hidden === false && focusChip.name === "Hands",
+      "tree selection scopes the assistant to the selected component");
+    check(highlightedHand.emissive && highlightedHand.emissive !== baseHand.emissive,
+      `component highlight changes the real mesh material (${baseHand.emissive} → ${highlightedHand.emissive})`);
+
+    await clickSelector('[data-tree-part-visibility="hour_hand"]',
+      "hide highlighted hour_hand");
+    await waitForBoolean(`(() => {
+      const m = window.WatchCAD3D.modelSnapshot();
+      return m.visibility.partsHidden.includes("hour_hand") && m.activeLoads === 0;
+    })()`, "highlighted part hidden before reload");
+    const currentDialColour = await evalJson(
+      `JSON.stringify(window.WatchCAD.STATE.spec.data.dial.color)`);
+    const replayColour = currentDialColour === "silver" ? "burgundy" : "silver";
+    await changeField("dial.color", replayColour);
+    const replayed = await waitForModel(`m.revision === window.WatchCAD.STATE.revision
+      && m.visibility.partsHidden.includes("hour_hand")
+      && m.visibility.highlight.includes("hour_hand")
+      && m.activeLoads === 0`, "visibility replay after GLB replacement");
+    const replayMesh = await meshState("hour_hand");
+    check(replayed.visibility.partsHidden.includes("hour_hand")
+      && replayMesh.visible === false
+      && replayMesh.emissive === highlightedHand.emissive,
+    "part visibility and highlight survive a real model replacement");
+
+    await clickSelector('[data-tree-isolate="hands"]', "isolate Hands component");
+    await waitForBoolean(`(() => {
+      const m = window.WatchCAD3D.modelSnapshot();
+      return m.visibility.partsIsolate
+        && m.visibility.partsIsolate.includes("hour_hand")
+        && m.parts.find((item) => item.name === "dial")?.visible === false;
+    })()`, "component isolation reaches the viewer");
+    const isolated = await model();
+    check(isolated.visibility.partsIsolate.includes("hour_hand")
+      && part(isolated, "dial")?.visible === false,
+    "isolation keeps owned parts visible and hides the rest of the real scene");
+    await clickSelector('[data-tree-isolate="hands"]', "clear Hands isolation");
+    await waitForBoolean(`(() => {
+      const m = window.WatchCAD3D.modelSnapshot();
+      return m.visibility.partsIsolate === null
+        && m.parts.find((item) => item.name === "dial")?.visible === true;
+    })()`, "component isolation clears");
+
+    await clickSelector('[data-tree-part-visibility="hour_hand"]', "show hour_hand again");
+    await waitForBoolean(
+      `window.WatchCAD3D.modelSnapshot().visibility.partsHidden.length === 0`,
+      "hidden parts cleared");
+    await evaluate("window.setComponentFocus(null)");
+    await waitForBoolean(
+      `window.WatchCAD3D.modelSnapshot().visibility.highlight.length === 0`,
+      "component highlight cleared");
+    const clearedHand = await meshState("hour_hand");
+    check(clearedHand.visible === true && clearedHand.emissive === baseHand.emissive,
+      "clearing the scope restores the original mesh state");
 
     section("resource disposal, listener stability and idle rendering");
     const perfBefore = await resources();

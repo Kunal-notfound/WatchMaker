@@ -13,7 +13,9 @@ Endpoints (JSON unless noted):
 
     GET  /api/state           spec, checks, summary, derivation report
     GET  /api/schema          field registry, presets, complications, ideas
+    GET  /api/components      component registry: parts, fields, checks, aliases
     GET  /api/scene           triangles for the software renderer
+    GET  /api/model.glb       canonical GLB for the Three.js viewer
     GET  /api/builds          last build manifest
     POST /api/prompt          {prompt, use_llm} -> patches, questions, state
     POST /api/set             {path, value, force}
@@ -36,6 +38,13 @@ Conversation endpoints:
     POST /api/chat/approve|reject        {conversation_id, token?}
     GET  /api/settings                   non-secret model/research settings
     POST /api/settings                   update non-secret settings
+
+Version endpoints:
+
+    GET  /api/agent/history              transcript, memory, versions, undo state
+    GET  /api/agent/version?id=<id>      one version including its writable spec
+    POST /api/agent/snapshot             {label?, expected_revision?} checkpoint only
+    POST /api/agent/restore              {id, expected_revision?} new undoable revision
 """
 
 from __future__ import annotations
@@ -44,6 +53,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import tempfile
@@ -73,7 +83,7 @@ from .agent.orchestrator import AgentOrchestrator, apply_variant, normalize_mode
 from .agent.planner import detect_intent, build_variants
 from .agent.tools import tool_catalog
 from .build import BuildResult, build, slugify
-from .components import UnknownComponent, component_context
+from .components import COMPONENTS, UnknownComponent, component_context
 from .critic import critique
 from .llm import LLMConfig
 from .modules import MODULES, QUARTZ_MODULES
@@ -979,6 +989,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(404, f"unknown version {key}")
                 return
             self._json(200, target.to_dict(include_spec=True))
+        elif route == "/api/components":
+            self._json(200, {
+                "components": [component.to_dict() for component in COMPONENTS.values()],
+            })
         elif route == "/api/agent/variants":
             self._json(200, {"variants": build_variants(studio)})
         elif route == "/api/download/file":
@@ -1251,6 +1265,10 @@ class Handler(BaseHTTPRequestHandler):
             self._agent_history(session, "undo")
         elif route == "/api/agent/redo":
             self._agent_history(session, "redo")
+        elif route == "/api/agent/snapshot":
+            self._agent_snapshot(session, body)
+        elif route == "/api/agent/restore":
+            self._agent_restore(session, body)
         elif route == "/api/agent/variant":
             self._agent_variant(session, body)
         elif route == "/api/session/new":
@@ -1371,6 +1389,49 @@ class Handler(BaseHTTPRequestHandler):
             self._error(409, f"nothing to {action}")
             return
         payload = session.studio.snapshot({
+            "version": target.to_dict(),
+            "session": session.conversation_payload(),
+        })
+        self._json(200, payload)
+
+    def _check_studio_revision(self, studio, body: dict) -> None:
+        expected = self._expected_revision(body)
+        if expected is None:
+            return
+        with studio.lock:
+            try:
+                wanted = int(expected)
+            except (TypeError, ValueError) as exc:
+                raise RevisionConflict(expected, studio.revision) from exc
+            if wanted != studio.revision:
+                raise RevisionConflict(wanted, studio.revision)
+
+    def _agent_snapshot(self, session, body: dict) -> None:
+        """Capture a named manual version without changing the live design."""
+        studio = session.studio
+        self._check_studio_revision(studio, body)
+        label = str(body.get("label") or "Manual snapshot").strip()[:120]
+        target = session.take_checkpoint(label, "snapshot", force=True)
+        payload = studio.snapshot({
+            "version": target.to_dict(),
+            "session": session.conversation_payload(),
+        })
+        self._json(200, payload)
+
+    def _agent_restore(self, session, body: dict) -> None:
+        """Commit a saved version as a new revision after an explicit request."""
+        studio = session.studio
+        self._check_studio_revision(studio, body)
+        version_id = body.get("id") or body.get("version")
+        if version_id in (None, ""):
+            self._error(400, "version id is required")
+            return
+        try:
+            target = session.restore(version_id)
+        except KeyError as exc:
+            self._error(404, str(exc))
+            return
+        payload = studio.snapshot({
             "version": target.to_dict(),
             "session": session.conversation_payload(),
         })

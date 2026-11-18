@@ -56,7 +56,10 @@ const S = {
   radius: 25,
   explode: 0,
   hidden: new Set(),
+  hiddenParts: new Set(),
   isolate: null,
+  isolateParts: null,
+  highlightParts: new Set(),
   selected: null,
   view: "three",
   frame: 0,
@@ -176,6 +179,7 @@ function init() {
   controls.minDistance = 6;
   controls.maxDistance = 900;
   controls.screenSpacePanning = true;
+  controls.zoomToCursor = false;
   track(controls, "change", () => requestRender());
 
   const key = new THREE.DirectionalLight(0xfff3df, 3.1);
@@ -227,8 +231,13 @@ function init() {
     setView: (name) => placeCamera(name, true),
     setExplode: (value) => setExplode(value),
     setVisibility: (state) => setVisibility(state),
+    visibilityState: () => visibilityState(),
     selectPart: (name) => selectByName(name),
     clearSelection: () => selectByName(null),
+    cameraState: () => cameraState(),
+    projectPoint: (world) => projectPoint(world),
+    pointerPoint: (clientX, clientY) => pointerPoint(clientX, clientY),
+    zoomAt: (clientX, clientY, factor) => zoomAt(clientX, clientY, factor),
     setQuality: (name) => setQuality(name),
     setModelUrl: (url, meta) => {
       setExpectedFromDetail({ ...(meta || {}), session: meta?.session || sessionId() },
@@ -256,6 +265,7 @@ function init() {
     setBackground: (name) => setBackground(name),
     getBackground: () => S.background,
     presets: () => ({ quality: Object.keys(QUALITY), background: Object.keys(BACKGROUNDS) }),
+    get wheelZoom() { return "pointer"; },
   };
   setStatus("3D viewer ready");
   return true;
@@ -277,6 +287,20 @@ function bindEvents() {
   track(el, "pointerleave", () => { down = null; });
   track(el, "dblclick", () => placeCamera("three", true));
   track(el, "contextmenu", (event) => event.preventDefault());
+  // OrbitControls' own wheel dolly always orbits around the scene target.
+  // Intercept mouse wheel in the capture phase and use the same pointer-plane
+  // anchor as the 2D viewport; touch pinch is left to OrbitControls.
+  track(el, "wheel", (event) => {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? el.clientHeight : 1;
+    const delta = Number(event.deltaY) * unit;
+    const factor = Math.max(0.5, Math.min(2, Math.exp(delta * 0.0012)));
+    const rect = el.getBoundingClientRect();
+    const x = Number.isFinite(event.clientX) ? event.clientX : rect.left + rect.width / 2;
+    const y = Number.isFinite(event.clientY) ? event.clientY : rect.top + rect.height / 2;
+    zoomAt(x, y, factor);
+  }, { capture: true });
   track(el, "webglcontextlost", (event) => {
     event.preventDefault();
     document.body?.classList.remove("webgl3d");
@@ -464,6 +488,12 @@ function handleSessionChange(session) {
   S.loadStats.sessionResets += 1;
   S.tree = {};
   S.groups.clear();
+  S.hidden = new Set();
+  S.hiddenParts = new Set();
+  S.isolate = null;
+  S.isolateParts = null;
+  S.highlightParts = new Set();
+  S.selected = null;
   setStatus(`session ${next.slice(-8)} — loading design…`);
 }
 
@@ -798,6 +828,7 @@ function modelSnapshot() {
       preview: S.expectedPreview, previewId: S.expectedPreviewId,
     },
     bounds: boxData(S.bounds),
+    visibility: visibilityState(),
     parts: S.parts.map((part) => ({
       name: part.name,
       role: part.userData.role || "part",
@@ -1055,37 +1086,157 @@ function groupOf(part) {
   return part.userData.group || S.groups.get(part.name) || "Parts";
 }
 
+function setFromArray(value, current) {
+  if (Array.isArray(value)) return new Set(value);
+  if (value instanceof Set) return new Set(value);
+  return current;
+}
+
 function setVisibility(state = {}) {
-  if (Array.isArray(state.hidden)) S.hidden = new Set(state.hidden);
-  else if (state.hidden instanceof Set) S.hidden = new Set(state.hidden);
-  S.isolate = Array.isArray(state.isolate) ? new Set(state.isolate)
-    : state.isolate instanceof Set ? new Set(state.isolate) : null;
+  S.hidden = setFromArray(state.hidden, S.hidden);
+  S.hiddenParts = setFromArray(state.parts_hidden, S.hiddenParts);
+  S.highlightParts = setFromArray(state.highlight, S.highlightParts);
+  if (Array.isArray(state.isolate) || state.isolate instanceof Set) {
+    S.isolate = setFromArray(state.isolate, null);
+  } else if (Object.prototype.hasOwnProperty.call(state, "isolate")) {
+    S.isolate = null;
+  }
+  if (Array.isArray(state.parts_isolate) || state.parts_isolate instanceof Set) {
+    S.isolateParts = setFromArray(state.parts_isolate, null);
+  } else if (Object.prototype.hasOwnProperty.call(state, "parts_isolate")) {
+    S.isolateParts = null;
+  }
   applyVisibility();
 }
 
 function applyVisibility() {
   for (const part of S.parts) {
     const group = groupOf(part);
-    part.visible = !S.hidden.has(group) && (!S.isolate || S.isolate.has(group));
-    part.userData.dimmed = Boolean(S.isolate && !S.isolate.has(group));
+    const groupVisible = !S.hidden.has(group) && (!S.isolate || S.isolate.has(group));
+    const partVisible = !S.hiddenParts.has(part.name)
+      && (!S.isolateParts || S.isolateParts.has(part.name));
+    part.visible = groupVisible && partVisible;
+    part.userData.dimmed = Boolean((S.isolate && !S.isolate.has(group))
+      || (S.isolateParts && !S.isolateParts.has(part.name)));
+  }
+  applyEmissive();
+  requestRender(true);
+}
+
+function visibilityState() {
+  return {
+    hidden: [...S.hidden],
+    isolate: S.isolate ? [...S.isolate] : null,
+    partsHidden: [...S.hiddenParts],
+    partsIsolate: S.isolateParts ? [...S.isolateParts] : null,
+    highlight: [...S.highlightParts],
+    selected: S.selected,
+  };
+}
+
+function cameraState() {
+  if (!S.camera || !S.controls) return null;
+  const position = S.camera.position.clone();
+  const target = S.controls.target.clone();
+  return {
+    position: position.toArray(),
+    target: target.toArray(),
+    distance: position.distanceTo(target),
+    fov: S.camera.fov,
+    aspect: S.camera.aspect,
+    minDistance: S.controls.minDistance,
+    maxDistance: S.controls.maxDistance,
+  };
+}
+
+function pointerRay(clientX, clientY) {
+  if (!S.camera || !S.renderer) return null;
+  const rect = S.renderer.domElement.getBoundingClientRect();
+  const x = Number.isFinite(clientX) ? clientX : rect.left + rect.width / 2;
+  const y = Number.isFinite(clientY) ? clientY : rect.top + rect.height / 2;
+  const pointer = new THREE.Vector2(
+    ((x - rect.left) / Math.max(1, rect.width)) * 2 - 1,
+    -((y - rect.top) / Math.max(1, rect.height)) * 2 + 1,
+  );
+  S.camera.updateMatrixWorld();
+  const ray = new THREE.Raycaster();
+  ray.setFromCamera(pointer, S.camera);
+  return ray.ray;
+}
+
+function targetPlane() {
+  if (!S.camera || !S.controls) return null;
+  const normal = new THREE.Vector3();
+  S.camera.getWorldDirection(normal);
+  return new THREE.Plane().setFromNormalAndCoplanarPoint(normal, S.controls.target);
+}
+
+function pointerPoint(clientX, clientY) {
+  const ray = pointerRay(clientX, clientY);
+  const plane = targetPlane();
+  if (!ray || !plane) return null;
+  const point = new THREE.Vector3();
+  return ray.intersectPlane(plane, point) ? point.toArray() : null;
+}
+
+function projectPoint(world) {
+  if (!S.camera || !S.renderer || !world) return null;
+  const vector = Array.isArray(world)
+    ? new THREE.Vector3(Number(world[0]) || 0, Number(world[1]) || 0, Number(world[2]) || 0)
+    : new THREE.Vector3(Number(world.x) || 0, Number(world.y) || 0, Number(world.z) || 0);
+  S.camera.updateMatrixWorld();
+  const projected = vector.project(S.camera);
+  const rect = S.renderer.domElement.getBoundingClientRect();
+  return {
+    x: rect.left + ((projected.x + 1) / 2) * rect.width,
+    y: rect.top + ((1 - projected.y) / 2) * rect.height,
+    ndc: [projected.x, projected.y],
+    depth: projected.z,
+  };
+}
+
+function zoomAt(clientX, clientY, factor) {
+  if (!S.camera || !S.controls) return cameraState();
+  const before = pointerPoint(clientX, clientY);
+  const offset = S.camera.position.clone().sub(S.controls.target);
+  const distance = Math.max(S.controls.minDistance,
+    Math.min(S.controls.maxDistance,
+      offset.length() * Math.max(0.01, Number(factor) || 1)));
+  offset.setLength(distance);
+  S.camera.position.copy(S.controls.target).add(offset);
+  S.camera.lookAt(S.controls.target);
+  S.camera.updateMatrixWorld();
+
+  // Normalise the dolly through OrbitControls first (damping, clamps and
+  // orientation), then apply the pointer-plane correction.  Applying the
+  // correction before update() lets the controls' spherical pass shift the
+  // anchor slightly, so the order here is deliberate.
+  S.controls.update();
+  if (before) {
+    const afterPoint = new THREE.Vector3();
+    const afterRay = pointerRay(clientX, clientY);
+    const afterPlane = targetPlane();
+    if (afterRay && afterRay.intersectPlane(afterPlane, afterPoint)) {
+      const shift = new THREE.Vector3(...before).sub(afterPoint);
+      S.camera.position.add(shift);
+      S.controls.target.add(shift);
+      S.camera.lookAt(S.controls.target);
+      S.camera.updateMatrixWorld();
+    }
   }
   requestRender(true);
+  return cameraState();
+}
+
+function zoom(factor) {
+  if (!S.camera || !S.controls) return;
+  const rect = S.renderer.domElement.getBoundingClientRect();
+  zoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, factor);
 }
 
 function setExplode(value) {
   S.explode = Math.max(0, Math.min(2.5, Number(value) || 0));
   applyExplode();
-}
-
-function zoom(factor) {
-  if (!S.camera || !S.controls) return;
-  const offset = S.camera.position.clone().sub(S.controls.target);
-  const distance = Math.max(S.controls.minDistance,
-    Math.min(S.controls.maxDistance, offset.length() * factor));
-  offset.setLength(distance);
-  S.camera.position.copy(S.controls.target).add(offset);
-  S.controls.update();
-  requestRender(true);
 }
 
 function applyExplode() {
@@ -1096,20 +1247,22 @@ function applyExplode() {
   requestRender(true);
 }
 
-function selectByName(name) {
+function applyEmissive() {
   for (const part of S.parts) {
     const material = part.material;
-    if (!material) continue;
+    if (!material?.emissive) continue;
     if (!material.userData.baseEmissive) {
-      material.userData.baseEmissive = material.emissive?.clone?.() || null;
+      material.userData.baseEmissive = material.emissive.clone();
     }
-    if (material.emissive) {
-      if (name && part.name === name) material.emissive.setHex(0x7a5a18);
-      else if (material.userData.baseEmissive) material.emissive.copy(material.userData.baseEmissive);
-      else material.emissive.setHex(0x000000);
-    }
+    if (S.selected && part.name === S.selected) material.emissive.setHex(0x7a5a18);
+    else if (S.highlightParts.has(part.name)) material.emissive.setHex(0x35506d);
+    else material.emissive.copy(material.userData.baseEmissive);
   }
+}
+
+function selectByName(name) {
   S.selected = name || null;
+  applyEmissive();
   requestRender(true);
 }
 

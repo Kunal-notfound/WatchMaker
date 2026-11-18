@@ -352,6 +352,17 @@ class ApiModelSyncTests(unittest.TestCase):
         self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
         return json.loads(raw)
 
+    def scene_signature(self):
+        status, _, raw = self.request("/api/scene?quality=low")
+        self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
+        scene = json.loads(raw)
+        return {
+            "mass_g": scene["mass_g"],
+            "triangles": scene["triangles"],
+            "parts": [(part.get("name"), part.get("bounds"))
+                      for part in scene["parts"]],
+        }
+
     def post_json(self, path, body):
         status, headers, raw = self.request(path, body)
         self.assertEqual(status, 200, raw.decode("utf-8", "replace"))
@@ -541,6 +552,92 @@ class ApiModelSyncTests(unittest.TestCase):
         self.assertGreater(other_second, other_first)
         self.assertLess(other_second, generations[-1],
                         "returning to a session may use a lower generation")
+
+    def test_components_endpoint_exposes_the_authoritative_registry(self):
+        before = self.get_json("/api/state")
+        payload = self.get_json("/api/components")
+        components = {item["id"]: item for item in payload["components"]}
+        self.assertGreaterEqual(len(components), 10)
+        for component_id in ("case", "dial", "hands", "movement", "complications"):
+            self.assertIn(component_id, components)
+            item = components[component_id]
+            self.assertTrue(item["label"])
+            self.assertTrue(item["group"])
+            self.assertTrue(item["parts"])
+            self.assertTrue(item["checks"])
+            self.assertTrue(item["fields"])
+        self.assertIn("dial.diameter_mm", components["dial"]["dimension_fields"])
+        self.assertIn("hour_hand", components["hands"]["parts"])
+        after = self.get_json("/api/state")
+        self.assertEqual(after["revision"], before["revision"])
+        self.assertEqual(after["checksum"], before["checksum"])
+
+    def test_snapshot_does_not_mutate_and_restore_commits_a_new_revision(self):
+        initial = self.get_json("/api/state")
+        initial_revision = int(initial["revision"])
+        initial_version = int(initial["spec"]["data"]["meta"]["version"])
+        initial_checksum = initial["checksum"]
+        initial_geometry = self.scene_signature()
+
+        snapshot, _ = self.post_json("/api/agent/snapshot", {
+            "label": "API snapshot",
+            "expected_revision": initial_revision,
+        })
+        self.assertEqual(int(snapshot["revision"]), initial_revision)
+        self.assertEqual(snapshot["checksum"], initial_checksum)
+        self.assertEqual(snapshot["version"]["label"], "API snapshot")
+        self.assertEqual(snapshot["version"]["kind"], "snapshot")
+
+        unchanged = self.get_json("/api/state")
+        self.assertEqual(int(unchanged["revision"]), initial_revision)
+        self.assertEqual(unchanged["checksum"], initial_checksum)
+        self.assertEqual(int(unchanged["spec"]["data"]["meta"]["version"]),
+                         initial_version)
+
+        history = self.get_json("/api/agent/history")
+        self.assertTrue(any(item["id"] == snapshot["version"]["id"]
+                            and item["kind"] == "snapshot"
+                            for item in history["history"]))
+
+        status, _, _ = self.request("/api/agent/snapshot", {
+            "label": "stale snapshot",
+            "expected_revision": initial_revision - 1,
+        })
+        self.assertEqual(status, 409, "a stale snapshot request must be fenced")
+
+        changed, _ = self.post_json("/api/set", {
+            "path": "dial.color", "value": "blue",
+            "expected_revision": initial_revision,
+        })
+        changed_revision = int(changed["revision"])
+        self.assertNotEqual(changed["checksum"], initial_checksum)
+        self.assertEqual(changed["spec"]["data"]["dial"]["color"], "blue")
+
+        restored, _ = self.post_json("/api/agent/restore", {
+            "id": snapshot["version"]["id"],
+            "expected_revision": changed_revision,
+        })
+        self.assertEqual(int(restored["revision"]), changed_revision + 1)
+        # Restore increments meta.version, which is part of the spec checksum,
+        # so the checksum must change.  The geometry it solves is invariant.
+        self.assertNotEqual(restored["checksum"], initial_checksum)
+        self.assertEqual(self.scene_signature(), initial_geometry,
+                         "restoring a version re-solves the original geometry")
+        self.assertEqual(restored["spec"]["data"]["dial"]["color"],
+                         initial["spec"]["data"]["dial"]["color"])
+        self.assertGreater(int(restored["spec"]["data"]["meta"]["version"]),
+                           int(changed["spec"]["data"]["meta"]["version"]))
+
+        status, _, _ = self.request("/api/agent/restore", {
+            "id": snapshot["version"]["id"],
+            "expected_revision": changed_revision,
+        })
+        self.assertEqual(status, 409, "a stale restore request must be fenced")
+
+        status, _, raw = self.request("/api/agent/restore", {
+            "id": "v9999", "expected_revision": int(restored["revision"]),
+        })
+        self.assertEqual(status, 404, raw.decode("utf-8", "replace"))
 
 
 if __name__ == "__main__":
