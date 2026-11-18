@@ -751,8 +751,13 @@ def _uv_coords(m: Mesh) -> list[tuple[float, float]]:
     return out
 
 
-def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
-    """Single-file glTF 2.0 with one node, mesh and material per part."""
+def to_gltf(meshes: list[Mesh], name: str = "watch",
+            extras: dict | None = None) -> dict:
+    """Single-file glTF 2.0 with one node, mesh and material per part.
+
+    ``extras`` is embedded in ``asset`` so a viewer can verify that the bytes it
+    parsed came from the same design identity announced in the HTTP headers.
+    """
     chunks: list[bytes] = []
     views: list[dict] = []
     accessors: list[dict] = []
@@ -849,7 +854,8 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
 
     buf = b"".join(chunks)
     return {
-        "asset": {"version": "2.0", "generator": "watchcad"},
+        "asset": {"version": "2.0", "generator": "watchcad",
+                  "extras": dict(extras or {})},
         "scene": 0,
         "scenes": [{"nodes": list(range(len(nodes)))}],
         "nodes": nodes,
@@ -862,7 +868,8 @@ def to_gltf(meshes: list[Mesh], name: str = "watch") -> dict:
     }
 
 
-def to_glb(meshes: list[Mesh], name: str = "watch") -> bytes:
+def to_glb(meshes: list[Mesh], name: str = "watch",
+           extras: dict | None = None) -> bytes:
     """Binary glTF 2.0 (GLB) with the same nodes and materials as ``to_gltf``.
 
     The JSON chunk is padded with spaces and the BIN chunk with zeroes to the
@@ -870,7 +877,7 @@ def to_glb(meshes: list[Mesh], name: str = "watch") -> bytes:
     deterministic for a given solved scene, so it can be checksummed alongside
     the other build artefacts.
     """
-    gltf = to_gltf(meshes, name)
+    gltf = to_gltf(meshes, name, extras)
     uri = gltf["buffers"][0].pop("uri", "")
     payload = base64.b64decode(uri.split(",", 1)[1]) if "," in uri else b""
     json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")

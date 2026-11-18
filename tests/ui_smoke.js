@@ -120,7 +120,7 @@ const window = {
 const eventLog = [];
 const watchedEvents = [
   "watchcad:scene-changed", "watchcad:model-url", "watchcad:viewer-model",
-  "watchcad:viewer-stale",
+  "watchcad:viewer-stale", "watchcad:viewer-error", "watchcad:session-changed",
 ];
 for (const type of watchedEvents) {
   window.addEventListener(type, (event) => {
@@ -131,7 +131,15 @@ for (const type of watchedEvents) {
 // The Three.js module cannot run in this DOM-less harness.  This minimal stand-in
 // keeps the same revision/generation fences so the smoke test exercises the
 // complete event path from a committed spec to a rendered-model acknowledgement.
-const fakeViewer = { token: 0, revision: 0, generation: 0 };
+const fakeViewer = { token: 0, sessions: new Map() };
+function viewerStateFor(session) {
+  if (!fakeViewer.sessions.has(session)) {
+    // Generations are session-local: a lower generation from another design is
+    // not an old model for that design.
+    fakeViewer.sessions.set(session, { revision: 0, generation: 0 });
+  }
+  return fakeViewer.sessions.get(session);
+}
 async function simulateViewerLoad(url, expectedRevision) {
   const token = ++fakeViewer.token;
   let base = String(url || "");
@@ -140,6 +148,7 @@ async function simulateViewerLoad(url, expectedRevision) {
     base += `${base.includes("?") ? "&" : "?"}revision=${expectedRevision}`;
   }
   const session = window.localStorage.getItem("watchcad.session") || "default";
+  const state = viewerStateFor(session);
   try {
     const response = await realFetch(BASE + base, {
       headers: { "X-WatchCAD-Session": session },
@@ -156,20 +165,27 @@ async function simulateViewerLoad(url, expectedRevision) {
       }));
       return;
     }
-    if (generation && generation <= fakeViewer.generation && !preview) return;
+    if (generation && generation <= state.generation && !preview) return;
     await response.arrayBuffer();
     if (token !== fakeViewer.token) return;
-    fakeViewer.revision = headerRevision || fakeViewer.revision;
-    fakeViewer.generation = generation || fakeViewer.generation + 1;
+    state.revision = headerRevision || state.revision;
+    state.generation = generation || state.generation + 1;
     window.dispatchEvent(new FakeCustomEvent("watchcad:viewer-model", {
-      detail: { revision: fakeViewer.revision, generation: fakeViewer.generation, preview },
+      detail: {
+        session, preview,
+        revision: state.revision, generation: state.generation,
+      },
     }));
   } catch (error) {
+    if (token !== fakeViewer.token) return;
     window.dispatchEvent(new FakeCustomEvent("watchcad:viewer-error", {
       detail: { message: String(error?.message || error) },
     }));
   }
 }
+window.addEventListener("watchcad:session-changed", () => {
+  fakeViewer.token += 1;
+});
 window.addEventListener("watchcad:scene-changed", (event) => {
   simulateViewerLoad("", Number(event.detail?.revision || 0));
 });
@@ -579,7 +595,8 @@ const waitFor = async (fn, label, timeout = 15000) => {
       "applying requires an explicit confirmation step");
     const modelEventsBeforePreview = eventLog.filter(
       (entry) => entry.type === "watchcad:model-url").length;
-    const generationBeforePreview = fakeViewer.generation;
+    const previewSession = window.localStorage.getItem("watchcad.session") || "default";
+    const generationBeforePreview = viewerStateFor(previewSession).generation;
     await t.previewCandidate(winner.id);
     check(Boolean(t.DESIGN.previewId) && el("btnClearPreview").hidden === false,
       "candidate preview loads a non-mutating 3D scene");

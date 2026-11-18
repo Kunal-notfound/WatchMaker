@@ -216,15 +216,31 @@ function rememberSession(id) {
   if (!id) return;
   const previous = AGENT.sessionId ? String(AGENT.sessionId) : "";
   const next = String(id);
-  if (previous && previous !== next) {
+  const changed = Boolean(previous && previous !== next);
+  if (changed) {
     // A different design session has its own monotonic revision sequence.
     appliedRevision = 0;
     renderedRevision = 0;
+    // A cloned session can have an identical design signature.  Force a scene
+    // reload so the viewer sees the new session identity instead of treating
+    // the unchanged checksum as "already rendered".
+    sceneToken += 1;
+    clearTimeout(sceneTimer);
+    lastSceneSig = "";
+    // A preview token belongs to the session that created it.
+    DESIGN.previewToken += 1;
+    DESIGN.previewId = "";
+    const clear = $("#btnClearPreview");
+    if (clear) clear.hidden = true;
   }
   AGENT.sessionId = id;
   try {
     window.localStorage?.setItem("watchcad.session", next);
   } catch { /* private mode: keep the in-memory value */ }
+  if (changed) {
+    // Invalidate in-flight loads before the new session's scene event arrives.
+    viewerEvent("watchcad:session-changed", { session: next, previous });
+  }
 }
 
 function withSession(url) {
@@ -262,6 +278,21 @@ function responseRevision(payload, name = "X-Design-Revision") {
   const raw = payload?.__headers?.get?.(name);
   const value = Number(raw);
   return Number.isFinite(value) ? value : 0;
+}
+
+function responseHeader(payload, name) {
+  return String(payload?.__headers?.get?.(name) || "");
+}
+
+function livePreviewMeta() {
+  return {
+    session: currentSession(),
+    revision: appliedRevision || Number(STATE?.revision || 0),
+    checksum: String(STATE?.spec?.data?.derived?.checksum || ""),
+    modification_id: String(STATE?.modification_id || ""),
+    preview: false,
+    preview_id: "",
+  };
 }
 
 function revisionedUrl(path, revision) {
@@ -406,6 +437,10 @@ async function boot() {
     const [schema, state] = await Promise.all([api("/api/schema"), api("/api/state")]);
     SCHEMA = schema;
     STATE = state;
+    // /api/state identifies the session that produced this snapshot.  Record it
+    // before any edits so later conversation switches are recognised as real
+    // session changes and can invalidate in-flight scene loads.
+    rememberSession(state.session?.session_id || currentSession());
     appliedRevision = Number(state.revision || 0) || appliedRevision;
     IDEAS = Object.fromEntries((schema.ideas || []).map((item) => [item.id, item.prompt]));
     renderExamples();
@@ -884,7 +919,13 @@ async function previewCandidate(id) {
     if (button) button.hidden = false;
     viewerEvent("watchcad:model-url", {
       url: `/api/model.glb?preview=${encodeURIComponent(payload.preview)}`,
-      revision: appliedRevision,
+      session: currentSession(),
+      revision: received,
+      checksum: String(payload.checksum || ""),
+      modification_id: responseHeader(payload, "X-Modification-ID")
+        || String(STATE?.modification_id || ""),
+      preview: true,
+      preview_id: String(payload.preview || ""),
     });
     toast(`previewing ${candidate.label}; the live design is unchanged`);
   } catch (error) {
@@ -899,7 +940,7 @@ function clearCandidatePreview() {
   DESIGN.previewId = "";
   const button = $("#btnClearPreview");
   if (button) button.hidden = true;
-  viewerEvent("watchcad:model-url", { url: "", revision: appliedRevision });
+  viewerEvent("watchcad:model-url", { url: "", ...livePreviewMeta() });
 }
 
 function armCandidateApply(id) {
@@ -3984,8 +4025,14 @@ async function loadScene(initial = false) {
     prepareMesh(payload);
     renderGroupToggles(payload.tree || {});
     viewerEvent("watchcad:scene-changed", {
-      checksum: sceneSignature(STATE),
+      session: String(payload.session_id || currentSession()),
       revision: received || requestedRevision,
+      checksum: String(payload.checksum || sceneSignature(STATE) || ""),
+      modification_id: String(payload.modification_id
+        || responseHeader(payload, "X-Modification-ID")
+        || STATE?.modification_id || ""),
+      preview: Boolean(payload.preview),
+      preview_id: String(payload.preview_id || ""),
     });
     requestRender();
   } catch (error) {
@@ -4514,6 +4561,7 @@ try {
       get SCHEMA() { return SCHEMA; },
       get CHAT() { return CHAT; },
       get AGENT() { return AGENT; },
+      get DESIGN() { return DESIGN; },
       get V() { return V; },
       modes: AGENT_MODES.slice(),
     }),

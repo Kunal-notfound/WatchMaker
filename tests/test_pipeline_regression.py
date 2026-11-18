@@ -446,6 +446,102 @@ class ApiModelSyncTests(unittest.TestCase):
         self.assertGreater(payload["generation"], 0)
         self.assertEqual(payload["quality"], "low")
 
+    def test_model_and_scene_carry_complete_session_identity(self):
+        state = self.get_json("/api/state")
+        status, headers, raw = self.request("/api/scene?quality=low")
+        self.assertEqual(status, 200)
+        payload = json.loads(raw)
+        for key in ("session_id", "revision", "checksum", "modification_id",
+                    "generation", "preview", "preview_id"):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["session_id"], self.session)
+        self.assertEqual(payload["revision"], int(state["revision"]))
+        self.assertEqual(payload["checksum"], state["checksum"])
+        self.assertEqual(payload["modification_id"], state["modification_id"])
+        self.assertFalse(payload["preview"])
+        self.assertEqual(payload["preview_id"], "")
+        self.assertEqual(self.header(headers, "X-WatchCAD-Session"), self.session)
+        self.assertEqual(self.header(headers, "X-Design-Checksum"), state["checksum"])
+        self.assertEqual(self.header(headers, "X-Modification-ID"),
+                         state["modification_id"])
+        self.assertEqual(self.header(headers, "X-Model-Preview"), "false")
+        self.assertEqual(self.header(headers, "X-Model-Preview-ID"), "")
+
+        status, headers, raw = self.request("/api/model.glb?quality=low")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.header(headers, "X-WatchCAD-Session"), self.session)
+        document = glb_json(raw)
+        embedded = document["asset"]["extras"]["watchcad"]
+        self.assertEqual(embedded["session_id"], self.session)
+        self.assertEqual(embedded["revision"], int(state["revision"]))
+        self.assertEqual(embedded["checksum"], state["checksum"])
+        self.assertEqual(embedded["modification_id"], state["modification_id"])
+        self.assertFalse(embedded["preview"])
+        self.assertEqual(embedded["preview_id"], "")
+
+    def test_preview_identity_is_isolated_from_live_model(self):
+        state = self.get_json("/api/state")
+        payload, _ = self.post_json("/api/optimise/preview", {
+            "changes": [{"path": "case.material", "value": "titanium"}],
+            "baseline_checksum": state["checksum"],
+            "label": "identity preview",
+        })
+        token = payload["preview"]
+        status, headers, raw = self.request(
+            f"/api/model.glb?preview={token}&quality=low")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.header(headers, "X-Model-Preview"), "true")
+        self.assertEqual(self.header(headers, "X-Model-Preview-ID"), token)
+        self.assertEqual(self.header(headers, "X-Design-Checksum"),
+                         payload["checksum"])
+        self.assertNotEqual(payload["checksum"], state["checksum"])
+        embedded = glb_json(raw)["asset"]["extras"]["watchcad"]
+        self.assertTrue(embedded["preview"])
+        self.assertEqual(embedded["preview_id"], token)
+        self.assertEqual(embedded["checksum"], payload["checksum"])
+
+        _, _, live = self.request("/api/model.glb?quality=low")
+        live_embedded = glb_json(live)["asset"]["extras"]["watchcad"]
+        self.assertFalse(live_embedded["preview"])
+        self.assertEqual(live_embedded["preview_id"], "")
+        self.assertEqual(live_embedded["checksum"], state["checksum"])
+        self.assertNotEqual(live, raw)
+
+        _, _, scene_raw = self.request(
+            f"/api/scene?preview={token}&quality=low")
+        scene_payload = json.loads(scene_raw)
+        self.assertTrue(scene_payload["preview"])
+        self.assertEqual(scene_payload["preview_id"], token)
+        self.assertEqual(scene_payload["checksum"], payload["checksum"])
+
+    def test_model_generations_are_session_local(self):
+        other = f"{self.session}-other"
+        generations = []
+        for _ in range(3):
+            status, headers, _ = self.request("/api/model.glb?quality=low")
+            self.assertEqual(status, 200)
+            generations.append(int(self.header(headers, "X-Model-Generation")))
+            self.assertEqual(self.header(headers, "X-WatchCAD-Session"), self.session)
+        self.assertEqual(generations, sorted(set(generations)))
+
+        status, headers, _ = self.request(
+            "/api/model.glb?quality=low",
+            headers={"X-WatchCAD-Session": other})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.header(headers, "X-WatchCAD-Session"), other)
+        other_first = int(self.header(headers, "X-Model-Generation"))
+        self.assertLess(other_first, generations[-1],
+                        "a new session starts its own generation sequence")
+
+        status, headers, _ = self.request(
+            "/api/model.glb?quality=low",
+            headers={"X-WatchCAD-Session": other})
+        self.assertEqual(status, 200)
+        other_second = int(self.header(headers, "X-Model-Generation"))
+        self.assertGreater(other_second, other_first)
+        self.assertLess(other_second, generations[-1],
+                        "returning to a session may use a lower generation")
+
 
 if __name__ == "__main__":
     unittest.main()

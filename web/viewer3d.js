@@ -61,10 +61,29 @@ const S = {
   view: "three",
   frame: 0,
   token: 0,
+  // The newest request always owns the token.  ``activeLoad`` is the only job
+  // allowed to install; ``pendingLoad`` is the newest request that superseded
+  // it, so a burst of edits coalesces into one final load.
+  activeLoad: null,
+  pendingLoad: null,
   expectedRevision: 0,
-  loadedRevision: 0,
-  loadedGeneration: 0,
-  loading: false,
+  expectedChecksum: "",
+  expectedModificationId: "",
+  expectedSession: "",
+  expectedPreview: false,
+  expectedPreviewId: "",
+  loaded: {
+    session: "", revision: 0, checksum: "", generation: 0,
+    modificationId: "", preview: false, previewId: "",
+  },
+  lastEmbeddedIdentity: emptyIdentity(),
+  loadStats: { started: 0, installed: 0, stale: 0, errors: 0, sessionResets: 0 },
+  stats: {
+    frames: 0, renders: 0, disposedGeometries: 0,
+    disposedMaterials: 0, disposedTextures: 0,
+  },
+  listeners: [],
+  resizeObserver: null,
   disposed: false,
   shadowPlane: null,
   dirty: true,
@@ -79,7 +98,10 @@ if (!BACKGROUNDS[S.background]) S.background = "studio";
 
 function sessionId() {
   try {
-    return window.localStorage?.getItem("watchcad.session") || "default";
+    // app.js creates the browser session before /api/state arrives; using its
+    // helper keeps the viewer header identical to every other API request.
+    return window.currentSession?.()
+      || window.localStorage?.getItem("watchcad.session") || "default";
   } catch {
     return "default";
   }
@@ -87,6 +109,28 @@ function sessionId() {
 
 function emit(name, detail) {
   try { window.dispatchEvent(new CustomEvent(name, { detail })); } catch { /* no events */ }
+}
+
+/* Every listener the viewer owns is tracked so pagehide can remove all of them
+   and browser tests can prove repeated model swaps do not accumulate any. */
+function track(target, type, fn, options) {
+  if (!target?.addEventListener) return;
+  target.addEventListener(type, fn, options);
+  S.listeners.push({ target, type, fn, options });
+}
+
+function untrackAll() {
+  for (const entry of S.listeners) {
+    try { entry.target.removeEventListener(entry.type, entry.fn, entry.options); }
+    catch { /* already gone */ }
+  }
+  S.listeners.length = 0;
+}
+
+function listenerCounts() {
+  const counts = {};
+  for (const entry of S.listeners) counts[entry.type] = (counts[entry.type] || 0) + 1;
+  return counts;
 }
 
 function setStatus(text) {
@@ -132,7 +176,7 @@ function init() {
   controls.minDistance = 6;
   controls.maxDistance = 900;
   controls.screenSpacePanning = true;
-  controls.addEventListener("change", () => requestRender());
+  track(controls, "change", () => requestRender());
 
   const key = new THREE.DirectionalLight(0xfff3df, 3.1);
   key.position.set(-60, -70, 110);
@@ -170,7 +214,6 @@ function init() {
 
   document.body.classList.add("webgl3d");
   bindEvents();
-  S.controls.addEventListener("change", () => requestRender());
   resize();
   placeCamera("three", true);
   requestRender(true);
@@ -188,12 +231,27 @@ function init() {
     clearSelection: () => selectByName(null),
     setQuality: (name) => setQuality(name),
     setModelUrl: (url, meta) => {
-      S.modelUrl = String(url || "");
-      S.expectedRevision = Number(meta?.revision || 0);
+      setExpectedFromDetail({ ...(meta || {}), session: meta?.session || sessionId() },
+        String(url || ""));
       load();
     },
-    get loadedRevision() { return S.loadedRevision; },
-    get loadedGeneration() { return S.loadedGeneration; },
+    get loadedRevision() { return S.loaded.revision; },
+    get loadedGeneration() { return S.loaded.generation; },
+    get identity() { return { ...S.loaded }; },
+    get expected() {
+      return {
+        session: S.expectedSession, revision: S.expectedRevision,
+        checksum: S.expectedChecksum, generation: S.loaded.generation,
+        modificationId: S.expectedModificationId,
+        preview: S.expectedPreview, previewId: S.expectedPreviewId,
+      };
+    },
+    get loadStats() { return { ...S.loadStats }; },
+    get activeLoads() { return S.activeLoad ? 1 : 0; },
+    get pendingLoads() { return S.pendingLoad ? 1 : 0; },
+    get disposed() { return S.disposed; },
+    modelSnapshot: () => modelSnapshot(),
+    resourceStats: () => resourceStats(),
     getQuality: () => S.quality,
     setBackground: (name) => setBackground(name),
     getBackground: () => S.background,
@@ -206,57 +264,59 @@ function init() {
 function bindEvents() {
   const el = S.renderer.domElement;
   let down = null;
-  el.addEventListener("pointerdown", (event) => {
+  track(el, "pointerdown", (event) => {
     down = { x: event.clientX, y: event.clientY, button: event.button };
   });
-  el.addEventListener("pointerup", (event) => {
+  track(el, "pointerup", (event) => {
     const start = down;
     down = null;
     if (!start || start.button !== 0) return;
     if (Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) return;
     pick(event.clientX, event.clientY);
   });
-  el.addEventListener("pointerleave", () => { down = null; });
-  el.addEventListener("dblclick", () => placeCamera("three", true));
-  el.addEventListener("contextmenu", (event) => event.preventDefault());
-  el.addEventListener("webglcontextlost", (event) => {
+  track(el, "pointerleave", () => { down = null; });
+  track(el, "dblclick", () => placeCamera("three", true));
+  track(el, "contextmenu", (event) => event.preventDefault());
+  track(el, "webglcontextlost", (event) => {
     event.preventDefault();
     document.body?.classList.remove("webgl3d");
     emit("watchcad:viewer-error", {
       message: "WebGL context lost; the software viewport is active again",
     });
   });
-  window.addEventListener("resize", () => resize());
-  window.addEventListener("pagehide", () => disposeAll());
+  track(window, "resize", () => resize());
+  track(window, "pagehide", () => disposeAll());
 
-  window.addEventListener("watchcad:scene-changed", (event) => {
-    S.modelUrl = "";
-    S.expectedRevision = Number(event.detail?.revision || 0);
+  track(window, "watchcad:session-changed", (event) =>
+    handleSessionChange(event.detail?.session));
+  track(window, "watchcad:scene-changed", (event) => {
+    setExpectedFromDetail(event.detail || {}, "");
     load();
   });
-  window.addEventListener("watchcad:model-url", (event) => {
-    S.modelUrl = String(event.detail?.url || "");
-    S.expectedRevision = Number(event.detail?.revision || 0);
+  track(window, "watchcad:model-url", (event) => {
+    setExpectedFromDetail(event.detail || {},
+      String(event.detail?.url || ""));
     load();
   });
-  window.addEventListener("watchcad:render-status", (event) => {
+  track(window, "watchcad:render-status", (event) => {
     const status = event.detail || {};
     if (status.status === "failed" && status.error) {
       setStatus(`render failed: ${String(status.error).slice(0, 120)}`);
     }
   });
-  window.addEventListener("watchcad:view", (event) => placeCamera(event.detail?.name, true));
-  window.addEventListener("watchcad:explode", (event) => setExplode(Number(event.detail?.value) || 0));
-  window.addEventListener("watchcad:zoom", (event) => zoom(Number(event.detail?.factor) || 1));
-  window.addEventListener("watchcad:visibility", (event) => setVisibility(event.detail || {}));
-  window.addEventListener("watchcad:select-part", (event) =>
+  track(window, "watchcad:view", (event) => placeCamera(event.detail?.name, true));
+  track(window, "watchcad:explode", (event) => setExplode(Number(event.detail?.value) || 0));
+  track(window, "watchcad:zoom", (event) => zoom(Number(event.detail?.factor) || 1));
+  track(window, "watchcad:visibility", (event) => setVisibility(event.detail || {}));
+  track(window, "watchcad:select-part", (event) =>
     selectByName(event.detail?.name || null));
-  window.addEventListener("watchcad:clear-selection", () => selectByName(null));
-  window.addEventListener("watchcad:quality", (event) => setQuality(event.detail?.name));
-  window.addEventListener("watchcad:background", (event) => setBackground(event.detail?.name));
+  track(window, "watchcad:clear-selection", () => selectByName(null));
+  track(window, "watchcad:quality", (event) => setQuality(event.detail?.name));
+  track(window, "watchcad:background", (event) => setBackground(event.detail?.name));
 
   if (window.ResizeObserver) {
-    new ResizeObserver(() => resize()).observe(el.parentElement || el);
+    S.resizeObserver = new ResizeObserver(() => resize());
+    S.resizeObserver.observe(el.parentElement || el);
   }
 }
 
@@ -282,19 +342,23 @@ function scheduleFrame() {
 function renderFrame() {
   S.frame = 0;
   if (S.disposed || !S.renderer) return;
+  S.stats.frames += 1;
   const moved = Boolean(S.controls.update());
   if (moved || S.dirty) {
     S.dirty = false;
     S.renderer.render(S.scene, S.camera);
+    S.stats.renders += 1;
   }
   if (moved || S.dirty) scheduleFrame();
 }
 
 function renderNow() {
   if (S.disposed || !S.renderer) return;
+  S.stats.frames += 1;
   S.controls.update();
   S.dirty = false;
   S.renderer.render(S.scene, S.camera);
+  S.stats.renders += 1;
 }
 
 function requestRender(force = false) {
@@ -342,121 +406,413 @@ function fitDistance() {
   return Math.max(12, (S.radius || 25) / Math.sin(fov / 2) * 1.18);
 }
 
-async function load() {
-  if (!S.renderer) return;
-  if (S.loading) { S.pending = true; return; }
-  S.loading = true;
-  const token = ++S.token;
-  const expectedRevision = S.expectedRevision;
+function positiveInt(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+}
+
+function emptyIdentity(session = "") {
+  return {
+    session: String(session || ""), revision: 0, checksum: "", generation: 0,
+    modificationId: "", preview: false, previewId: "",
+  };
+}
+
+function publicJob(job) {
+  return {
+    session: job.session, revision: job.revision, checksum: job.checksum,
+    modificationId: job.modificationId, preview: job.preview,
+    previewId: job.previewId, generation: S.loaded.generation, token: job.token,
+  };
+}
+
+function setExpectedFromDetail(detail, url) {
+  S.modelUrl = String(url || "");
+  S.expectedSession = String(detail.session || sessionId() || "default");
+  S.expectedRevision = positiveInt(detail.revision);
+  S.expectedChecksum = String(detail.checksum || "");
+  S.expectedModificationId = String(detail.modification_id || detail.modificationId || "");
+  S.expectedPreview = detail.preview === true || detail.preview === "true";
+  S.expectedPreviewId = String(detail.preview_id || detail.previewId || "");
+}
+
+function invalidateLoads() {
+  S.token += 1;
+  if (S.activeLoad) {
+    try { S.activeLoad.controller.abort(); } catch { /* already finished */ }
+    S.activeLoad = null;
+  }
+  S.pendingLoad = null;
+}
+
+function handleSessionChange(session) {
+  const next = String(session || sessionId() || "default");
+  if (next === S.expectedSession && next === S.loaded.session) return;
+  // A generation is only comparable inside its own session.  Drop the fence,
+  // cancel every load from the previous session, but keep the last good root
+  // on screen until the new session delivers a valid replacement.
+  invalidateLoads();
+  S.expectedSession = next;
+  S.expectedRevision = 0;
+  S.expectedChecksum = "";
+  S.expectedModificationId = "";
+  S.expectedPreview = false;
+  S.expectedPreviewId = "";
+  S.modelUrl = "";
+  S.loaded = emptyIdentity(next);
+  S.lastEmbeddedIdentity = emptyIdentity(next);
+  S.loadStats.sessionResets += 1;
+  S.tree = {};
+  S.groups.clear();
+  setStatus(`session ${next.slice(-8)} — loading design…`);
+}
+
+function load() {
+  if (!S.renderer || S.disposed) return;
+  // Every request gets a fresh token, even while another load is in flight.
+  // The old fetch is aborted at once and cannot install or acknowledge anything.
+  if (S.activeLoad) {
+    try { S.activeLoad.controller.abort(); } catch { /* already finished */ }
+    S.activeLoad = null;
+  }
+  const request = {
+    token: ++S.token,
+    session: S.expectedSession || sessionId(),
+    modelUrl: S.modelUrl,
+    revision: S.expectedRevision,
+    checksum: S.expectedChecksum,
+    modificationId: S.expectedModificationId,
+    preview: S.expectedPreview,
+    previewId: S.expectedPreviewId,
+  };
+  // A burst of edits overwrites the pending slot: only the newest one runs.
+  S.pendingLoad = request;
+  pumpLoads();
+}
+
+function pumpLoads() {
+  if (S.activeLoad || !S.pendingLoad || S.disposed) return;
+  const request = S.pendingLoad;
+  S.pendingLoad = null;
+  const job = { ...request, controller: new AbortController() };
+  S.activeLoad = job;
+  S.loadStats.started += 1;
   setStatus("loading 3D model…");
+  void runLoad(job);
+}
+
+function isCurrent(job) {
+  return !S.disposed && S.activeLoad === job && job.token === S.token;
+}
+
+function modelUrlFor(request) {
+  const base = request.modelUrl
+    || `/api/model.glb?quality=${encodeURIComponent(S.quality)}`;
+  return request.revision && !/[?&]revision=/.test(base)
+    ? `${base}${base.includes("?") ? "&" : "?"}revision=${request.revision}`
+    : base;
+}
+
+function identityFromHeaders(headers) {
+  return {
+    session: String(headers?.get?.("X-WatchCAD-Session") || ""),
+    revision: positiveInt(headers?.get?.("X-Design-Revision")),
+    checksum: String(headers?.get?.("X-Design-Checksum") || ""),
+    generation: positiveInt(headers?.get?.("X-Model-Generation")),
+    modificationId: String(headers?.get?.("X-Modification-ID") || ""),
+    preview: headers?.get?.("X-Model-Preview") === "true",
+    previewId: String(headers?.get?.("X-Model-Preview-ID") || ""),
+  };
+}
+
+function identityFromObject(value) {
+  const source = value?.watchcad || value || {};
+  return {
+    session: String(source.session_id || source.session || ""),
+    revision: positiveInt(source.revision),
+    checksum: String(source.checksum || ""),
+    generation: positiveInt(source.generation),
+    modificationId: String(source.modification_id || source.modificationId || ""),
+    preview: source.preview === true || source.preview === "true",
+    previewId: String(source.preview_id || source.previewId || ""),
+  };
+}
+
+function identityMismatch(actual, expected) {
+  if (expected.session && actual.session !== expected.session) return "session";
+  if (expected.revision && actual.revision !== expected.revision) return "revision";
+  if (expected.checksum && actual.checksum !== expected.checksum) return "checksum";
+  if (expected.modificationId
+      && actual.modificationId !== expected.modificationId) return "modification";
+  if (Boolean(actual.preview) !== Boolean(expected.preview)) return "preview";
+  if (expected.previewId && actual.previewId !== expected.previewId) return "preview-id";
+  if (!expected.preview && actual.previewId) return "preview-id";
+  return "";
+}
+
+function generationMismatch(identity) {
+  if (!identity.generation) return "missing-generation";
+  if (S.loaded.session && identity.session !== S.loaded.session) return "session-fence";
+  if (S.loaded.generation && identity.generation <= S.loaded.generation) {
+    return "generation";
+  }
+  return "";
+}
+
+function emitStale(job, reason, received, source) {
+  S.loadStats.stale += 1;
+  emit("watchcad:viewer-stale", {
+    reason, source, expected: publicJob(job), received: { ...received },
+  });
+}
+
+function emitLoadError(job, error) {
+  S.loadStats.errors += 1;
+  const message = String(error?.message || error);
+  console.warn("3D model load failed", error);
+  setStatus(`3D model failed: ${message}`);
+  emit("watchcad:viewer-error", {
+    message, expected: publicJob(job),
+  });
+}
+
+function embeddedIdentity(gltf) {
+  const asset = gltf?.parser?.json?.asset || gltf?.asset || {};
+  return identityFromObject(asset.extras);
+}
+
+async function runLoad(job) {
   try {
-    const base = S.modelUrl
-      || `/api/model.glb?quality=${encodeURIComponent(S.quality)}`;
-    const url = expectedRevision && !/[?&]revision=/.test(base)
-      ? `${base}${base.includes("?") ? "&" : "?"}revision=${expectedRevision}`
-      : base;
-    const response = await fetch(url, {
-      headers: { "X-WatchCAD-Session": sessionId() },
+    const response = await fetch(modelUrlFor(job), {
+      headers: { "X-WatchCAD-Session": job.session },
+      signal: job.controller.signal,
       cache: "no-store",
     });
-    if (token !== S.token) return;
+    if (!isCurrent(job)) return;
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    const headerRevision = Number(response.headers?.get?.("X-Design-Revision") || 0);
-    const generation = Number(response.headers?.get?.("X-Model-Generation") || 0);
-    const preview = response.headers?.get?.("X-Model-Preview") === "true";
-    if (expectedRevision && headerRevision && headerRevision !== expectedRevision) {
-      emit("watchcad:viewer-stale", {
-        expected: expectedRevision, received: headerRevision,
-      });
+    const identity = identityFromHeaders(response.headers);
+    const mismatch = identityMismatch(identity, job);
+    if (mismatch) {
+      emitStale(job, `header-${mismatch}`, identity, "headers");
       return;
     }
-    if (generation && generation <= S.loadedGeneration && !preview) return;
+    const generation = generationMismatch(identity);
+    if (generation) {
+      emitStale(job, generation, identity, "generation");
+      return;
+    }
 
     const buffer = await response.arrayBuffer();
-    if (token !== S.token) return;
-
+    if (!isCurrent(job)) return;
     const gltf = await new Promise((resolve, reject) => {
       S.loader.parse(buffer, "", resolve, reject);
     });
-    if (token !== S.token) return;
-    install(gltf, { preserveCamera: Boolean(S.root) });
-    await loadGroups(expectedRevision, token);
-    if (token !== S.token) return;
-    S.loadedRevision = headerRevision || S.loadedRevision;
-    S.loadedGeneration = generation || S.loadedGeneration + 1;
-    setStatus(`${S.parts.length} parts · PBR / IBL · r${S.loadedRevision}`);
-    emit("watchcad:viewer-model", {
-      parts: S.parts.length,
-      revision: S.loadedRevision,
-      generation: S.loadedGeneration,
-      preview,
-    });
+    if (!isCurrent(job)) return;
+
+    const embedded = embeddedIdentity(gltf);
+    if (!embedded.session && !embedded.revision && !embedded.checksum) {
+      emitLoadError(job, new Error("GLB is missing design identity metadata"));
+      return;
+    }
+    const embeddedMismatch = identityMismatch(embedded, identity);
+    if (embeddedMismatch) {
+      emitStale(job, `glb-${embeddedMismatch}`, embedded, "glb");
+      return;
+    }
+
+    // prepareModel builds and validates a complete replacement without touching
+    // the current root, so a malformed GLB cannot blank the last good design.
+    const prepared = prepareModel(gltf);
+    if (!isCurrent(job)) { disposeObject(prepared.root); return; }
+    install(prepared);
+    await loadGroups(job, identity);
+    if (!isCurrent(job)) return;
+    commitLoaded(identity, embedded);
   } catch (error) {
-    if (token !== S.token) return;
-    console.warn("3D model load failed", error);
-    setStatus(`3D model failed: ${error.message || error}`);
-    emit("watchcad:viewer-error", { message: String(error?.message || error) });
+    if (!isCurrent(job) || job.controller.signal.aborted) return;
+    emitLoadError(job, error);
   } finally {
-    S.loading = false;
-    if (S.pending) { S.pending = false; load(); }
+    if (S.activeLoad === job) {
+      S.activeLoad = null;
+      pumpLoads();
+    }
   }
 }
 
-function install(gltf, options = {}) {
-  const preserveCamera = Boolean(options.preserveCamera && S.root);
+async function loadGroups(job, modelIdentity) {
+  try {
+    const base = `/api/scene?quality=${encodeURIComponent(S.quality)}`;
+    const url = job.revision ? `${base}&revision=${job.revision}` : base;
+    const response = await fetch(url, {
+      headers: { "X-WatchCAD-Session": job.session },
+      signal: job.controller.signal,
+      cache: "no-store",
+    });
+    if (!isCurrent(job)) return;
+    if (!response.ok) return;
+    const headerIdentity = identityFromHeaders(response.headers);
+    const headerMismatch = identityMismatch(headerIdentity, modelIdentity);
+    if (headerMismatch) {
+      emitStale(job, `scene-header-${headerMismatch}`, headerIdentity, "scene-headers");
+      return;
+    }
+    const payload = await response.json();
+    if (!isCurrent(job)) return;
+    const payloadIdentity = identityFromObject(payload);
+    const payloadMismatch = identityMismatch(payloadIdentity, modelIdentity);
+    if (payloadMismatch) {
+      emitStale(job, `scene-${payloadMismatch}`, payloadIdentity, "scene");
+      return;
+    }
+    S.tree = payload.tree || {};
+    S.groups.clear();
+    for (const [group, names] of Object.entries(S.tree)) {
+      for (const name of names) S.groups.set(name, group);
+    }
+    for (const part of S.parts) {
+      if (!part.userData.group) part.userData.group = S.groups.get(part.name) || "Parts";
+    }
+    applyVisibility();
+  } catch (error) {
+    if (!isCurrent(job) || job.controller.signal.aborted) return;
+    console.warn("group metadata unavailable", error);
+  }
+}
+
+function geometryFingerprint(geometry) {
+  const attribute = geometry?.getAttribute?.("position");
+  if (!attribute) return "none:0";
+  const stride = Math.max(1, Math.floor(attribute.count / 256));
+  let hash = 2166136261;
+  for (let index = 0; index < attribute.count; index += stride) {
+    for (let axis = 0; axis < 3; axis += 1) {
+      hash ^= Math.round(attribute.getComponent(index, axis) * 1000);
+      hash = Math.imul(hash, 16777619);
+    }
+  }
+  return `${(hash >>> 0).toString(16).padStart(8, "0")}:${attribute.count}`;
+}
+
+function boxData(box) {
+  if (!box || (typeof box.isEmpty === "function" && box.isEmpty())) return null;
+  const round = (value) => Math.round(value * 1000) / 1000;
+  return {
+    min: box.min.toArray().map(round),
+    max: box.max.toArray().map(round),
+    size: box.getSize(new THREE.Vector3()).toArray().map(round),
+  };
+}
+
+function prepareModel(gltf) {
+  const root = gltf.scene || gltf.scenes?.[0];
+  if (!root) throw new Error("glTF contained no scene");
+  const parts = [];
+  const box = new THREE.Box3();
+  root.updateMatrixWorld(true);
+  try {
+    root.traverse((child) => {
+      if (!child.isMesh) return;
+      const role = child.userData?.role || child.parent?.userData?.role || "part";
+      const sourceMaterials = Array.isArray(child.material)
+        ? child.material : [child.material];
+      const material = makeMaterial(child.material, role);
+      child.material = material;
+      for (const source of sourceMaterials) {
+        if (source && source !== material) source.dispose?.();
+      }
+      child.castShadow = role !== "crystal";
+      child.receiveShadow = true;
+      child.userData.role = role;
+      child.userData.baseZ = 0;
+      child.geometry?.computeBoundingBox?.();
+      child.userData.geometryBounds = boxData(child.geometry?.boundingBox);
+      child.userData.fingerprint = geometryFingerprint(child.geometry);
+      parts.push(child);
+      box.expandByObject(child);
+    });
+    if (!parts.length || box.isEmpty()) throw new Error("glTF contained no meshes");
+    const center = box.getCenter(new THREE.Vector3());
+    const radius = box.getSize(new THREE.Vector3()).length() / 2 || 25;
+    root.position.set(-center.x, -center.y, -center.z);
+    root.updateMatrixWorld(true);
+    for (const part of parts) {
+      const partBox = new THREE.Box3().setFromObject(part);
+      part.userData.explodeCenter = partBox.getCenter(new THREE.Vector3())
+        .sub(root.position);
+    }
+    return { root, parts, bounds: box.clone(), radius };
+  } catch (error) {
+    disposeObject(root);
+    throw error;
+  }
+}
+
+function install(model) {
+  const preserveCamera = Boolean(S.root);
   if (S.root) {
     S.scene.remove(S.root);
     disposeObject(S.root);
     S.root = null;
   }
-  const root = gltf.scene || gltf.scenes?.[0];
-  if (!root) throw new Error("glTF contained no scene");
-  S.root = root;
-  S.parts = [];
-  const box = new THREE.Box3();
-  root.updateMatrixWorld(true);
-
-  root.traverse((child) => {
-    if (!child.isMesh) return;
-    const role = child.userData?.role || child.parent?.userData?.role || "part";
-    const sourceMaterials = Array.isArray(child.material)
-      ? child.material : [child.material];
-    const material = makeMaterial(child.material, role);
-    child.material = material;
-    for (const source of sourceMaterials) source?.dispose?.();
-    child.castShadow = role !== "crystal";
-    child.receiveShadow = true;
-    child.userData.role = role;
-    child.userData.baseZ = 0;
-    S.parts.push(child);
-    box.expandByObject(child);
-  });
-
-  if (box.isEmpty()) throw new Error("glTF contained no meshes");
-  S.bounds = box;
-  const center = box.getCenter(new THREE.Vector3());
-  S.radius = box.getSize(new THREE.Vector3()).length() / 2 || 25;
-
-  // Centre the assembly on the origin so orbiting feels natural.  The camera
-  // and all explode offsets work in this centred frame.
-  root.position.set(-center.x, -center.y, -center.z);
-  root.updateMatrixWorld(true);
+  S.root = model.root;
+  S.parts = model.parts;
+  S.bounds = model.bounds;
+  S.radius = model.radius;
   S.center.set(0, 0, 0);
-
-  // Per-part centres in the root's local frame (translate by the root offset).
-  for (const part of S.parts) {
-    const partBox = new THREE.Box3().setFromObject(part);
-    part.userData.explodeCenter = partBox.getCenter(new THREE.Vector3()).sub(root.position);
-  }
-
-  S.scene.add(root);
+  S.scene.add(model.root);
   installShadowPlane();
   aimKeyLight();
   applyVisibility();
   applyExplode();
   if (preserveCamera) requestRender(true);
   else placeCamera(S.view, true);
+}
+
+function commitLoaded(identity, embedded) {
+  S.loaded = { ...identity };
+  S.lastEmbeddedIdentity = { ...embedded };
+  S.loadStats.installed += 1;
+  setStatus(`${S.parts.length} parts · PBR / IBL · r${S.loaded.revision}`);
+  emit("watchcad:viewer-model", {
+    parts: S.parts.length,
+    ...{ ...identity },
+  });
+}
+
+function modelSnapshot() {
+  return {
+    ready: Boolean(S.root),
+    session: S.loaded.session,
+    revision: S.loaded.revision,
+    generation: S.loaded.generation,
+    checksum: S.loaded.checksum,
+    modificationId: S.loaded.modificationId,
+    preview: S.loaded.preview,
+    previewId: S.loaded.previewId,
+    identity: { ...S.loaded },
+    embeddedIdentity: { ...S.lastEmbeddedIdentity },
+    expected: {
+      session: S.expectedSession, revision: S.expectedRevision,
+      checksum: S.expectedChecksum, modificationId: S.expectedModificationId,
+      preview: S.expectedPreview, previewId: S.expectedPreviewId,
+    },
+    bounds: boxData(S.bounds),
+    parts: S.parts.map((part) => ({
+      name: part.name,
+      role: part.userData.role || "part",
+      vertices: part.geometry?.getAttribute?.("position")?.count || 0,
+      fingerprint: part.userData.fingerprint || "",
+      bounds: part.userData.geometryBounds || boxData(part.geometry?.boundingBox),
+      color: part.material?.color?.getHexString?.() || "",
+      materialType: part.material?.type || "",
+      visible: Boolean(part.visible),
+      group: groupOf(part),
+    })),
+    loadStats: { ...S.loadStats },
+    activeLoads: S.activeLoad ? 1 : 0,
+    pendingLoads: S.pendingLoad ? 1 : 0,
+  };
 }
 
 function makeMaterial(source, role) {
@@ -665,8 +1021,7 @@ function setBackground(name) {
 function installShadowPlane() {
   if (S.shadowPlane) {
     S.scene.remove(S.shadowPlane);
-    S.shadowPlane.geometry.dispose();
-    S.shadowPlane.material.dispose();
+    disposeObject(S.shadowPlane);
   }
   const size = S.radius * 6;
   const plane = new THREE.Mesh(
@@ -694,34 +1049,6 @@ function aimKeyLight() {
   cam.near = 1;
   cam.far = r * 9;
   cam.updateProjectionMatrix();
-}
-
-async function loadGroups(expectedRevision = 0, token = 0) {
-  try {
-    const base = `/api/scene?quality=${encodeURIComponent(S.quality)}`;
-    const url = expectedRevision ? `${base}&revision=${expectedRevision}` : base;
-    const response = await fetch(url, {
-      headers: { "X-WatchCAD-Session": sessionId() },
-      cache: "no-store",
-    });
-    if (token && token !== S.token) return;
-    if (!response.ok) return;
-    const received = Number(response.headers?.get?.("X-Design-Revision") || 0);
-    if (expectedRevision && received && received !== expectedRevision) return;
-    const payload = await response.json();
-    if (token && token !== S.token) return;
-    S.tree = payload.tree || {};
-    S.groups.clear();
-    for (const [group, names] of Object.entries(S.tree)) {
-      for (const name of names) S.groups.set(name, group);
-    }
-    for (const part of S.parts) {
-      if (!part.userData.group) part.userData.group = S.groups.get(part.name) || "Parts";
-    }
-    applyVisibility();
-  } catch (error) {
-    console.warn("group metadata unavailable", error);
-  }
 }
 
 function groupOf(part) {
@@ -813,26 +1140,90 @@ function pick(clientX, clientY) {
 }
 
 function disposeObject(object) {
-  object.traverse((child) => {
+  object?.traverse?.((child) => {
     if (!child.isMesh) return;
     child.geometry?.dispose?.();
+    S.stats.disposedGeometries += 1;
     const materials = Array.isArray(child.material) ? child.material : [child.material];
-    for (const material of materials) material?.dispose?.();
+    for (const material of materials) {
+      // Cached procedural textures are shared by later models; disposing a
+      // material must never dispose those textures.
+      material?.dispose?.();
+      S.stats.disposedMaterials += 1;
+    }
   });
+}
+
+function resourceStats() {
+  const geometries = new Set();
+  const materials = new Set();
+  const textures = new Set();
+  S.scene?.traverse((child) => {
+    if (!child.isMesh) return;
+    if (child.geometry) geometries.add(child.geometry);
+    const list = Array.isArray(child.material) ? child.material : [child.material];
+    for (const material of list) {
+      if (!material) continue;
+      materials.add(material);
+      for (const value of Object.values(material)) {
+        if (value?.isTexture) textures.add(value);
+      }
+    }
+  });
+  const cached = [...S.textureCache.values()];
+  return {
+    geometries: geometries.size,
+    materials: materials.size,
+    textures: textures.size,
+    textureCache: cached.length,
+    cachedTexturesReferenced: cached.filter((texture) => textures.has(texture)).length,
+    rendererGeometries: S.renderer?.info?.memory?.geometries ?? 0,
+    rendererTextures: S.renderer?.info?.memory?.textures ?? 0,
+    renderCalls: S.renderer?.info?.render?.calls ?? 0,
+    frames: S.stats.frames,
+    renders: S.stats.renders,
+    disposedGeometries: S.stats.disposedGeometries,
+    disposedMaterials: S.stats.disposedMaterials,
+    disposedTextures: S.stats.disposedTextures,
+    listeners: listenerCounts(),
+    activeLoads: S.activeLoad ? 1 : 0,
+    pendingLoads: S.pendingLoad ? 1 : 0,
+    framePending: Boolean(S.frame),
+    disposed: S.disposed,
+  };
 }
 
 function disposeAll() {
   if (S.disposed) return;
   S.disposed = true;
-  S.token += 1;
+  invalidateLoads();
   if (S.frame && window.cancelAnimationFrame) window.cancelAnimationFrame(S.frame);
   S.frame = 0;
-  if (S.root) disposeObject(S.root);
-  for (const texture of S.textureCache.values()) texture?.dispose?.();
+  if (S.root) {
+    S.scene?.remove(S.root);
+    disposeObject(S.root);
+    S.root = null;
+    S.parts = [];
+  }
+  if (S.shadowPlane) {
+    S.scene?.remove(S.shadowPlane);
+    disposeObject(S.shadowPlane);
+    S.shadowPlane = null;
+  }
+  for (const texture of S.textureCache.values()) {
+    texture?.dispose?.();
+    S.stats.disposedTextures += 1;
+  }
   S.textureCache.clear();
   S.keyLight?.shadow?.map?.dispose?.();
+  if (S.keyLight?.shadow) S.keyLight.shadow.map = null;
   S.env?.dispose?.();
+  try { S.resizeObserver?.disconnect?.(); } catch { /* detached */ }
+  S.resizeObserver = null;
+  untrackAll();
+  S.controls?.dispose?.();
   S.renderer?.dispose?.();
+  S.scene?.clear?.();
 }
 
 if (init()) {

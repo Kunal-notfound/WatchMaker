@@ -301,15 +301,28 @@ class Studio:
             self.generation += 1
             return self.generation
 
-    def model_headers(self, generation: int, preview: bool = False) -> dict:
-        """Headers that bind an artifact to the design that produced it."""
+    def model_headers(self, generation: int, preview: bool = False, *,
+                      session_id: str = "", checksum: str | None = None,
+                      modification_id: str | None = None,
+                      preview_id: str = "") -> dict:
+        """Headers that bind an artifact to the design that produced it.
+
+        A generation is only meaningful inside one design session, so the
+        session id travels with every other identity field.  Previews carry
+        their own checksum and token; they must never be mistaken for the live
+        design at the same revision.
+        """
         with self.lock:
             return {
                 "X-Design-Revision": str(self.revision),
-                "X-Design-Checksum": str(self.solved.get("derived.checksum") or ""),
+                "X-Design-Checksum": str(
+                    checksum if checksum is not None
+                    else self.solved.get("derived.checksum") or ""),
                 "X-Model-Generation": str(generation),
                 "X-Model-Preview": "true" if preview else "false",
-                "X-Modification-ID": str(self.modification_id),
+                "X-Model-Preview-ID": str(preview_id or ""),
+                "X-Modification-ID": str(modification_id or self.modification_id),
+                "X-WatchCAD-Session": str(session_id or "default"),
             }
 
     def scene_for(self, quality: str = "high") -> dict:
@@ -868,8 +881,11 @@ class Handler(BaseHTTPRequestHandler):
         elif route in ("/api/scene", "/api/model.glb"):
             quality = (query.get("quality") or ["high"])[0]
             requested_revision = (query.get("revision") or [""])[0]
+            session_id = self._session_id(query)
+            preview_token = str((query.get("preview") or [""])[0] or "")
             entry = self._preview_entry(query)
             preview = entry["spec"] if entry else None
+            preview_id = preview_token if preview is not None else ""
             with studio.lock:
                 if requested_revision not in ("", None):
                     try:
@@ -883,11 +899,17 @@ class Handler(BaseHTTPRequestHandler):
                 if preview is not None:
                     scene = build_scene(preview, quality)
                     name = preview.get("meta.name") or "watch"
+                    checksum = str(preview.get("derived.checksum") or "")
                 else:
                     scene = studio.scene_for(quality)
                     name = studio.solved.get("meta.name") or "watch"
+                    checksum = str(studio.solved.get("derived.checksum") or "")
                 generation = studio.next_generation()
-                headers = studio.model_headers(generation, preview=preview is not None)
+                headers = studio.model_headers(
+                    generation, preview=preview is not None,
+                    session_id=session_id, checksum=checksum,
+                    preview_id=preview_id,
+                )
                 if route == "/api/scene":
                     parts = [p.to_viewer() for p in scene.get("parts", [])]
                     payload = {"parts": parts,
@@ -899,18 +921,29 @@ class Handler(BaseHTTPRequestHandler):
                                "preview": preview is not None,
                                "revision": studio.revision,
                                "generation": generation,
-                               "checksum": str(studio.solved.get("derived.checksum") or "")}
+                               "checksum": checksum,
+                               "session_id": session_id,
+                               "modification_id": studio.modification_id,
+                               "preview_id": preview_id}
                     self._json(200, payload, headers)
                     return
                 # Preview specs differ from the live spec at the same revision.
                 # Including the token prevents a preview from reusing the
                 # baseline GLB (or another preview's GLB) from the same cache.
-                preview_token = str((query.get("preview") or [""])[0] or "")
                 key = (studio.revision, quality, preview_token)
                 data = studio._models.get(key)
                 cached = data is not None
                 if data is None:
-                    data = mesh_kernel.to_glb(list(scene.get("parts", [])), str(name))
+                    model_extras = {"watchcad": {
+                        "session_id": session_id,
+                        "revision": studio.revision,
+                        "checksum": checksum,
+                        "modification_id": studio.modification_id,
+                        "preview": preview is not None,
+                        "preview_id": preview_id,
+                    }}
+                    data = mesh_kernel.to_glb(
+                        list(scene.get("parts", [])), str(name), extras=model_extras)
                     studio._models[key] = data
             _render_log("model_exported", revision=studio.revision,
                         generation=generation, preview=preview is not None,
